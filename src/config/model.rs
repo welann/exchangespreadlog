@@ -81,6 +81,17 @@ impl Default for Config {
                     markets: vec!["0".to_string(), "1".to_string(), "2".to_string()],
                     channel: Some("ticker".to_string()),
                 },
+                VenueConfig {
+                    name: "risex".to_string(),
+                    enabled: true,
+                    url: Some("wss://ws.rise.trade/ws".to_string()),
+                    markets: vec![
+                        "1:BTC".to_string(),
+                        "2:ETH".to_string(),
+                        "4:SOL".to_string(),
+                    ],
+                    channel: Some("orderbook".to_string()),
+                },
             ],
         }
     }
@@ -137,11 +148,18 @@ mod tests {
         assert_eq!(config.mode, "bbo");
         assert!(config.tui.enabled);
         assert_eq!(config.tui.refresh_ms, 250);
-        assert_eq!(config.venues.len(), 2);
+        assert_eq!(config.venues.len(), 3);
         assert_eq!(config.venues[0].name, "hyperliquid");
         assert_eq!(config.venues[0].channel.as_deref(), Some("bbo"));
         assert_eq!(config.venues[1].name, "lighter");
         assert_eq!(config.venues[1].channel.as_deref(), Some("ticker"));
         assert!(config.venues[1].markets.contains(&"2".to_string()));
+        assert_eq!(config.venues[2].name, "risex");
+        assert_eq!(
+            config.venues[2].url.as_deref(),
+            Some("wss://ws.rise.trade/ws")
+        );
+        assert_eq!(config.venues[2].channel.as_deref(), Some("orderbook"));
+        assert!(config.venues[2].markets.contains(&"4:SOL".to_string()));
     }
 }

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum Venue {
     Hyperliquid,
     Lighter,
+    Risex,
 }
 
 impl Venue {
@@ -12,6 +13,7 @@ impl Venue {
         match self {
             Self::Hyperliquid => "hyperliquid",
             Self::Lighter => "lighter",
+            Self::Risex => "risex",
         }
     }
 }

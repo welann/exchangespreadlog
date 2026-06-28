@@ -6,8 +6,9 @@ Currently supported venues:
 
 - `hyperliquid`
 - `lighter`
+- `risex`
 
-By default, only Hyperliquid is enabled in `config.example.toml`.
+By default, Hyperliquid, Lighter, and RiseX are enabled in `config.example.toml`.
 
 ## Project Structure
 
@@ -24,7 +25,8 @@ By default, only Hyperliquid is enabled in `config.example.toml`.
     |-- domain/             # BBO tick, market, venue, fixed decimal, quality models
     |-- exchange/           # Exchange adapters and message parsers
     |   |-- hyperliquid/
-    |   `-- lighter/
+    |   |-- lighter/
+    |   `-- risex/
     |-- ingest/             # WebSocket connection, retry/backoff, time helpers
     |-- pipeline/           # Normalize, dedupe, update state, write sinks
     |-- state.rs            # Shared latest-BBO state for the TUI
@@ -82,11 +84,18 @@ channel = "bbo"
 name = "lighter"
 enabled = false
 url = "wss://mainnet.zklighter.elliot.ai/stream"
-markets = ["0", "1"]
+markets = ["0", "1", "2"]
 channel = "ticker"
+
+[[venues]]
+name = "risex"
+enabled = true
+url = "wss://ws.rise.trade/ws"
+markets = ["1:BTC", "2:ETH", "4:SOL"]
+channel = "orderbook"
 ```
 
-For Hyperliquid, market values are symbols such as `BTC` or `ETH`. For Lighter, market values are market IDs such as `0` or `1`.
+For Hyperliquid, market values are symbols such as `BTC` or `ETH`. For Lighter, market values are market IDs such as `0` or `1`. For RiseX, market values are numeric mainnet market IDs; use `id:symbol` such as `1:BTC` to align the TUI market label with other venues.
 
 ## Running
 

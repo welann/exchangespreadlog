@@ -1,12 +1,33 @@
-use std::{fmt, str::FromStr};
+use std::{cmp::Ordering, fmt, str::FromStr};
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fixed {
     value: i128,
     scale: u32,
+}
+
+impl PartialOrd for Fixed {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Fixed {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let scale = self.scale.max(other.scale);
+        match (self.align_value(scale), other.align_value(scale)) {
+            (Ok(lhs), Ok(rhs)) => lhs.cmp(&rhs),
+            _ => self
+                .to_f64()
+                .partial_cmp(&other.to_f64())
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| self.scale.cmp(&other.scale))
+                .then_with(|| self.value.cmp(&other.value)),
+        }
+    }
 }
 
 impl Fixed {
@@ -178,6 +199,14 @@ mod tests {
 
         assert_eq!(ask.checked_sub(bid).unwrap().to_string(), "0.02");
         assert_eq!(bid.midpoint(ask).unwrap().to_string(), "100.11");
+    }
+
+    #[test]
+    fn orders_values_by_numeric_value_across_scales() {
+        let lower: Fixed = "100.5".parse().unwrap();
+        let higher: Fixed = "101".parse().unwrap();
+
+        assert!(lower < higher);
     }
 
     #[test]

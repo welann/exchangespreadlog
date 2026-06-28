@@ -33,3 +33,14 @@ markets = [
     "2",
 ]
 channel = "ticker"
+
+[[venues]]
+name = "risex"
+enabled = true
+url = "wss://ws.rise.trade/ws"
+markets = [
+    "1:BTC",
+    "2:ETH",
+    "4:SOL",
+]
+channel = "orderbook"

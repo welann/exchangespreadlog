@@ -6,7 +6,10 @@ use tracing::{info, warn};
 
 use crate::{
     config::{Config, VenueConfig},
-    exchange::{ExchangeAdapter, hyperliquid::HyperliquidAdapter, lighter::LighterAdapter},
+    exchange::{
+        ExchangeAdapter, hyperliquid::HyperliquidAdapter, lighter::LighterAdapter,
+        risex::RisexAdapter,
+    },
     pipeline::fanout,
     state::new_shared_state,
     storage::{BboSink, jsonl::JsonlSink, noop::NoopSink},
@@ -106,6 +109,7 @@ fn build_adapter(config: &VenueConfig) -> anyhow::Result<Box<dyn ExchangeAdapter
     match config.name.as_str() {
         "hyperliquid" => Ok(Box::new(HyperliquidAdapter::from_config(config))),
         "lighter" => Ok(Box::new(LighterAdapter::from_config(config))),
+        "rise" | "risex" => Ok(Box::new(RisexAdapter::from_config(config))),
         other => Err(anyhow!("unsupported venue: {other}")),
     }
 }

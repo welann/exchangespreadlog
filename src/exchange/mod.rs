@@ -1,5 +1,6 @@
 pub mod hyperliquid;
 pub mod lighter;
+pub mod risex;
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc::Sender, watch};
