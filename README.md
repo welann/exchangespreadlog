@@ -1,0 +1,186 @@
+# Exchange Spread Log
+
+Exchange Spread Log is a Rust collector for top-of-book/BBO data from perpetual DEX venues. It connects to exchange WebSocket feeds, normalizes best bid/ask updates, calculates spread and mid price, deduplicates unchanged ticks, shows the latest state in a terminal UI, and optionally persists ticks as JSONL.
+
+Currently supported venues:
+
+- `hyperliquid`
+- `lighter`
+
+By default, only Hyperliquid is enabled in `config.example.toml`.
+
+## Project Structure
+
+```text
+.
+|-- Cargo.toml              # Rust package metadata and dependencies
+|-- Cargo.lock              # Locked dependency versions
+|-- config.example.toml     # Example runtime configuration
+`-- src
+    |-- main.rs             # CLI entrypoint
+    |-- lib.rs              # Library module exports
+    |-- app/runner.rs       # Application orchestration and shutdown handling
+    |-- config/             # TOML config model and defaults
+    |-- domain/             # BBO tick, market, venue, fixed decimal, quality models
+    |-- exchange/           # Exchange adapters and message parsers
+    |   |-- hyperliquid/
+    |   `-- lighter/
+    |-- ingest/             # WebSocket connection, retry/backoff, time helpers
+    |-- pipeline/           # Normalize, dedupe, update state, write sinks
+    |-- state.rs            # Shared latest-BBO state for the TUI
+    |-- storage/            # JSONL and no-op storage sinks
+    |-- telemetry/          # tracing/logging initialization
+    `-- tui.rs              # Ratatui terminal interface
+```
+
+## Requirements
+
+- Rust toolchain with Cargo and Rust 2024 edition support
+- Network access to the configured WebSocket endpoints
+
+Check the local toolchain:
+
+```bash
+cargo --version
+```
+
+## Configuration
+
+Create a local config from the example:
+
+```bash
+cp config.example.toml config.toml
+```
+
+You can also print the built-in default config:
+
+```bash
+cargo run -- --print-default-config
+```
+
+Important config sections:
+
+- `pipeline.channel_capacity`: internal tick channel size.
+- `pipeline.stale_after_ms`: stale threshold reserved in the config model.
+- `storage.jsonl_enabled`: write normalized ticks to JSONL when `true`.
+- `storage.jsonl_dir`: base output directory, default `data/bbo`.
+- `tui.enabled`: enable or disable the terminal UI.
+- `tui.refresh_ms`: terminal UI refresh interval.
+- `venues`: exchange WebSocket settings.
+
+Example venue entries:
+
+```toml
+[[venues]]
+name = "hyperliquid"
+enabled = true
+url = "wss://api.hyperliquid.xyz/ws"
+markets = ["BTC", "ETH", "SOL"]
+channel = "bbo"
+
+[[venues]]
+name = "lighter"
+enabled = false
+url = "wss://mainnet.zklighter.elliot.ai/stream"
+markets = ["0", "1"]
+channel = "ticker"
+```
+
+For Hyperliquid, market values are symbols such as `BTC` or `ETH`. For Lighter, market values are market IDs such as `0` or `1`.
+
+## Running
+
+Run with the default `config.toml` path:
+
+```bash
+cargo run
+```
+
+Run with an explicit config:
+
+```bash
+cargo run -- --config config.toml
+```
+
+Run without the terminal UI, while still collecting and writing data:
+
+```bash
+cargo run -- --config config.toml --no-tui
+```
+
+Set log verbosity with `RUST_LOG`:
+
+```bash
+RUST_LOG=info cargo run -- --config config.toml --no-tui
+RUST_LOG=debug,exchangespreadlog=trace cargo run -- --config config.toml
+```
+
+Stop the collector with `Ctrl-C`. When the TUI is enabled, `q` or `Esc` also exits.
+
+## TUI Controls
+
+- `q` / `Esc`: quit.
+- `Tab`: switch focus between BBO and spread panels.
+- `Left` / `Right`: switch selected market.
+- `Up` / `Down`: switch selected venue.
+- `1` / `2`: choose the first or second venue leg in the spread panel.
+
+## Output
+
+When `storage.jsonl_enabled = true`, ticks are written under:
+
+```text
+data/bbo/YYYY-MM-DD/<venue>.jsonl
+```
+
+Each line is one normalized `BboTick` JSON object. Common fields include:
+
+- `venue`: exchange name.
+- `market`: market ID and optional display symbol.
+- `recv_ts_ns`: local receive timestamp in nanoseconds.
+- `exchange_ts_ms`: exchange timestamp when provided by the feed.
+- `sequence`: feed sequence/nonce when provided.
+- `bid` / `ask`: best price, size, and optional order count.
+- `spread`: `ask.price - bid.price`.
+- `mid`: midpoint between bid and ask.
+- `source`: source feed type such as `bbo`, `ticker`, or `l2_book`.
+- `quality`: quality flags, including `inconsistent` for negative spread.
+
+## Build and Test
+
+Run tests:
+
+```bash
+cargo test
+```
+
+Build a release binary:
+
+```bash
+cargo build --release
+```
+
+Run the release binary:
+
+```bash
+./target/release/exchangespreadlog --config config.toml
+```
+
+Show CLI help:
+
+```bash
+cargo run -- --help
+```
+
+Current CLI options:
+
+```text
+Usage: exchangespreadlog [OPTIONS]
+
+Options:
+  -c, --config <CONFIG>       [default: config.toml]
+      --no-tui
+      --print-default-config
+  -h, --help                  Print help
+  -V, --version               Print version
+```

@@ -1,0 +1,35 @@
+mode = "bbo"
+
+[pipeline]
+channel_capacity = 4096
+stale_after_ms = 5000
+
+[storage]
+jsonl_enabled = true
+jsonl_dir = "data/bbo"
+
+[tui]
+enabled = true
+refresh_ms = 250
+
+[[venues]]
+name = "hyperliquid"
+enabled = true
+url = "wss://api.hyperliquid.xyz/ws"
+markets = [
+    "BTC",
+    "ETH",
+    "SOL",
+]
+channel = "bbo"
+
+[[venues]]
+name = "lighter"
+enabled = true
+url = "wss://mainnet.zklighter.elliot.ai/stream"
+markets = [
+    "0",
+    "1",
+    "2",
+]
+channel = "ticker"
