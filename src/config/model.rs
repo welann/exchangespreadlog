@@ -387,8 +387,8 @@ fn default_hyperliquid_instruments() -> Vec<InstrumentConfig> {
 
 fn default_lighter_instruments() -> Vec<InstrumentConfig> {
     vec![
-        instrument("0", "BTC", Some("0"), "BTC"),
-        instrument("1", "ETH", Some("1"), "ETH"),
+        instrument("0", "ETH", Some("0"), "ETH"),
+        instrument("1", "BTC", Some("1"), "BTC"),
         instrument("2", "SOL", Some("2"), "SOL"),
     ]
 }
@@ -420,7 +420,7 @@ impl Default for TuiConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, StorageConfig, StorageMode};
+    use super::{Config, StorageConfig, StorageMode, VenueConfig};
 
     #[test]
     fn default_config_round_trips_through_toml() {
@@ -448,6 +448,7 @@ mod tests {
         assert_eq!(config.venues[0].catalog()[0].quote_asset, "USDC");
         assert_eq!(config.venues[1].venue_instance_id, "lighter");
         assert_eq!(config.venues[1].channel.as_deref(), Some("ticker"));
+        assert_lighter_mainnet_market_ids(&config.venues[1]);
         assert_eq!(config.venues[1].instruments[2].instrument_id, "2");
         assert_eq!(config.venues[2].venue_instance_id, "risex");
         assert_eq!(
@@ -463,6 +464,37 @@ mod tests {
         );
         assert_eq!(config.venues[3].channel.as_deref(), Some("deltas"));
         assert_eq!(config.venues[3].catalog()[2].feed_key(), "SOLUSD");
+    }
+
+    #[test]
+    fn config_example_uses_lighter_mainnet_market_ids() {
+        let config: Config = toml::from_str(include_str!("../../config.example.toml")).unwrap();
+        let lighter = config
+            .venues
+            .iter()
+            .find(|venue| venue.adapter == "lighter")
+            .expect("config.example.toml has Lighter venue");
+
+        assert_lighter_mainnet_market_ids(lighter);
+    }
+
+    fn assert_lighter_mainnet_market_ids(venue: &VenueConfig) {
+        assert_eq!(venue.venue_instance_id, "lighter");
+        assert_eq!(venue.channel.as_deref(), Some("ticker"));
+
+        let expected = [
+            ("0", "ETH", "ETH"),
+            ("1", "BTC", "BTC"),
+            ("2", "SOL", "SOL"),
+        ];
+        for (instrument, (instrument_id, raw_symbol, base_asset)) in
+            venue.instruments.iter().zip(expected)
+        {
+            assert_eq!(instrument.instrument_id, instrument_id);
+            assert_eq!(instrument.feed_symbol.as_deref(), Some(instrument_id));
+            assert_eq!(instrument.raw_symbol, raw_symbol);
+            assert_eq!(instrument.base_asset, base_asset);
+        }
     }
 
     #[test]

@@ -78,18 +78,18 @@ default_margin_asset = "USDC"
 
 [[venues.instruments]]
 instrument_id = "0"
-raw_symbol = "BTC"
+raw_symbol = "ETH"
 feed_symbol = "0"
 product_type = "perp"
-base_asset = "BTC"
+base_asset = "ETH"
 status = "active"
 
 [[venues.instruments]]
 instrument_id = "1"
-raw_symbol = "ETH"
+raw_symbol = "BTC"
 feed_symbol = "1"
 product_type = "perp"
-base_asset = "ETH"
+base_asset = "BTC"
 status = "active"
 
 [[venues.instruments]]
