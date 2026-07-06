@@ -1,0 +1,10 @@
+.git/
+.alma-snapshots/
+target/
+data/
+docs/
+
+.DS_Store
+.env
+config.toml
+*.log
