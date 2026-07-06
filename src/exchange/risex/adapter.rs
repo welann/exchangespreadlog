@@ -104,10 +104,20 @@ impl RisexAdapter {
                             let recv_ts_ns = crate::ingest::time::unix_time_ns();
                             match parser::parse_message(&text) {
                                 Ok(ParsedMessage::Orderbook(delta)) => {
-                                    let configured_instrument = self.catalog.resolve(&delta.market_id);
+                                    let market_id = delta.market_id.clone();
+                                    let configured_instrument = self.catalog.resolve(&market_id);
+                                    let missing_catalog = configured_instrument.is_none();
                                     match books.apply(delta, recv_ts_ns, configured_instrument) {
                                         Ok(Some(tick)) => {
                                             tx.send(MarketEvent::Tick { tick }).await.context("send RiseX tick")?;
+                                        }
+                                        Ok(None) if missing_catalog => {
+                                            warn!(
+                                                venue = %self.venue_instance_id,
+                                                adapter = "risex",
+                                                feed_key = %market_id,
+                                                "orderbook skipped because feed key is missing from instrument catalog"
+                                            );
                                         }
                                         Ok(None) => {}
                                         Err(err) => {

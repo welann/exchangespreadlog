@@ -105,6 +105,45 @@ impl InstrumentCatalog {
         status: impl Into<String>,
         source_raw_json: Option<Value>,
     ) -> Self {
+        Self::new_with_units(
+            venue_instance_id,
+            instrument_id,
+            raw_symbol,
+            feed_symbol,
+            product_type,
+            base_asset,
+            quote_asset,
+            settle_asset,
+            margin_asset,
+            PriceConvention::QuotePerBase,
+            SizeUnit::BaseAsset,
+            price_tick,
+            size_tick,
+            min_size,
+            status,
+            source_raw_json,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_units(
+        venue_instance_id: impl Into<String>,
+        instrument_id: impl Into<String>,
+        raw_symbol: impl Into<String>,
+        feed_symbol: Option<String>,
+        product_type: ProductType,
+        base_asset: impl Into<String>,
+        quote_asset: impl Into<String>,
+        settle_asset: impl Into<String>,
+        margin_asset: impl Into<String>,
+        price_convention: PriceConvention,
+        size_unit: SizeUnit,
+        price_tick: Option<Fixed>,
+        size_tick: Option<Fixed>,
+        min_size: Option<Fixed>,
+        status: impl Into<String>,
+        source_raw_json: Option<Value>,
+    ) -> Self {
         let venue_instance_id = venue_instance_id.into();
         let instrument_id = instrument_id.into();
         let raw_symbol = raw_symbol.into();
@@ -133,6 +172,8 @@ impl InstrumentCatalog {
             quote_asset.as_str(),
             settle_asset.as_str(),
             margin_asset.as_str(),
+            price_convention.as_str(),
+            size_unit.as_str(),
             price_tick_seed.as_str(),
             size_tick_seed.as_str(),
             min_size_seed.as_str(),
@@ -151,8 +192,8 @@ impl InstrumentCatalog {
             quote_asset,
             settle_asset,
             margin_asset,
-            price_convention: PriceConvention::QuotePerBase,
-            size_unit: SizeUnit::BaseAsset,
+            price_convention,
+            size_unit,
             price_tick,
             size_tick,
             min_size,
@@ -220,7 +261,7 @@ fn stable_catalog_id(venue_instance_id: &str, instrument_id: &str, version_seed:
 
 #[cfg(test)]
 mod tests {
-    use super::{InstrumentCatalog, ProductType};
+    use super::{InstrumentCatalog, PriceConvention, ProductType, SizeUnit};
 
     #[test]
     fn catalog_id_changes_when_market_rules_change() {
@@ -259,5 +300,47 @@ mod tests {
 
         assert_ne!(first.catalog_id, second.catalog_id);
         assert_eq!(first.instrument_ref().instrument_id, "0");
+    }
+
+    #[test]
+    fn catalog_id_changes_when_quote_or_size_semantics_change() {
+        let first = InstrumentCatalog::new_with_units(
+            "lighter",
+            "0",
+            "BTC",
+            Some("0".to_string()),
+            ProductType::Perp,
+            "BTC",
+            "USDC",
+            "USDC",
+            "USDC",
+            PriceConvention::QuotePerBase,
+            SizeUnit::BaseAsset,
+            None,
+            None,
+            None,
+            "active",
+            None,
+        );
+        let second = InstrumentCatalog::new_with_units(
+            "lighter",
+            "0",
+            "BTC",
+            Some("0".to_string()),
+            ProductType::Perp,
+            "BTC",
+            "USDC",
+            "USDC",
+            "USDC",
+            PriceConvention::QuotePerBase,
+            SizeUnit::Contracts,
+            None,
+            None,
+            None,
+            "active",
+            None,
+        );
+
+        assert_ne!(first.catalog_id, second.catalog_id);
     }
 }

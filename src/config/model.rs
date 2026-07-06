@@ -3,7 +3,9 @@ use std::{fmt, fs, path::Path, str::FromStr};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Fixed, InstrumentCatalog, ProductType, QuoteRate, QuoteRateBook};
+use crate::domain::{
+    Fixed, InstrumentCatalog, PriceConvention, ProductType, QuoteRate, QuoteRateBook, SizeUnit,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -75,10 +77,22 @@ pub struct VenueConfig {
     pub enabled: bool,
     pub url: Option<String>,
     pub channel: Option<String>,
+    pub catalog_source: CatalogSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_url: Option<String>,
     pub default_quote_asset: String,
     pub default_settle_asset: String,
     pub default_margin_asset: String,
     pub instruments: Vec<InstrumentConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogSource {
+    /// Use only static `venues.instruments` entries.
+    Config,
+    /// Fetch exchange metadata before streaming, then merge it into configured instruments.
+    Exchange,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +109,10 @@ pub struct InstrumentConfig {
     pub settle_asset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub margin_asset: Option<String>,
+    #[serde(default = "default_price_convention")]
+    pub price_convention: PriceConvention,
+    #[serde(default = "default_size_unit")]
+    pub size_unit: SizeUnit,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_tick: Option<Fixed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,6 +179,8 @@ impl Default for Config {
                     enabled: true,
                     url: Some("wss://api.hyperliquid.xyz/ws".to_string()),
                     channel: Some("bbo".to_string()),
+                    catalog_source: CatalogSource::Exchange,
+                    metadata_url: Some("https://api.hyperliquid.xyz/info".to_string()),
                     default_quote_asset: "USDC".to_string(),
                     default_settle_asset: "USDC".to_string(),
                     default_margin_asset: "USDC".to_string(),
@@ -172,6 +192,10 @@ impl Default for Config {
                     enabled: true,
                     url: Some("wss://mainnet.zklighter.elliot.ai/stream".to_string()),
                     channel: Some("ticker".to_string()),
+                    catalog_source: CatalogSource::Exchange,
+                    metadata_url: Some(
+                        "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks".to_string(),
+                    ),
                     default_quote_asset: "USDC".to_string(),
                     default_settle_asset: "USDC".to_string(),
                     default_margin_asset: "USDC".to_string(),
@@ -183,6 +207,8 @@ impl Default for Config {
                     enabled: true,
                     url: Some("wss://ws.rise.trade/ws".to_string()),
                     channel: Some("orderbook".to_string()),
+                    catalog_source: CatalogSource::Config,
+                    metadata_url: None,
                     default_quote_asset: "USDC".to_string(),
                     default_settle_asset: "USDC".to_string(),
                     default_margin_asset: "USDC".to_string(),
@@ -194,6 +220,8 @@ impl Default for Config {
                     enabled: true,
                     url: Some("wss://zo-mainnet.n1.xyz".to_string()),
                     channel: Some("deltas".to_string()),
+                    catalog_source: CatalogSource::Config,
+                    metadata_url: None,
                     default_quote_asset: "USD".to_string(),
                     default_settle_asset: "USD".to_string(),
                     default_margin_asset: "USD".to_string(),
@@ -307,6 +335,8 @@ impl Default for VenueConfig {
             enabled: true,
             url: None,
             channel: None,
+            catalog_source: CatalogSource::Config,
+            metadata_url: None,
             default_quote_asset: "USD".to_string(),
             default_settle_asset: "USD".to_string(),
             default_margin_asset: "USD".to_string(),
@@ -326,7 +356,7 @@ impl VenueConfig {
 
 impl InstrumentConfig {
     pub fn to_catalog(&self, venue: &VenueConfig) -> InstrumentCatalog {
-        InstrumentCatalog::new(
+        InstrumentCatalog::new_with_units(
             venue.venue_instance_id.clone(),
             self.instrument_id.clone(),
             self.raw_symbol.clone(),
@@ -342,6 +372,8 @@ impl InstrumentConfig {
             self.margin_asset
                 .clone()
                 .unwrap_or_else(|| venue.default_margin_asset.clone()),
+            self.price_convention,
+            self.size_unit,
             self.price_tick,
             self.size_tick,
             self.min_size,
@@ -353,6 +385,14 @@ impl InstrumentConfig {
 
 fn default_instrument_status() -> String {
     "active".to_string()
+}
+
+fn default_price_convention() -> PriceConvention {
+    PriceConvention::QuotePerBase
+}
+
+fn default_size_unit() -> SizeUnit {
+    SizeUnit::BaseAsset
 }
 
 fn instrument(
@@ -370,6 +410,8 @@ fn instrument(
         quote_asset: None,
         settle_asset: None,
         margin_asset: None,
+        price_convention: default_price_convention(),
+        size_unit: default_size_unit(),
         price_tick: None,
         size_tick: None,
         min_size: None,
@@ -420,7 +462,8 @@ impl Default for TuiConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, StorageConfig, StorageMode, VenueConfig};
+    use super::{CatalogSource, Config, StorageConfig, StorageMode, VenueConfig};
+    use crate::domain::{PriceConvention, SizeUnit};
 
     #[test]
     fn default_config_round_trips_through_toml() {
@@ -444,10 +487,21 @@ mod tests {
         assert_eq!(config.venues[0].venue_instance_id, "hyperliquid");
         assert_eq!(config.venues[0].adapter, "hyperliquid");
         assert_eq!(config.venues[0].channel.as_deref(), Some("bbo"));
+        assert_eq!(config.venues[0].catalog_source, CatalogSource::Exchange);
+        assert_eq!(
+            config.venues[0].metadata_url.as_deref(),
+            Some("https://api.hyperliquid.xyz/info")
+        );
         assert_eq!(config.venues[0].instruments[0].base_asset, "BTC");
         assert_eq!(config.venues[0].catalog()[0].quote_asset, "USDC");
+        assert_eq!(
+            config.venues[0].catalog()[0].price_convention,
+            PriceConvention::QuotePerBase
+        );
+        assert_eq!(config.venues[0].catalog()[0].size_unit, SizeUnit::BaseAsset);
         assert_eq!(config.venues[1].venue_instance_id, "lighter");
         assert_eq!(config.venues[1].channel.as_deref(), Some("ticker"));
+        assert_eq!(config.venues[1].catalog_source, CatalogSource::Exchange);
         assert_lighter_mainnet_market_ids(&config.venues[1]);
         assert_eq!(config.venues[1].instruments[2].instrument_id, "2");
         assert_eq!(config.venues[2].venue_instance_id, "risex");
@@ -522,5 +576,32 @@ enabled = true
             StorageMode::Clickhouse
         );
         assert!("sqlite".parse::<StorageMode>().is_err());
+    }
+
+    #[test]
+    fn parses_instrument_quote_and_size_semantics() {
+        let config: Config = toml::from_str(
+            r#"
+[[venues]]
+venue_instance_id = "contracts-venue"
+adapter = "lighter"
+default_quote_asset = "USDC"
+default_settle_asset = "USDC"
+default_margin_asset = "USDC"
+
+[[venues.instruments]]
+instrument_id = "1"
+raw_symbol = "BTC"
+feed_symbol = "1"
+product_type = "perp"
+base_asset = "BTC"
+size_unit = "contracts"
+"#,
+        )
+        .unwrap();
+
+        let catalog = config.venues[0].catalog();
+        assert_eq!(catalog[0].price_convention, PriceConvention::QuotePerBase);
+        assert_eq!(catalog[0].size_unit, SizeUnit::Contracts);
     }
 }
