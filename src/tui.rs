@@ -694,29 +694,9 @@ fn common_quote(
     first: &InstrumentCatalog,
     second: &InstrumentCatalog,
 ) -> Option<String> {
-    if first.quote_asset == second.quote_asset {
-        return Some(first.quote_asset.clone());
-    }
-    if snapshot.rates.rate(&first.quote_asset, "USD").is_some()
-        && snapshot.rates.rate(&second.quote_asset, "USD").is_some()
-    {
-        return Some("USD".to_string());
-    }
-    if snapshot
+    snapshot
         .rates
-        .rate(&first.quote_asset, &second.quote_asset)
-        .is_some()
-    {
-        return Some(second.quote_asset.clone());
-    }
-    if snapshot
-        .rates
-        .rate(&second.quote_asset, &first.quote_asset)
-        .is_some()
-    {
-        return Some(first.quote_asset.clone());
-    }
-    None
+        .common_quote(&first.quote_asset, &second.quote_asset)
 }
 
 fn converted_price(
@@ -1015,13 +995,20 @@ mod tests {
     use std::str::FromStr;
 
     use crate::{
-        domain::{BboTick, BestLevel, Fixed, InstrumentCatalog, ProductType, SourceKind},
+        domain::{
+            BboTick, BestLevel, Fixed, InstrumentCatalog, ProductType, QuoteRate, QuoteRateBook,
+            SourceKind,
+        },
         pipeline::normalizer,
         state::BboStore,
         tui::{SpreadHistory, TuiSelection, cross_spread, main_areas, spread_summary_rows},
     };
 
     fn catalog(venue: &str) -> InstrumentCatalog {
+        catalog_with_quote(venue, "USDC")
+    }
+
+    fn catalog_with_quote(venue: &str, quote_asset: &str) -> InstrumentCatalog {
         InstrumentCatalog::new(
             venue,
             "ETH",
@@ -1029,15 +1016,23 @@ mod tests {
             Some("ETH".to_string()),
             ProductType::Perp,
             "ETH",
-            "USDC",
-            "USDC",
-            "USDC",
+            quote_asset,
+            quote_asset,
+            quote_asset,
             None,
             None,
             None,
             "active",
             None,
         )
+    }
+
+    fn rate(from: &str, to: &str, rate: &str) -> QuoteRate {
+        QuoteRate {
+            from: from.to_string(),
+            to: to.to_string(),
+            rate: rate.parse().unwrap(),
+        }
     }
 
     fn tick(catalog: &InstrumentCatalog, bid: &str, ask: &str) -> BboTick {
@@ -1095,6 +1090,30 @@ mod tests {
 
         assert_eq!(super::spread_bp(&snapshot, &first, &second), "49.75");
         assert_eq!(super::spread_bp(&snapshot, &second, &first), "-196.08");
+    }
+
+    #[test]
+    fn calculates_cross_spread_through_configured_common_quote() {
+        let rates = QuoteRateBook::new([rate("USDC", "USD", "1"), rate("USDT", "USD", "0.999")]);
+        let mut store = BboStore::new(rates);
+        let first_catalog = catalog_with_quote("hyperliquid", "USDC");
+        let second_catalog = catalog_with_quote("binance", "USDT");
+        store.update_catalog(first_catalog.clone());
+        store.update_catalog(second_catalog.clone());
+        store.update_tick(tick(&first_catalog, "101", "102"));
+        store.update_tick(tick(&second_catalog, "100", "100.5"));
+        let snapshot = store.snapshot();
+        let rows = snapshot.rows_for_market("ETH");
+        let first = rows
+            .iter()
+            .find(|row| row.tick.instrument.venue_instance_id == "hyperliquid")
+            .unwrap();
+        let second = rows
+            .iter()
+            .find(|row| row.tick.instrument.venue_instance_id == "binance")
+            .unwrap();
+
+        assert_eq!(cross_spread(&snapshot, &first, &second), "0.600500");
     }
 
     #[test]
