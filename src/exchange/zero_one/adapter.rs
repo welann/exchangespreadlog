@@ -11,7 +11,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::VenueConfig, domain::BboTick, exchange::ExchangeAdapter, ingest::supervisor::Backoff,
+    config::VenueConfig,
+    domain::{BboTick, InstrumentCatalog, MarketEvent},
+    exchange::{CatalogIndex, ExchangeAdapter, run_with_reconnect},
     ingest::ws,
 };
 
@@ -22,17 +24,11 @@ use super::{
 
 #[derive(Debug, Clone)]
 pub struct ZeroOneAdapter {
+    venue_instance_id: String,
     url: String,
     rest_url: String,
     channel: String,
-    markets: Vec<ZeroOneMarket>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ZeroOneMarket {
-    id: String,
-    label: String,
-    feed_symbol: String,
+    catalog: CatalogIndex,
 }
 
 impl ZeroOneAdapter {
@@ -42,47 +38,55 @@ impl ZeroOneAdapter {
             .clone()
             .unwrap_or_else(|| "wss://zo-mainnet.n1.xyz".to_string());
         Self {
+            venue_instance_id: config.venue_instance_id.clone(),
             rest_url: derive_rest_url(&url),
             url,
             channel: config
                 .channel
                 .clone()
                 .unwrap_or_else(|| "deltas".to_string()),
-            markets: config
-                .markets
-                .iter()
-                .map(|market| parse_market(market))
-                .collect(),
+            catalog: CatalogIndex::new(config.catalog()),
         }
     }
 
     async fn run_once(
         &self,
-        tx: Sender<BboTick>,
+        tx: Sender<MarketEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
+        for instrument in self.catalog.instruments() {
+            tx.send(MarketEvent::Catalog {
+                instrument: instrument.clone(),
+            })
+            .await
+            .context("send 01 catalog")?;
+        }
+
         let client = reqwest::Client::new();
         let mut books = ZeroOneBooks::default();
         let markets_by_symbol = self
-            .markets
+            .catalog
+            .instruments()
             .iter()
-            .map(|market| (market.feed_symbol.clone(), market.clone()))
+            .map(|market| (market.feed_key().to_string(), market.clone()))
             .collect::<HashMap<_, _>>();
 
-        let ws_url = build_ws_url(&self.url, &self.channel, &self.markets);
+        let ws_url = build_ws_url(&self.url, &self.channel, self.catalog.instruments());
         let (stream, _) = ws::connect(&ws_url).await?;
         let (mut write, mut read) = stream.split();
 
-        for market in &self.markets {
+        for market in self.catalog.instruments() {
             let recv_ts_ns = crate::ingest::time::unix_time_ns();
             let tick = self
                 .fetch_snapshot_tick(&client, &mut books, market, recv_ts_ns)
                 .await
-                .with_context(|| format!("fetch initial 01 snapshot {}", market.feed_symbol))?;
-            tx.send(tick).await.context("send initial 01 tick")?;
+                .with_context(|| format!("fetch initial 01 snapshot {}", market.feed_key()))?;
+            tx.send(MarketEvent::Tick { tick })
+                .await
+                .context("send initial 01 tick")?;
         }
 
-        info!(venue = "01", markets = ?self.markets, url = %ws_url, "subscribed");
+        info!(venue = %self.venue_instance_id, instruments = ?self.catalog.instruments(), url = %ws_url, "subscribed");
         let mut heartbeat = time::interval(Duration::from_secs(30));
 
         loop {
@@ -108,7 +112,7 @@ impl ZeroOneAdapter {
                                     let market_symbol = delta.market_symbol.clone();
                                     match books.apply_delta(delta, recv_ts_ns) {
                                         ApplyResult::Tick(tick) => {
-                                            tx.send(tick).await.context("send 01 tick")?;
+                                            tx.send(MarketEvent::Tick { tick }).await.context("send 01 tick")?;
                                         }
                                         ApplyResult::Skipped => {}
                                         ApplyResult::Gap { expected_last_update_id, received_last_update_id, .. } => {
@@ -120,11 +124,13 @@ impl ZeroOneAdapter {
                                                 "orderbook delta gap; refreshing snapshot"
                                             );
                                             if let Some(market) = markets_by_symbol.get(&market_symbol) {
-                                                let tick = self
+                                                let mut tick = self
                                                     .fetch_snapshot_tick(&client, &mut books, market, recv_ts_ns)
                                                     .await
                                                     .with_context(|| format!("refresh 01 snapshot {market_symbol}"))?;
-                                                tx.send(tick).await.context("send refreshed 01 tick")?;
+                                                tick.quality.gap = true;
+                                                tick.quality.add_note("orderbook delta gap; snapshot refreshed");
+                                                tx.send(MarketEvent::Tick { tick }).await.context("send refreshed 01 tick")?;
                                             }
                                         }
                                     }
@@ -152,14 +158,13 @@ impl ZeroOneAdapter {
         &self,
         client: &reqwest::Client,
         books: &mut ZeroOneBooks,
-        market: &ZeroOneMarket,
+        market: &InstrumentCatalog,
         recv_ts_ns: i128,
     ) -> anyhow::Result<BboTick> {
-        let snapshot = self.fetch_snapshot(client, &market.id).await?;
+        let snapshot = self.fetch_snapshot(client, &market.instrument_id).await?;
         Ok(books.apply_snapshot(
-            &market.feed_symbol,
-            &market.id,
-            &market.label,
+            market.feed_key(),
+            market.instrument_ref(),
             snapshot,
             recv_ts_ns,
         ))
@@ -189,50 +194,14 @@ impl ZeroOneAdapter {
 impl ExchangeAdapter for ZeroOneAdapter {
     async fn run(
         &self,
-        tx: Sender<BboTick>,
+        tx: Sender<MarketEvent>,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let mut backoff = Backoff::default();
-        while !*shutdown.borrow() {
-            match self.run_once(tx.clone(), shutdown.clone()).await {
-                Ok(()) => return Ok(()),
-                Err(err) => {
-                    let sleep = backoff.next_delay();
-                    warn!(venue = "01", error = %err, ?sleep, "adapter restarting");
-                    time::sleep(sleep).await;
-                }
-            }
-        }
-        Ok(())
+        run_with_reconnect("01", tx, shutdown, |tx, shutdown| {
+            self.run_once(tx, shutdown)
+        })
+        .await
     }
-}
-
-fn parse_market(raw: &str) -> ZeroOneMarket {
-    let mut parts = raw.split([':', '=']).map(str::trim);
-    let id = parts.next().unwrap_or_default().to_string();
-    let label = parts.next().filter(|value| !value.is_empty());
-    let feed_symbol = parts.next().filter(|value| !value.is_empty());
-
-    let label = label
-        .map(str::to_string)
-        .unwrap_or_else(|| label_from_feed_symbol(feed_symbol.unwrap_or(&id)));
-    let feed_symbol = feed_symbol
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{label}USD"));
-
-    ZeroOneMarket {
-        id,
-        label,
-        feed_symbol,
-    }
-}
-
-fn label_from_feed_symbol(symbol: &str) -> String {
-    symbol
-        .strip_suffix("USD")
-        .or_else(|| symbol.strip_suffix("USDC"))
-        .unwrap_or(symbol)
-        .to_string()
 }
 
 fn derive_rest_url(ws_url: &str) -> String {
@@ -247,7 +216,7 @@ fn derive_rest_url(ws_url: &str) -> String {
         .to_string()
 }
 
-fn build_ws_url(base_url: &str, channel: &str, markets: &[ZeroOneMarket]) -> String {
+fn build_ws_url(base_url: &str, channel: &str, markets: &[InstrumentCatalog]) -> String {
     let base = base_url.trim_end_matches('/');
     let base = if base.ends_with("/ws") {
         base.to_string()
@@ -256,7 +225,7 @@ fn build_ws_url(base_url: &str, channel: &str, markets: &[ZeroOneMarket]) -> Str
     };
     let streams = markets
         .iter()
-        .map(|market| format!("{channel}@{}", market.feed_symbol))
+        .map(|market| format!("{channel}@{}", market.feed_key()))
         .collect::<Vec<_>>()
         .join("&");
     format!("{base}/{streams}")
@@ -264,22 +233,26 @@ fn build_ws_url(base_url: &str, channel: &str, markets: &[ZeroOneMarket]) -> Str
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ws_url, derive_rest_url, parse_market};
+    use super::{build_ws_url, derive_rest_url};
+    use crate::domain::{InstrumentCatalog, ProductType};
 
-    #[test]
-    fn parses_market_id_label_and_feed_symbol() {
-        let market = parse_market("0:BTC:BTCUSD");
-        assert_eq!(market.id, "0");
-        assert_eq!(market.label, "BTC");
-        assert_eq!(market.feed_symbol, "BTCUSD");
-    }
-
-    #[test]
-    fn derives_feed_symbol_from_label() {
-        let market = parse_market("2:SOL");
-        assert_eq!(market.id, "2");
-        assert_eq!(market.label, "SOL");
-        assert_eq!(market.feed_symbol, "SOLUSD");
+    fn instrument(id: &str, feed: &str, base: &str) -> InstrumentCatalog {
+        InstrumentCatalog::new(
+            "01",
+            id,
+            feed,
+            Some(feed.to_string()),
+            ProductType::Perp,
+            base,
+            "USD",
+            "USD",
+            "USD",
+            None,
+            None,
+            None,
+            "active",
+            None,
+        )
     }
 
     #[test]
@@ -296,7 +269,10 @@ mod tests {
 
     #[test]
     fn builds_combined_delta_stream_url() {
-        let markets = vec![parse_market("0:BTC:BTCUSD"), parse_market("1:ETH:ETHUSD")];
+        let markets = vec![
+            instrument("0", "BTCUSD", "BTC"),
+            instrument("1", "ETHUSD", "ETH"),
+        ];
         assert_eq!(
             build_ws_url("wss://zo-mainnet.n1.xyz", "deltas", &markets),
             "wss://zo-mainnet.n1.xyz/ws/deltas@BTCUSD&deltas@ETHUSD"

@@ -3,10 +3,11 @@ use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde::Serialize;
 use tokio::sync::Mutex;
+use tracing::warn;
 
 use crate::{
     config::ClickHouseConfig,
-    domain::{BboTick, BestLevel, Fixed, SourceKind},
+    domain::{BboTick, BestLevel, Fixed, InstrumentCatalog, SourceKind},
     storage::BboSink,
 };
 
@@ -15,10 +16,11 @@ pub struct ClickHouseSink {
     url: String,
     database: String,
     table: String,
+    catalog_table: String,
     username: String,
     password: Option<String>,
     batch_size: usize,
-    buffer: Mutex<Vec<ClickHouseRow>>,
+    buffer: Mutex<Vec<BboClickHouseRow>>,
 }
 
 impl ClickHouseSink {
@@ -30,17 +32,23 @@ impl ClickHouseSink {
 
         let database = validate_identifier("ClickHouse database", &config.database)?;
         let table = validate_identifier("ClickHouse table", &config.table)?;
+        let catalog_table = validate_identifier("ClickHouse catalog table", &config.catalog_table)?;
         let password = resolve_password(config)?;
+        let batch_size = config.batch_size.max(1);
+        if config.batch_size == 0 {
+            warn!("ClickHouse batch_size is 0; using 1 because every tick must be flushed");
+        }
 
         let sink = Self {
             client: reqwest::Client::new(),
             url,
             database,
             table,
+            catalog_table,
             username: config.username.clone(),
             password,
-            batch_size: config.batch_size.max(1),
-            buffer: Mutex::new(Vec::with_capacity(config.batch_size.max(1))),
+            batch_size,
+            buffer: Mutex::new(Vec::with_capacity(batch_size)),
         };
 
         if config.create_table {
@@ -54,15 +62,43 @@ impl ClickHouseSink {
 
     async fn ensure_table(&self) -> anyhow::Result<()> {
         let table = quote_identifier(&self.table);
-        let sql = format!(
+        let catalog_table = quote_identifier(&self.catalog_table);
+        let catalog_sql = format!(
+            r#"CREATE TABLE IF NOT EXISTS {catalog_table}
+(
+    catalog_id String,
+    venue_instance_id LowCardinality(String),
+    instrument_id String,
+    raw_symbol String,
+    feed_symbol Nullable(String),
+    product_type LowCardinality(String),
+    base_asset LowCardinality(String),
+    quote_asset LowCardinality(String),
+    settle_asset LowCardinality(String),
+    margin_asset LowCardinality(String),
+    price_convention LowCardinality(String),
+    size_unit LowCardinality(String),
+    price_tick Nullable(String),
+    size_tick Nullable(String),
+    min_size Nullable(String),
+    status LowCardinality(String),
+    source_raw_json Nullable(String),
+    inserted_time DateTime64(9, 'UTC') DEFAULT now64(9)
+)
+ENGINE = ReplacingMergeTree(inserted_time)
+ORDER BY (venue_instance_id, instrument_id, catalog_id)"#
+        );
+        self.execute_sql(catalog_sql).await?;
+
+        let tick_sql = format!(
             r#"CREATE TABLE IF NOT EXISTS {table}
 (
+    catalog_id String,
+    venue_instance_id LowCardinality(String),
+    instrument_id String,
     recv_ts_ns Int64,
     recv_time DateTime64(9, 'UTC') MATERIALIZED fromUnixTimestamp64Nano(recv_ts_ns),
     exchange_ts_ms Nullable(Int64),
-    venue LowCardinality(String),
-    market_id String,
-    market_symbol Nullable(String),
     sequence Nullable(String),
     source LowCardinality(String),
     bid_price Nullable(Float64),
@@ -86,12 +122,12 @@ impl ClickHouseSink {
 )
 ENGINE = MergeTree
 PARTITION BY toDate(recv_time)
-ORDER BY (venue, market_id, recv_time)"#
+ORDER BY (venue_instance_id, instrument_id, recv_time)"#
         );
-        self.execute_sql(sql).await
+        self.execute_sql(tick_sql).await
     }
 
-    async fn insert_rows(&self, rows: &[ClickHouseRow]) -> anyhow::Result<()> {
+    async fn insert_tick_rows(&self, rows: &[BboClickHouseRow]) -> anyhow::Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -105,6 +141,15 @@ ORDER BY (venue, market_id, recv_time)"#
             sql.push('\n');
         }
 
+        self.execute_sql(sql).await
+    }
+
+    async fn insert_catalog_row(&self, row: &CatalogClickHouseRow) -> anyhow::Result<()> {
+        let sql = format!(
+            "INSERT INTO {} FORMAT JSONEachRow\n{}\n",
+            quote_identifier(&self.catalog_table),
+            serde_json::to_string(row).context("serialize ClickHouse catalog row")?
+        );
         self.execute_sql(sql).await
     }
 
@@ -140,8 +185,13 @@ ORDER BY (venue, market_id, recv_time)"#
 
 #[async_trait]
 impl BboSink for ClickHouseSink {
-    async fn write(&self, tick: &BboTick) -> anyhow::Result<()> {
-        let row = ClickHouseRow::try_from_tick(tick)?;
+    async fn write_catalog(&self, catalog: &InstrumentCatalog) -> anyhow::Result<()> {
+        self.insert_catalog_row(&CatalogClickHouseRow::from_catalog(catalog))
+            .await
+    }
+
+    async fn write_tick(&self, tick: &BboTick) -> anyhow::Result<()> {
+        let row = BboClickHouseRow::try_from_tick(tick)?;
         let mut ready = None;
 
         {
@@ -153,7 +203,7 @@ impl BboSink for ClickHouseSink {
         }
 
         if let Some(mut rows) = ready {
-            if let Err(err) = self.insert_rows(&rows).await {
+            if let Err(err) = self.insert_tick_rows(&rows).await {
                 let mut buffer = self.buffer.lock().await;
                 rows.append(&mut *buffer);
                 *buffer = rows;
@@ -174,7 +224,7 @@ impl BboSink for ClickHouseSink {
             return Ok(());
         }
 
-        if let Err(err) = self.insert_rows(&rows).await {
+        if let Err(err) = self.insert_tick_rows(&rows).await {
             let mut buffer = self.buffer.lock().await;
             rows.append(&mut *buffer);
             *buffer = rows;
@@ -186,12 +236,60 @@ impl BboSink for ClickHouseSink {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-struct ClickHouseRow {
+struct CatalogClickHouseRow {
+    catalog_id: String,
+    venue_instance_id: String,
+    instrument_id: String,
+    raw_symbol: String,
+    feed_symbol: Option<String>,
+    product_type: String,
+    base_asset: String,
+    quote_asset: String,
+    settle_asset: String,
+    margin_asset: String,
+    price_convention: String,
+    size_unit: String,
+    price_tick: Option<String>,
+    size_tick: Option<String>,
+    min_size: Option<String>,
+    status: String,
+    source_raw_json: Option<String>,
+}
+
+impl CatalogClickHouseRow {
+    fn from_catalog(catalog: &InstrumentCatalog) -> Self {
+        Self {
+            catalog_id: catalog.catalog_id.clone(),
+            venue_instance_id: catalog.venue_instance_id.clone(),
+            instrument_id: catalog.instrument_id.clone(),
+            raw_symbol: catalog.raw_symbol.clone(),
+            feed_symbol: catalog.feed_symbol.clone(),
+            product_type: catalog.product_type.as_str().to_string(),
+            base_asset: catalog.base_asset.clone(),
+            quote_asset: catalog.quote_asset.clone(),
+            settle_asset: catalog.settle_asset.clone(),
+            margin_asset: catalog.margin_asset.clone(),
+            price_convention: catalog.price_convention.as_str().to_string(),
+            size_unit: catalog.size_unit.as_str().to_string(),
+            price_tick: catalog.price_tick.map(|value| value.to_string()),
+            size_tick: catalog.size_tick.map(|value| value.to_string()),
+            min_size: catalog.min_size.map(|value| value.to_string()),
+            status: catalog.status.clone(),
+            source_raw_json: catalog
+                .source_raw_json
+                .as_ref()
+                .map(|value| value.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct BboClickHouseRow {
+    catalog_id: String,
+    venue_instance_id: String,
+    instrument_id: String,
     recv_ts_ns: i64,
     exchange_ts_ms: Option<i64>,
-    venue: String,
-    market_id: String,
-    market_symbol: Option<String>,
     sequence: Option<String>,
     source: String,
     bid_price: Option<f64>,
@@ -214,7 +312,7 @@ struct ClickHouseRow {
     quality_note: Option<String>,
 }
 
-impl ClickHouseRow {
+impl BboClickHouseRow {
     fn try_from_tick(tick: &BboTick) -> anyhow::Result<Self> {
         let (bid_price, bid_price_text, bid_size, bid_size_text, bid_order_count) =
             best_level_fields(tick.bid.as_ref());
@@ -228,9 +326,9 @@ impl ClickHouseRow {
                 format!("recv_ts_ns {} does not fit into Int64", tick.recv_ts_ns)
             })?,
             exchange_ts_ms: tick.exchange_ts_ms,
-            venue: tick.venue.as_str().to_string(),
-            market_id: tick.market.id.clone(),
-            market_symbol: tick.market.symbol.clone(),
+            catalog_id: tick.instrument.catalog_id.clone(),
+            venue_instance_id: tick.instrument.venue_instance_id.clone(),
+            instrument_id: tick.instrument.instrument_id.clone(),
             sequence: tick.sequence.map(|value| value.to_string()),
             source: source_kind_as_str(tick.source).to_string(),
             bid_price,
@@ -339,15 +437,34 @@ fn clickhouse_status_error(status: StatusCode, body: &str) -> anyhow::Error {
 mod tests {
     use std::str::FromStr;
 
-    use crate::domain::{BboTick, BestLevel, Fixed, MarketRef, SourceKind, Venue};
+    use crate::domain::{BboTick, BestLevel, Fixed, InstrumentCatalog, ProductType, SourceKind};
 
-    use super::{ClickHouseRow, validate_identifier};
+    use super::{BboClickHouseRow, CatalogClickHouseRow, validate_identifier};
+
+    fn catalog() -> InstrumentCatalog {
+        InstrumentCatalog::new(
+            "hyperliquid",
+            "BTC",
+            "BTC",
+            Some("BTC".to_string()),
+            ProductType::Perp,
+            "BTC",
+            "USDC",
+            "USDC",
+            "USDC",
+            "0.1".parse().ok(),
+            None,
+            None,
+            "active",
+            None,
+        )
+    }
 
     #[test]
     fn converts_bbo_tick_to_clickhouse_row() {
+        let catalog = catalog();
         let mut tick = BboTick::new(
-            Venue::Hyperliquid,
-            MarketRef::new("BTC", Some("BTC".to_string())),
+            catalog.instrument_ref(),
             1_800_000_000_000_000_000,
             Some(1_800_000_000_000),
             Some(42),
@@ -366,16 +483,30 @@ mod tests {
         tick.spread = Some(Fixed::from_str("0.10").unwrap());
         tick.mid = Some(Fixed::from_str("100.15").unwrap());
 
-        let row = ClickHouseRow::try_from_tick(&tick).unwrap();
+        let row = BboClickHouseRow::try_from_tick(&tick).unwrap();
 
         assert_eq!(row.recv_ts_ns, 1_800_000_000_000_000_000);
-        assert_eq!(row.venue, "hyperliquid");
-        assert_eq!(row.market_symbol.as_deref(), Some("BTC"));
+        assert_eq!(row.venue_instance_id, "hyperliquid");
+        assert_eq!(row.instrument_id, "BTC");
         assert_eq!(row.sequence.as_deref(), Some("42"));
         assert_eq!(row.bid_price_text.as_deref(), Some("100.1"));
         assert_eq!(row.ask_size_text.as_deref(), Some("1.5"));
         assert_eq!(row.spread_text.as_deref(), Some("0.1"));
         assert_eq!(row.mid, Some(100.15));
+    }
+
+    #[test]
+    fn converts_catalog_to_clickhouse_row() {
+        let row = CatalogClickHouseRow::from_catalog(&catalog());
+
+        assert_eq!(row.venue_instance_id, "hyperliquid");
+        assert_eq!(row.instrument_id, "BTC");
+        assert_eq!(row.product_type, "perp");
+        assert_eq!(row.base_asset, "BTC");
+        assert_eq!(row.quote_asset, "USDC");
+        assert_eq!(row.price_convention, "quote_per_base");
+        assert_eq!(row.size_unit, "base_asset");
+        assert_eq!(row.price_tick.as_deref(), Some("0.1"));
     }
 
     #[test]

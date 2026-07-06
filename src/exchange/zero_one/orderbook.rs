@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use crate::domain::{BboTick, BestLevel, Fixed, MarketRef, SourceKind, Venue};
+use crate::domain::{BboTick, BestLevel, Fixed, InstrumentRef, SourceKind};
 
 use super::parser::{OrderbookDelta, OrderbookSnapshot};
 
@@ -11,8 +11,7 @@ pub struct ZeroOneBooks {
 
 #[derive(Debug, Default)]
 struct MarketBook {
-    market_id: String,
-    label: String,
+    instrument: Option<InstrumentRef>,
     update_id: Option<i128>,
     bids: BTreeMap<Fixed, BestLevel>,
     asks: BTreeMap<Fixed, BestLevel>,
@@ -33,26 +32,18 @@ impl ZeroOneBooks {
     pub fn apply_snapshot(
         &mut self,
         market_symbol: &str,
-        market_id: &str,
-        label: &str,
+        instrument: InstrumentRef,
         snapshot: OrderbookSnapshot,
         recv_ts_ns: i128,
     ) -> BboTick {
         let book = self.books.entry(market_symbol.to_string()).or_default();
-        book.market_id = market_id.to_string();
-        book.label = label.to_string();
+        book.instrument = Some(instrument.clone());
         book.update_id = Some(snapshot.update_id);
         book.bids.clear();
         book.asks.clear();
         replace_side(&mut book.bids, snapshot.bids);
         replace_side(&mut book.asks, snapshot.asks);
-        build_tick(
-            market_id,
-            Some(label),
-            recv_ts_ns,
-            Some(snapshot.update_id),
-            book,
-        )
+        build_tick(recv_ts_ns, Some(snapshot.update_id), instrument, book)
     }
 
     pub fn apply_delta(&mut self, delta: OrderbookDelta, recv_ts_ns: i128) -> ApplyResult {
@@ -84,15 +75,22 @@ impl ZeroOneBooks {
             };
         }
 
+        let Some(instrument) = book.instrument.clone() else {
+            return ApplyResult::Gap {
+                market_symbol: delta.market_symbol,
+                expected_last_update_id: current_update_id,
+                received_last_update_id: delta.last_update_id,
+            };
+        };
+
         apply_side(&mut book.bids, delta.bids);
         apply_side(&mut book.asks, delta.asks);
         book.update_id = Some(delta.update_id);
 
         ApplyResult::Tick(build_tick(
-            &book.market_id,
-            Some(&book.label),
             recv_ts_ns,
             Some(delta.update_id),
+            instrument,
             book,
         ))
     }
@@ -113,18 +111,16 @@ fn apply_side(side: &mut BTreeMap<Fixed, BestLevel>, levels: Vec<BestLevel>) {
 }
 
 fn build_tick(
-    market_id: &str,
-    label: Option<&str>,
     recv_ts_ns: i128,
     sequence: Option<i128>,
+    instrument: InstrumentRef,
     book: &MarketBook,
 ) -> BboTick {
     let bid = book.bids.iter().next_back().map(|(_, level)| level.clone());
     let ask = book.asks.iter().next().map(|(_, level)| level.clone());
 
     BboTick::new(
-        Venue::ZeroOne,
-        MarketRef::new(market_id, label.map(str::to_string)),
+        instrument,
         recv_ts_ns,
         None,
         sequence,
@@ -137,7 +133,30 @@ fn build_tick(
 #[cfg(test)]
 mod tests {
     use super::{ApplyResult, ZeroOneBooks};
-    use crate::exchange::zero_one::parser::{parse_delta, parse_snapshot};
+    use crate::{
+        domain::{InstrumentCatalog, ProductType},
+        exchange::zero_one::parser::{parse_delta, parse_snapshot},
+    };
+
+    fn instrument() -> crate::domain::InstrumentRef {
+        InstrumentCatalog::new(
+            "01",
+            "0",
+            "BTCUSD",
+            Some("BTCUSD".to_string()),
+            ProductType::Perp,
+            "BTC",
+            "USD",
+            "USD",
+            "USD",
+            None,
+            None,
+            None,
+            "active",
+            None,
+        )
+        .instrument_ref()
+    }
 
     #[test]
     fn applies_snapshot_and_contiguous_delta() {
@@ -164,9 +183,9 @@ mod tests {
         .unwrap();
 
         let mut books = ZeroOneBooks::default();
-        let tick = books.apply_snapshot("BTCUSD", "0", "BTC", snapshot, 123);
-        assert_eq!(tick.venue.as_str(), "01");
-        assert_eq!(tick.market.symbol.as_deref(), Some("BTC"));
+        let tick = books.apply_snapshot("BTCUSD", instrument(), snapshot, 123);
+        assert_eq!(tick.instrument.venue_instance_id, "01");
+        assert_eq!(tick.instrument.instrument_id, "0");
         assert_eq!(tick.bid.unwrap().price.to_string(), "100");
         assert_eq!(tick.ask.unwrap().price.to_string(), "101");
 
@@ -196,7 +215,7 @@ mod tests {
         .unwrap();
 
         let mut books = ZeroOneBooks::default();
-        books.apply_snapshot("BTCUSD", "0", "BTC", snapshot, 123);
+        books.apply_snapshot("BTCUSD", instrument(), snapshot, 123);
 
         assert_eq!(
             books.apply_delta(delta, 124),
@@ -233,7 +252,7 @@ mod tests {
         .unwrap();
 
         let mut books = ZeroOneBooks::default();
-        books.apply_snapshot("BTCUSD", "0", "BTC", snapshot, 123);
+        books.apply_snapshot("BTCUSD", instrument(), snapshot, 123);
 
         let ApplyResult::Tick(tick) = books.apply_delta(delta, 124) else {
             panic!("expected overlapping delta to apply");
@@ -260,7 +279,7 @@ mod tests {
         .unwrap();
 
         let mut books = ZeroOneBooks::default();
-        books.apply_snapshot("BTCUSD", "0", "BTC", snapshot, 123);
+        books.apply_snapshot("BTCUSD", instrument(), snapshot, 123);
 
         assert_eq!(books.apply_delta(delta, 124), ApplyResult::Skipped);
     }

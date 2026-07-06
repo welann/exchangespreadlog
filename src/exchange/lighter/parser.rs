@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::domain::{BboTick, BestLevel, Fixed, MarketRef, SourceKind, Venue};
+use crate::domain::{BboTick, BestLevel, Fixed, InstrumentRef, SourceKind};
 
 #[derive(Debug, Deserialize)]
 struct TickerEnvelope {
@@ -18,7 +18,6 @@ struct TickerEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct Ticker {
-    s: Option<String>,
     a: Option<LighterLevel>,
     b: Option<LighterLevel>,
     #[serde(default)]
@@ -31,7 +30,11 @@ struct LighterLevel {
     size: String,
 }
 
-pub fn parse_message(text: &str, recv_ts_ns: i128) -> Result<Option<BboTick>> {
+pub fn parse_message(
+    text: &str,
+    recv_ts_ns: i128,
+    venue_instance_id: &str,
+) -> Result<Option<BboTick>> {
     let value: Value = serde_json::from_str(text)?;
     if value.get("type").and_then(Value::as_str) != Some("update/ticker") {
         return Ok(None);
@@ -48,7 +51,6 @@ pub fn parse_message(text: &str, recv_ts_ns: i128) -> Result<Option<BboTick>> {
         .split_once(':')
         .map(|(_, id)| id.to_string())
         .unwrap_or_else(|| envelope.channel.clone());
-    let symbol = ticker.s.clone();
     let bid = ticker.b.as_ref().map(parse_level).transpose()?;
     let ask = ticker.a.as_ref().map(parse_level).transpose()?;
     let exchange_ts_ms = envelope
@@ -56,8 +58,7 @@ pub fn parse_message(text: &str, recv_ts_ns: i128) -> Result<Option<BboTick>> {
         .or_else(|| ticker.last_updated_at.map(micros_to_millis));
 
     Ok(Some(BboTick::new(
-        Venue::Lighter,
-        MarketRef::new(market_id, symbol),
+        InstrumentRef::unchecked(venue_instance_id, market_id),
         recv_ts_ns,
         exchange_ts_ms,
         envelope.nonce,
@@ -68,6 +69,7 @@ pub fn parse_message(text: &str, recv_ts_ns: i128) -> Result<Option<BboTick>> {
 }
 
 fn micros_to_millis(value: i64) -> i64 {
+    // Flips when epoch milliseconds exceed 10^13, around 2286 CE; use an explicit unit flag before then.
     if value > 10_000_000_000_000 {
         value / 1_000
     } else {
@@ -86,7 +88,7 @@ fn parse_level(level: &LighterLevel) -> Result<BestLevel> {
 #[cfg(test)]
 mod tests {
     use super::parse_message;
-    use crate::domain::{SourceKind, Venue};
+    use crate::domain::SourceKind;
 
     #[test]
     fn parses_lighter_ticker() {
@@ -104,10 +106,9 @@ mod tests {
             "type":"update/ticker"
         }"#;
 
-        let tick = parse_message(raw, 123).unwrap().unwrap();
-        assert_eq!(tick.venue, Venue::Lighter);
-        assert_eq!(tick.market.id, "0");
-        assert_eq!(tick.market.symbol.as_deref(), Some("ETH"));
+        let tick = parse_message(raw, 123, "lighter").unwrap().unwrap();
+        assert_eq!(tick.instrument.venue_instance_id, "lighter");
+        assert_eq!(tick.instrument.instrument_id, "0");
         assert_eq!(tick.sequence, Some(9182249734));
         assert_eq!(tick.source, SourceKind::Ticker);
         assert_eq!(tick.bid.unwrap().size.to_string(), "1.0392");
@@ -117,12 +118,12 @@ mod tests {
     #[test]
     fn ignores_non_ticker_messages() {
         let raw = r#"{"type":"subscribed/ticker","channel":"ticker:0"}"#;
-        assert!(parse_message(raw, 123).unwrap().is_none());
+        assert!(parse_message(raw, 123, "lighter").unwrap().is_none());
     }
 
     #[test]
     fn ignores_non_ticker_messages_without_channel() {
         let raw = r#"{"type":"connected","timestamp":1774883844933,"code":200}"#;
-        assert!(parse_message(raw, 123).unwrap().is_none());
+        assert!(parse_message(raw, 123, "lighter").unwrap().is_none());
     }
 }

@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::domain::{BboTick, BestLevel, Fixed, MarketRef, SourceKind, Venue};
+use crate::domain::{BboTick, BestLevel, Fixed, InstrumentRef, SourceKind};
 
 #[derive(Debug, Deserialize)]
 struct Envelope {
@@ -33,28 +33,31 @@ struct WsLevel {
     n: Option<u32>,
 }
 
-pub fn parse_message(text: &str, recv_ts_ns: i128) -> Result<Option<BboTick>> {
+pub fn parse_message(
+    text: &str,
+    recv_ts_ns: i128,
+    venue_instance_id: &str,
+) -> Result<Option<BboTick>> {
     let envelope: Envelope = serde_json::from_str(text)?;
     let Some(data) = envelope.data else {
         return Ok(None);
     };
 
     match envelope.channel.as_str() {
-        "bbo" => parse_bbo(data, recv_ts_ns).map(Some),
-        "l2Book" => parse_l2_book(data, recv_ts_ns).map(Some),
+        "bbo" => parse_bbo(data, recv_ts_ns, venue_instance_id).map(Some),
+        "l2Book" => parse_l2_book(data, recv_ts_ns, venue_instance_id).map(Some),
         "subscriptionResponse" | "pong" => Ok(None),
         _ => Ok(None),
     }
 }
 
-fn parse_bbo(data: Value, recv_ts_ns: i128) -> Result<BboTick> {
+fn parse_bbo(data: Value, recv_ts_ns: i128, venue_instance_id: &str) -> Result<BboTick> {
     let bbo: WsBbo = serde_json::from_value(data)?;
     let bid = bbo.bbo[0].as_ref().map(parse_level).transpose()?;
     let ask = bbo.bbo[1].as_ref().map(parse_level).transpose()?;
 
     Ok(BboTick::new(
-        Venue::Hyperliquid,
-        MarketRef::new(bbo.coin.clone(), Some(bbo.coin)),
+        InstrumentRef::unchecked(venue_instance_id, bbo.coin),
         recv_ts_ns,
         Some(bbo.time),
         None,
@@ -64,14 +67,13 @@ fn parse_bbo(data: Value, recv_ts_ns: i128) -> Result<BboTick> {
     ))
 }
 
-fn parse_l2_book(data: Value, recv_ts_ns: i128) -> Result<BboTick> {
+fn parse_l2_book(data: Value, recv_ts_ns: i128, venue_instance_id: &str) -> Result<BboTick> {
     let book: WsBook = serde_json::from_value(data)?;
     let bid = book.levels[0].first().map(parse_level).transpose()?;
     let ask = book.levels[1].first().map(parse_level).transpose()?;
 
     Ok(BboTick::new(
-        Venue::Hyperliquid,
-        MarketRef::new(book.coin.clone(), Some(book.coin)),
+        InstrumentRef::unchecked(venue_instance_id, book.coin),
         recv_ts_ns,
         Some(book.time),
         None,
@@ -92,7 +94,7 @@ fn parse_level(level: &WsLevel) -> Result<BestLevel> {
 #[cfg(test)]
 mod tests {
     use super::parse_message;
-    use crate::domain::{SourceKind, Venue};
+    use crate::domain::SourceKind;
 
     #[test]
     fn parses_hyperliquid_bbo() {
@@ -108,9 +110,9 @@ mod tests {
             }
         }"#;
 
-        let tick = parse_message(raw, 123).unwrap().unwrap();
-        assert_eq!(tick.venue, Venue::Hyperliquid);
-        assert_eq!(tick.market.label(), "BTC");
+        let tick = parse_message(raw, 123, "hyperliquid").unwrap().unwrap();
+        assert_eq!(tick.instrument.venue_instance_id, "hyperliquid");
+        assert_eq!(tick.instrument.instrument_id, "BTC");
         assert_eq!(tick.source, SourceKind::Bbo);
         assert_eq!(tick.bid.unwrap().price.to_string(), "65000.5");
         assert_eq!(tick.ask.unwrap().size.to_string(), "0.42");
@@ -119,7 +121,7 @@ mod tests {
     #[test]
     fn ignores_subscription_ack() {
         let raw = r#"{"channel":"subscriptionResponse","data":{"ok":true}}"#;
-        assert!(parse_message(raw, 123).unwrap().is_none());
+        assert!(parse_message(raw, 123, "hyperliquid").unwrap().is_none());
     }
 
     #[test]
@@ -141,8 +143,8 @@ mod tests {
             }
         }"#;
 
-        let tick = parse_message(raw, 123).unwrap().unwrap();
-        assert_eq!(tick.market.label(), "ETH");
+        let tick = parse_message(raw, 123, "hyperliquid").unwrap().unwrap();
+        assert_eq!(tick.instrument.instrument_id, "ETH");
         assert_eq!(tick.source, SourceKind::L2Book);
         assert_eq!(tick.bid.unwrap().price.to_string(), "3500.1");
         assert_eq!(tick.ask.unwrap().order_count, Some(5));

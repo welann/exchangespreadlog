@@ -3,82 +3,130 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::domain::{BboTick, Venue};
+use crate::domain::{BboTick, InstrumentCatalog, QuoteRateBook};
 
 pub type SharedBboState = Arc<RwLock<BboStore>>;
 
-pub fn new_shared_state() -> SharedBboState {
-    Arc::new(RwLock::new(BboStore::default()))
+pub fn new_shared_state(rates: QuoteRateBook) -> SharedBboState {
+    Arc::new(RwLock::new(BboStore::new(rates)))
 }
 
 #[derive(Debug, Default)]
 pub struct BboStore {
-    ticks: HashMap<(Venue, String), BboTick>,
+    catalogs: HashMap<String, InstrumentCatalog>,
+    ticks: HashMap<String, BboTick>,
+    rates: QuoteRateBook,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct BboSnapshot {
     pub ticks: Vec<BboTick>,
-    pub venues: Vec<Venue>,
+    pub catalogs: HashMap<String, InstrumentCatalog>,
     pub markets: Vec<String>,
+    pub rates: QuoteRateBook,
+}
+
+pub struct BboRow<'a> {
+    pub tick: &'a BboTick,
+    pub catalog: Option<&'a InstrumentCatalog>,
 }
 
 impl BboStore {
-    pub fn update(&mut self, tick: BboTick) {
-        let market = market_key(&tick);
-        self.ticks.insert((tick.venue, market), tick);
+    pub fn new(rates: QuoteRateBook) -> Self {
+        Self {
+            rates,
+            ..Self::default()
+        }
+    }
+
+    pub fn update_catalog(&mut self, catalog: InstrumentCatalog) {
+        self.catalogs.insert(catalog.catalog_id.clone(), catalog);
+    }
+
+    pub fn update_tick(&mut self, tick: BboTick) {
+        self.ticks.insert(tick.instrument.catalog_id.clone(), tick);
     }
 
     pub fn snapshot(&self) -> BboSnapshot {
         let mut ticks = self.ticks.values().cloned().collect::<Vec<_>>();
         ticks.sort_by(|lhs, rhs| {
-            lhs.market
-                .label()
-                .cmp(rhs.market.label())
-                .then(lhs.venue.as_str().cmp(rhs.venue.as_str()))
+            market_key_for(&self.catalogs, lhs)
+                .cmp(&market_key_for(&self.catalogs, rhs))
+                .then(
+                    instrument_label_for(&self.catalogs, lhs)
+                        .cmp(&instrument_label_for(&self.catalogs, rhs)),
+                )
         });
 
-        let venues = ticks
-            .iter()
-            .map(|tick| tick.venue)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
         let markets = ticks
             .iter()
-            .map(market_key)
+            .map(|tick| market_key_for(&self.catalogs, tick))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
 
         BboSnapshot {
             ticks,
-            venues,
+            catalogs: self.catalogs.clone(),
             markets,
+            rates: self.rates.clone(),
         }
     }
 }
 
 impl BboSnapshot {
-    pub fn find(&self, venue: Venue, market: &str) -> Option<&BboTick> {
-        self.ticks
-            .iter()
-            .find(|tick| tick.venue == venue && market_key(tick) == market)
+    pub fn catalog_for(&self, tick: &BboTick) -> Option<&InstrumentCatalog> {
+        self.catalogs.get(&tick.instrument.catalog_id)
     }
 
-    pub fn rows_for_market(&self, market: &str) -> Vec<&BboTick> {
+    pub fn rows_for_market(&self, market: &str) -> Vec<BboRow<'_>> {
         self.ticks
             .iter()
-            .filter(|tick| market_key(tick) == market)
+            .filter(|tick| self.market_key(tick) == market)
+            .map(|tick| BboRow {
+                tick,
+                catalog: self.catalog_for(tick),
+            })
             .collect()
+    }
+
+    pub fn row_for_market(&self, market: &str, index: usize) -> Option<BboRow<'_>> {
+        self.rows_for_market(market).into_iter().nth(index)
+    }
+
+    pub fn market_key(&self, tick: &BboTick) -> String {
+        market_key_for(&self.catalogs, tick)
+    }
+
+    pub fn instrument_label(&self, tick: &BboTick) -> String {
+        instrument_label_for(&self.catalogs, tick)
     }
 }
 
-pub fn market_key(tick: &BboTick) -> String {
-    tick.market
-        .symbol
-        .clone()
-        .unwrap_or_else(|| tick.market.id.clone())
+fn market_key_for(catalogs: &HashMap<String, InstrumentCatalog>, tick: &BboTick) -> String {
+    catalogs
+        .get(&tick.instrument.catalog_id)
+        .map(|catalog| catalog.base_asset.clone())
+        .unwrap_or_else(|| tick.instrument.instrument_id.clone())
+}
+
+fn instrument_label_for(catalogs: &HashMap<String, InstrumentCatalog>, tick: &BboTick) -> String {
+    catalogs
+        .get(&tick.instrument.catalog_id)
+        .map(|catalog| {
+            format!(
+                "{}/{} {}",
+                catalog.venue_instance_id,
+                catalog.display_symbol(),
+                catalog.quote_asset
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "{}/{}",
+                tick.instrument.venue_instance_id, tick.instrument.instrument_id
+            )
+        })
 }
 
 #[cfg(test)]
@@ -86,14 +134,40 @@ mod tests {
     use std::str::FromStr;
 
     use crate::{
-        domain::{BboTick, BestLevel, Fixed, MarketRef, SourceKind, Venue},
-        state::{BboStore, market_key},
+        domain::{
+            BboTick, BestLevel, Fixed, InstrumentCatalog, ProductType, QuoteRateBook, SourceKind,
+        },
+        state::BboStore,
     };
 
-    fn tick(venue: Venue, market_id: &str, symbol: Option<&str>) -> BboTick {
-        BboTick::new(
+    fn catalog(
+        venue: &str,
+        id: &str,
+        raw_symbol: &str,
+        base: &str,
+        quote: &str,
+    ) -> InstrumentCatalog {
+        InstrumentCatalog::new(
             venue,
-            MarketRef::new(market_id, symbol.map(str::to_string)),
+            id,
+            raw_symbol,
+            Some(id.to_string()),
+            ProductType::Perp,
+            base,
+            quote,
+            quote,
+            quote,
+            None,
+            None,
+            None,
+            "active",
+            None,
+        )
+    }
+
+    fn tick(catalog: &InstrumentCatalog) -> BboTick {
+        BboTick::new(
+            catalog.instrument_ref(),
             123,
             Some(456),
             None,
@@ -112,23 +186,17 @@ mod tests {
     }
 
     #[test]
-    fn groups_markets_by_symbol_when_available() {
-        let lighter = tick(Venue::Lighter, "0", Some("ETH"));
-        assert_eq!(market_key(&lighter), "ETH");
-
-        let hyperliquid = tick(Venue::Hyperliquid, "ETH", Some("ETH"));
-        assert_eq!(market_key(&hyperliquid), "ETH");
-    }
-
-    #[test]
-    fn snapshot_tracks_venues_and_markets() {
-        let mut store = BboStore::default();
-        store.update(tick(Venue::Hyperliquid, "BTC", Some("BTC")));
-        store.update(tick(Venue::Lighter, "0", Some("ETH")));
+    fn keeps_multiple_instruments_for_same_base_asset() {
+        let mut store = BboStore::new(QuoteRateBook::default());
+        let usdc = catalog("dex", "BTC-USDC", "BTC-USDC", "BTC", "USDC");
+        let usdt = catalog("dex", "BTC-USDT", "BTC-USDT", "BTC", "USDT");
+        store.update_catalog(usdc.clone());
+        store.update_catalog(usdt.clone());
+        store.update_tick(tick(&usdc));
+        store.update_tick(tick(&usdt));
 
         let snapshot = store.snapshot();
-        assert_eq!(snapshot.venues.len(), 2);
-        assert_eq!(snapshot.markets, vec!["BTC".to_string(), "ETH".to_string()]);
-        assert!(snapshot.find(Venue::Hyperliquid, "BTC").is_some());
+        assert_eq!(snapshot.markets, vec!["BTC".to_string()]);
+        assert_eq!(snapshot.rows_for_market("BTC").len(), 2);
     }
 }

@@ -12,6 +12,7 @@ jsonl_dir = "data/bbo"
 url = "https://obdata.zeabur.app/"
 database = "zeabur"
 table = "bbo_ticks"
+catalog_table = "instrument_catalog"
 username = "zeabur"
 password_env = "CLICKHOUSE_PASSWORD"
 create_table = true
@@ -21,46 +22,148 @@ batch_size = 100
 enabled = true
 refresh_ms = 250
 
+[[quote_rates]]
+from = "USDC"
+to = "USD"
+rate = "1"
+
+[[quote_rates]]
+from = "USDT"
+to = "USD"
+rate = "1"
+
 [[venues]]
-name = "hyperliquid"
+venue_instance_id = "hyperliquid"
+adapter = "hyperliquid"
 enabled = true
 url = "wss://api.hyperliquid.xyz/ws"
-markets = [
-    "BTC",
-    "ETH",
-    "SOL",
-]
 channel = "bbo"
+default_quote_asset = "USDC"
+default_settle_asset = "USDC"
+default_margin_asset = "USDC"
+
+[[venues.instruments]]
+instrument_id = "BTC"
+raw_symbol = "BTC"
+feed_symbol = "BTC"
+product_type = "perp"
+base_asset = "BTC"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "ETH"
+raw_symbol = "ETH"
+feed_symbol = "ETH"
+product_type = "perp"
+base_asset = "ETH"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "SOL"
+raw_symbol = "SOL"
+feed_symbol = "SOL"
+product_type = "perp"
+base_asset = "SOL"
+status = "active"
 
 [[venues]]
-name = "lighter"
+venue_instance_id = "lighter"
+adapter = "lighter"
 enabled = true
 url = "wss://mainnet.zklighter.elliot.ai/stream"
-markets = [
-    "0",
-    "1",
-    "2",
-]
 channel = "ticker"
+default_quote_asset = "USDC"
+default_settle_asset = "USDC"
+default_margin_asset = "USDC"
+
+[[venues.instruments]]
+instrument_id = "0"
+raw_symbol = "BTC"
+feed_symbol = "0"
+product_type = "perp"
+base_asset = "BTC"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "1"
+raw_symbol = "ETH"
+feed_symbol = "1"
+product_type = "perp"
+base_asset = "ETH"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "2"
+raw_symbol = "SOL"
+feed_symbol = "2"
+product_type = "perp"
+base_asset = "SOL"
+status = "active"
 
 [[venues]]
-name = "risex"
+venue_instance_id = "risex"
+adapter = "risex"
 enabled = true
 url = "wss://ws.rise.trade/ws"
-markets = [
-    "1:BTC",
-    "2:ETH",
-    "4:SOL",
-]
 channel = "orderbook"
+default_quote_asset = "USDC"
+default_settle_asset = "USDC"
+default_margin_asset = "USDC"
+
+[[venues.instruments]]
+instrument_id = "1"
+raw_symbol = "BTC"
+feed_symbol = "1"
+product_type = "perp"
+base_asset = "BTC"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "2"
+raw_symbol = "ETH"
+feed_symbol = "2"
+product_type = "perp"
+base_asset = "ETH"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "4"
+raw_symbol = "SOL"
+feed_symbol = "4"
+product_type = "perp"
+base_asset = "SOL"
+status = "active"
 
 [[venues]]
-name = "01"
+venue_instance_id = "01"
+adapter = "01"
 enabled = true
 url = "wss://zo-mainnet.n1.xyz"
-markets = [
-    "0:BTC:BTCUSD",
-    "1:ETH:ETHUSD",
-    "2:SOL:SOLUSD",
-]
 channel = "deltas"
+default_quote_asset = "USD"
+default_settle_asset = "USD"
+default_margin_asset = "USD"
+
+[[venues.instruments]]
+instrument_id = "0"
+raw_symbol = "BTCUSD"
+feed_symbol = "BTCUSD"
+product_type = "perp"
+base_asset = "BTC"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "1"
+raw_symbol = "ETHUSD"
+feed_symbol = "ETHUSD"
+product_type = "perp"
+base_asset = "ETH"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "2"
+raw_symbol = "SOLUSD"
+feed_symbol = "SOLUSD"
+product_type = "perp"
+base_asset = "SOL"
+status = "active"

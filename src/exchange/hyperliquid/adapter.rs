@@ -12,7 +12,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::VenueConfig, domain::BboTick, exchange::ExchangeAdapter, ingest::supervisor::Backoff,
+    config::VenueConfig,
+    domain::MarketEvent,
+    exchange::{CatalogIndex, ExchangeAdapter, run_with_reconnect},
     ingest::ws,
 };
 
@@ -20,46 +22,61 @@ use super::parser;
 
 #[derive(Debug, Clone)]
 pub struct HyperliquidAdapter {
+    venue_instance_id: String,
     url: String,
-    markets: Vec<String>,
+    catalog: CatalogIndex,
     channel: String,
 }
 
 impl HyperliquidAdapter {
     pub fn from_config(config: &VenueConfig) -> Self {
         Self {
+            venue_instance_id: config.venue_instance_id.clone(),
             url: config
                 .url
                 .clone()
                 .unwrap_or_else(|| "wss://api.hyperliquid.xyz/ws".to_string()),
-            markets: config.markets.clone(),
+            catalog: CatalogIndex::new(config.catalog()),
             channel: config.channel.clone().unwrap_or_else(|| "bbo".to_string()),
         }
     }
 
     async fn run_once(
         &self,
-        tx: Sender<BboTick>,
+        tx: Sender<MarketEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
+        for instrument in self.catalog.instruments() {
+            tx.send(MarketEvent::Catalog {
+                instrument: instrument.clone(),
+            })
+            .await
+            .context("send Hyperliquid catalog")?;
+        }
+
         let (stream, _) = ws::connect(&self.url).await?;
         let (mut write, mut read) = stream.split();
 
-        for market in &self.markets {
+        for instrument in self.catalog.instruments() {
+            let feed_key = instrument.feed_key();
             let payload = json!({
                 "method": "subscribe",
                 "subscription": {
                     "type": self.channel,
-                    "coin": market,
+                    "coin": feed_key,
                 }
             });
             write
                 .send(Message::Text(payload.to_string()))
                 .await
-                .with_context(|| format!("subscribe Hyperliquid {market}"))?;
+                .with_context(|| format!("subscribe Hyperliquid {feed_key}"))?;
         }
 
-        info!(venue = "hyperliquid", markets = ?self.markets, "subscribed");
+        info!(
+            venue = %self.venue_instance_id,
+            instruments = ?self.catalog.instruments(),
+            "subscribed"
+        );
         let mut heartbeat = time::interval(Duration::from_secs(30));
 
         loop {
@@ -80,9 +97,11 @@ impl HyperliquidAdapter {
                     match msg? {
                         Message::Text(text) => {
                             let recv_ts_ns = crate::ingest::time::unix_time_ns();
-                            match parser::parse_message(&text, recv_ts_ns) {
+                            match parser::parse_message(&text, recv_ts_ns, &self.venue_instance_id) {
                                 Ok(Some(tick)) => {
-                                    tx.send(tick).await.context("send Hyperliquid tick")?;
+                                    if let Some(tick) = self.catalog.retarget_tick(tick) {
+                                        tx.send(MarketEvent::Tick { tick }).await.context("send Hyperliquid tick")?;
+                                    }
                                 }
                                 Ok(None) => {}
                                 Err(err) => {
@@ -108,20 +127,12 @@ impl HyperliquidAdapter {
 impl ExchangeAdapter for HyperliquidAdapter {
     async fn run(
         &self,
-        tx: Sender<BboTick>,
+        tx: Sender<MarketEvent>,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let mut backoff = Backoff::default();
-        while !*shutdown.borrow() {
-            match self.run_once(tx.clone(), shutdown.clone()).await {
-                Ok(()) => return Ok(()),
-                Err(err) => {
-                    let sleep = backoff.next_delay();
-                    warn!(venue = "hyperliquid", error = %err, ?sleep, "adapter restarting");
-                    time::sleep(sleep).await;
-                }
-            }
-        }
-        Ok(())
+        run_with_reconnect("hyperliquid", tx, shutdown, |tx, shutdown| {
+            self.run_once(tx, shutdown)
+        })
+        .await
     }
 }

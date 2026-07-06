@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 
-use crate::domain::{BboTick, BestLevel, Fixed, MarketRef, SourceKind, Venue};
+use crate::domain::{BboTick, BestLevel, Fixed, InstrumentRef, SourceKind};
 
 use super::parser::{OrderbookDelta, RiseLevelDelta};
 
@@ -13,7 +13,7 @@ pub struct RisexBooks {
 
 #[derive(Debug, Default)]
 struct MarketBook {
-    symbol: Option<String>,
+    instrument: Option<InstrumentRef>,
     has_snapshot: bool,
     checksum_compatible: Option<bool>,
     bids: BTreeMap<Fixed, StoredLevel>,
@@ -32,15 +32,12 @@ impl RisexBooks {
         &mut self,
         delta: OrderbookDelta,
         recv_ts_ns: i128,
-        configured_symbol: Option<&str>,
+        configured_instrument: Option<InstrumentRef>,
     ) -> Result<Option<BboTick>> {
         let market_id = delta.market_id.clone();
-        let symbol = configured_symbol
-            .map(str::to_string)
-            .or_else(|| delta.product.as_deref().map(symbol_from_product));
         let book = self.books.entry(market_id.clone()).or_default();
-        if symbol.is_some() {
-            book.symbol = symbol;
+        if configured_instrument.is_some() {
+            book.instrument = configured_instrument;
         }
 
         if delta.is_snapshot {
@@ -83,9 +80,12 @@ impl RisexBooks {
             .next()
             .map(|(_, level)| level.level.clone());
 
+        let Some(instrument) = book.instrument.clone() else {
+            return Ok(None);
+        };
+
         let mut tick = BboTick::new(
-            Venue::Risex,
-            MarketRef::new(market_id, book.symbol.clone()),
+            instrument,
             recv_ts_ns,
             delta.exchange_ts_ms,
             delta.sequence,
@@ -156,17 +156,33 @@ fn crc32_ieee(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn symbol_from_product(product: &str) -> String {
-    product
-        .split_once('-')
-        .map(|(base, _)| base.to_string())
-        .unwrap_or_else(|| product.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{RisexBooks, crc32_ieee};
-    use crate::exchange::risex::parser::{ParsedMessage, parse_message};
+    use crate::{
+        domain::{InstrumentCatalog, ProductType},
+        exchange::risex::parser::{ParsedMessage, parse_message},
+    };
+
+    fn instrument() -> crate::domain::InstrumentRef {
+        InstrumentCatalog::new(
+            "risex",
+            "1",
+            "BTC",
+            Some("1".to_string()),
+            ProductType::Perp,
+            "BTC",
+            "USDC",
+            "USDC",
+            "USDC",
+            None,
+            None,
+            None,
+            "active",
+            None,
+        )
+        .instrument_ref()
+    }
 
     #[test]
     fn crc32_matches_standard_check_value() {
@@ -209,16 +225,22 @@ mod tests {
         let ParsedMessage::Orderbook(snapshot) = parse_message(snapshot).unwrap() else {
             panic!("expected snapshot");
         };
-        let tick = books.apply(snapshot, 123, Some("BTC")).unwrap().unwrap();
-        assert_eq!(tick.venue.as_str(), "risex");
-        assert_eq!(tick.market.symbol.as_deref(), Some("BTC"));
+        let tick = books
+            .apply(snapshot, 123, Some(instrument()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(tick.instrument.venue_instance_id, "risex");
+        assert_eq!(tick.instrument.instrument_id, "1");
         assert_eq!(tick.bid.unwrap().price.to_string(), "100");
         assert_eq!(tick.ask.unwrap().price.to_string(), "101");
 
         let ParsedMessage::Orderbook(update) = parse_message(update).unwrap() else {
             panic!("expected update");
         };
-        let tick = books.apply(update, 124, Some("BTC")).unwrap().unwrap();
+        let tick = books
+            .apply(update, 124, Some(instrument()))
+            .unwrap()
+            .unwrap();
         assert_eq!(tick.sequence, Some(2_000_007));
         assert_eq!(tick.bid.unwrap().price.to_string(), "99");
         assert_eq!(tick.ask.unwrap().price.to_string(), "100.5");
@@ -241,7 +263,12 @@ mod tests {
             panic!("expected update");
         };
         let mut books = RisexBooks::default();
-        assert!(books.apply(update, 123, Some("BTC")).unwrap().is_none());
+        assert!(
+            books
+                .apply(update, 123, Some(instrument()))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -262,7 +289,10 @@ mod tests {
             panic!("expected snapshot");
         };
         let mut books = RisexBooks::default();
-        let tick = books.apply(snapshot, 123, Some("BTC")).unwrap().unwrap();
+        let tick = books
+            .apply(snapshot, 123, Some(instrument()))
+            .unwrap()
+            .unwrap();
 
         assert!(!tick.quality.inconsistent);
         assert!(
@@ -287,7 +317,10 @@ mod tests {
         let ParsedMessage::Orderbook(update) = parse_message(update).unwrap() else {
             panic!("expected update");
         };
-        let tick = books.apply(update, 124, Some("BTC")).unwrap().unwrap();
+        let tick = books
+            .apply(update, 124, Some(instrument()))
+            .unwrap()
+            .unwrap();
         assert!(tick.quality.note.is_none());
     }
 }

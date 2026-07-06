@@ -23,7 +23,7 @@ By default, Hyperliquid, Lighter, RiseX, and 01 are enabled in `config.example.t
     |-- lib.rs              # Library module exports
     |-- app/runner.rs       # Application orchestration and shutdown handling
     |-- config/             # TOML config model and defaults
-    |-- domain/             # BBO tick, market, venue, fixed decimal, quality models
+    |-- domain/             # BBO tick, market catalog, fixed decimal, quality models
     |-- exchange/           # Exchange adapters and message parsers
     |   |-- hyperliquid/
     |   |-- lighter/
@@ -65,18 +65,21 @@ cargo run -- --print-default-config
 Important config sections:
 
 - `pipeline.channel_capacity`: internal tick channel size.
-- `pipeline.stale_after_ms`: stale threshold reserved in the config model.
+- `pipeline.stale_after_ms`: marks ticks stale when exchange timestamps lag local receive time by more than this threshold. Set to `0` to disable stale marking.
 - `storage.mode`: storage target. Supported values are `none`, `jsonl`, `clickhouse`, and `both`.
 - `storage.jsonl_dir`: base output directory, default `data/bbo`.
 - `storage.clickhouse.url`: ClickHouse HTTP endpoint.
 - `storage.clickhouse.database`: ClickHouse database name.
-- `storage.clickhouse.table`: ClickHouse table name. The collector creates it when `create_table = true`.
+- `storage.clickhouse.table`: raw BBO tick table name. The collector creates it when `create_table = true`.
+- `storage.clickhouse.catalog_table`: instrument catalog table name.
 - `storage.clickhouse.username`: ClickHouse HTTP username.
 - `storage.clickhouse.password_env`: environment variable holding the ClickHouse password.
 - `storage.clickhouse.batch_size`: number of rows buffered before each HTTP insert.
 - `tui.enabled`: enable or disable the terminal UI.
 - `tui.refresh_ms`: terminal UI refresh interval.
-- `venues`: exchange WebSocket settings.
+- `quote_rates`: optional direct quote conversion rates used by the TUI for cross-quote spread display.
+- `venues`: adapter settings plus default quote/settle/margin assets.
+- `venues.instruments`: the explicit instrument catalog for that venue instance.
 
 Example ClickHouse storage config for the Zeabur service:
 
@@ -89,6 +92,7 @@ jsonl_dir = "data/bbo"
 url = "https://obdata.zeabur.app/"
 database = "zeabur"
 table = "bbo_ticks"
+catalog_table = "instrument_catalog"
 username = "zeabur"
 password_env = "CLICKHOUSE_PASSWORD"
 create_table = true
@@ -104,36 +108,39 @@ export CLICKHOUSE_PASSWORD='your-clickhouse-password'
 Example venue entries:
 
 ```toml
-[[venues]]
-name = "hyperliquid"
-enabled = true
-url = "wss://api.hyperliquid.xyz/ws"
-markets = ["BTC", "ETH", "SOL"]
-channel = "bbo"
+[[quote_rates]]
+from = "USDC"
+to = "USD"
+rate = "1"
 
 [[venues]]
-name = "lighter"
-enabled = false
+venue_instance_id = "lighter"
+adapter = "lighter"
+enabled = true
 url = "wss://mainnet.zklighter.elliot.ai/stream"
-markets = ["0", "1", "2"]
 channel = "ticker"
+default_quote_asset = "USDC"
+default_settle_asset = "USDC"
+default_margin_asset = "USDC"
 
-[[venues]]
-name = "risex"
-enabled = true
-url = "wss://ws.rise.trade/ws"
-markets = ["1:BTC", "2:ETH", "4:SOL"]
-channel = "orderbook"
+[[venues.instruments]]
+instrument_id = "0"
+raw_symbol = "BTC"
+feed_symbol = "0"
+product_type = "perp"
+base_asset = "BTC"
+status = "active"
 
-[[venues]]
-name = "01"
-enabled = true
-url = "wss://zo-mainnet.n1.xyz"
-markets = ["0:BTC:BTCUSD", "1:ETH:ETHUSD", "2:SOL:SOLUSD"]
-channel = "deltas"
+[[venues.instruments]]
+instrument_id = "1"
+raw_symbol = "ETH"
+feed_symbol = "1"
+product_type = "perp"
+base_asset = "ETH"
+status = "active"
 ```
 
-For Hyperliquid, market values are symbols such as `BTC` or `ETH`. For Lighter, market values are market IDs such as `0` or `1`. For RiseX, market values are numeric mainnet market IDs; use `id:symbol` such as `1:BTC` to align the TUI market label with other venues. For 01, use `id:label:feed_symbol`, for example `0:BTC:BTCUSD`; the adapter fetches `GET /market/{id}/orderbook` for the snapshot and subscribes to `deltas@{feed_symbol}` for updates.
+`venue_instance_id` is the pricing domain, not just the adapter name. If a protocol exposes independent domains such as HIP3 markets, configure them as separate venue instances. `instrument_id` is the exchange/internal market ID; `feed_symbol` is the subscription key when it differs. Quote, settle, and margin assets default from the venue and can be overridden per instrument.
 
 ## Running
 
@@ -190,22 +197,22 @@ Stop the collector with `Ctrl-C`. When the TUI is enabled, `q` or `Esc` also exi
 
 - `q` / `Esc`: quit.
 - `Tab`: switch focus between BBO and spread panels.
-- `Left` / `Right`: switch selected market.
-- `Up` / `Down`: switch selected venue.
-- `1` / `2`: choose the first or second venue leg in the spread panel.
+- `Left` / `Right`: switch selected base asset.
+- `Up` / `Down`: switch selected instrument row.
+- `1` / `2`: choose the first or second instrument leg in the spread panel.
 
 ## Output
 
 When `storage.mode = "jsonl"` or `storage.mode = "both"`, ticks are written under:
 
 ```text
-data/bbo/YYYY-MM-DD/<venue>.jsonl
+data/bbo/catalog/YYYY-MM-DD/<venue_instance_id>.jsonl
+data/bbo/bbo/YYYY-MM-DD/<venue_instance_id>.jsonl
 ```
 
-Each line is one normalized `BboTick` JSON object. Common fields include:
+Catalog lines contain static instrument metadata such as base/quote assets and trading rules. BBO lines are narrow `BboTick` JSON objects. Common tick fields include:
 
-- `venue`: exchange name.
-- `market`: market ID and optional display symbol.
+- `instrument`: `catalog_id`, `venue_instance_id`, and `instrument_id`.
 - `recv_ts_ns`: local receive timestamp in nanoseconds.
 - `exchange_ts_ms`: exchange timestamp when provided by the feed.
 - `sequence`: feed sequence/nonce when provided.
@@ -213,11 +220,11 @@ Each line is one normalized `BboTick` JSON object. Common fields include:
 - `spread`: `ask.price - bid.price`.
 - `mid`: midpoint between bid and ask.
 - `source`: source feed type such as `bbo`, `ticker`, or `l2_book`.
-- `quality`: quality flags, including `inconsistent` for negative spread.
+- `quality`: quality flags, including `inconsistent` for negative spread, `stale` for delayed exchange timestamps, and `gap` for refreshed orderbook gaps.
 
-When `storage.mode = "clickhouse"` or `storage.mode = "both"`, ticks are inserted through the ClickHouse HTTP interface into `storage.clickhouse.table`. The table includes:
+When `storage.mode = "clickhouse"` or `storage.mode = "both"`, catalog rows are inserted into `storage.clickhouse.catalog_table` and ticks into `storage.clickhouse.table`. The tick table includes:
 
-- identifiers and timestamps: `venue`, `market_id`, `market_symbol`, `recv_ts_ns`, `recv_time`, `exchange_ts_ms`, `sequence`, `source`.
+- identifiers and timestamps: `catalog_id`, `venue_instance_id`, `instrument_id`, `recv_ts_ns`, `recv_time`, `exchange_ts_ms`, `sequence`, `source`.
 - bid/ask values as both Float64 and exact text fields, for example `bid_price` and `bid_price_text`.
 - derived `spread` and `mid` values as both Float64 and exact text fields.
 - quality flags: `quality_gap`, `quality_stale`, `quality_inconsistent`, `quality_note`.

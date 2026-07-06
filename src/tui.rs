@@ -22,17 +22,17 @@ use ratatui::{
 use tokio::sync::watch;
 
 use crate::{
-    domain::{BboTick, Fixed, Venue},
+    domain::{BboTick, Fixed, InstrumentCatalog},
     state::{BboSnapshot, SharedBboState},
 };
 
 #[derive(Debug, Default)]
 struct TuiSelection {
     bbo_market: usize,
-    bbo_venue: usize,
+    bbo_row: usize,
     spread_market: usize,
-    spread_venue_a: usize,
-    spread_venue_b: usize,
+    spread_row_a: usize,
+    spread_row_b: usize,
     focus: FocusPanel,
     spread_leg: SpreadLeg,
 }
@@ -59,8 +59,8 @@ const SPREAD_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SpreadKey {
     market: String,
-    venue_a: Venue,
-    venue_b: Venue,
+    instrument_a: String,
+    instrument_b: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -245,8 +245,8 @@ fn draw_bbo_panel(
         .unwrap_or_default()
         .into_iter()
         .enumerate()
-        .map(|(index, tick)| {
-            let style = if selection.focus == FocusPanel::Bbo && index == selection.bbo_venue {
+        .map(|(index, row)| {
+            let style = if selection.focus == FocusPanel::Bbo && index == selection.bbo_row {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -254,8 +254,12 @@ fn draw_bbo_panel(
             } else {
                 Style::default()
             };
+            let catalog = row.catalog;
+            let tick = row.tick;
             Row::new(vec![
-                Cell::from(tick.venue.as_str()),
+                Cell::from(instrument_venue(tick, catalog)),
+                Cell::from(instrument_symbol(tick, catalog)),
+                Cell::from(instrument_quote(catalog)),
                 Cell::from(level_price(tick.bid.as_ref())),
                 Cell::from(level_price(tick.ask.as_ref())),
                 Cell::from(level_size(tick.bid.as_ref())),
@@ -271,6 +275,8 @@ fn draw_bbo_panel(
         [
             Constraint::Length(13),
             Constraint::Length(14),
+            Constraint::Length(8),
+            Constraint::Length(14),
             Constraint::Length(14),
             Constraint::Length(12),
             Constraint::Length(12),
@@ -280,7 +286,7 @@ fn draw_bbo_panel(
     )
     .header(
         Row::new([
-            "venue", "bid", "ask", "bid size", "ask size", "spread", "age",
+            "venue", "symbol", "quote", "bid", "ask", "bid size", "ask size", "spread", "age",
         ])
         .style(
             Style::default()
@@ -302,13 +308,17 @@ fn draw_spread_panel(
     spread_history: &SpreadHistory,
 ) {
     let market = selected_market(snapshot, selection.spread_market);
-    let venue_a = selected_venue(snapshot, selection.spread_venue_a);
-    let venue_b = selected_venue(snapshot, selection.spread_venue_b);
-    let title = match (market, venue_a, venue_b) {
+    let first = market.and_then(|market| snapshot.row_for_market(market, selection.spread_row_a));
+    let second = market.and_then(|market| snapshot.row_for_market(market, selection.spread_row_b));
+    let title = match (market, first.as_ref(), second.as_ref()) {
         (Some(market), Some(a), Some(b)) => {
-            format!("Spread: {} vs {} / {market}", a.as_str(), b.as_str())
+            format!(
+                "Spread: {} vs {} / {market}",
+                instrument_short_label(a.tick, a.catalog),
+                instrument_short_label(b.tick, b.catalog)
+            )
         }
-        _ => "Spread: waiting for two venues and a shared market".to_string(),
+        _ => "Spread: waiting for two instruments and a shared asset".to_string(),
     };
 
     let block = panel_block(&title, selection.focus == FocusPanel::Spread);
@@ -321,10 +331,8 @@ fn draw_spread_panel(
         .constraints([Constraint::Length(summary_h), Constraint::Min(3)])
         .split(inner);
 
-    if let (Some(market), Some(venue_a), Some(venue_b)) = (market, venue_a, venue_b) {
-        let first = snapshot.find(venue_a, market);
-        let second = snapshot.find(venue_b, market);
-        draw_spread_summary_table(frame, chunks[0], venue_a, first, venue_b, second);
+    if let (Some(first), Some(second)) = (first.as_ref(), second.as_ref()) {
+        draw_spread_summary_table(frame, chunks[0], snapshot, first, second);
     } else {
         frame.render_widget(Paragraph::new("No comparable BBO yet."), chunks[0]);
     }
@@ -355,8 +363,8 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, selection: &TuiSelection) {
         FocusPanel::Spread => "Spread",
     };
     let leg = match selection.spread_leg {
-        SpreadLeg::First => "1st venue",
-        SpreadLeg::Second => "2nd venue",
+        SpreadLeg::First => "1st instrument",
+        SpreadLeg::Second => "2nd instrument",
     };
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("q", Style::default().fg(Color::Yellow)),
@@ -366,9 +374,9 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, selection: &TuiSelection) {
         Span::styled("left/right", Style::default().fg(Color::Yellow)),
         Span::raw(" market  "),
         Span::styled("up/down", Style::default().fg(Color::Yellow)),
-        Span::raw(format!(" venue ({leg})  ")),
+        Span::raw(format!(" row ({leg})  ")),
         Span::styled("1/2", Style::default().fg(Color::Yellow)),
-        Span::raw(" spread venue leg  "),
+        Span::raw(" spread leg  "),
         Span::styled("chart", Style::default().fg(Color::Yellow)),
         Span::raw(" last 90s"),
     ]))
@@ -398,38 +406,36 @@ struct SpreadSummaryRow {
 }
 
 fn spread_summary_rows(
-    venue_a: Venue,
-    first: Option<&BboTick>,
-    venue_b: Venue,
-    second: Option<&BboTick>,
+    snapshot: &BboSnapshot,
+    first: &crate::state::BboRow<'_>,
+    second: &crate::state::BboRow<'_>,
 ) -> Vec<SpreadSummaryRow> {
-    let data_status = missing_data_status(venue_a, first, venue_b, second);
+    let label_a = instrument_short_label(first.tick, first.catalog);
+    let label_b = instrument_short_label(second.tick, second.catalog);
+    let data_status = comparability_status(snapshot, first.catalog, second.catalog);
     vec![
         SpreadSummaryRow {
             direction: "green A->B".to_string(),
-            formula: format!("{} bid - {} ask", venue_a.as_str(), venue_b.as_str()),
-            value: cross_spread(first, second),
-            bp: spread_bp(first, second),
+            formula: format!("{label_a} bid - {label_b} ask"),
+            value: cross_spread(snapshot, first, second),
+            bp: spread_bp(snapshot, first, second),
             meaning: data_status
                 .clone()
                 .unwrap_or_else(|| "sell A, buy B; >0 before fees".to_string()),
         },
         SpreadSummaryRow {
             direction: "magenta B->A".to_string(),
-            formula: format!("{} bid - {} ask", venue_b.as_str(), venue_a.as_str()),
-            value: cross_spread(second, first),
-            bp: spread_bp(second, first),
+            formula: format!("{label_b} bid - {label_a} ask"),
+            value: cross_spread(snapshot, second, first),
+            bp: spread_bp(snapshot, second, first),
             meaning: data_status
                 .clone()
                 .unwrap_or_else(|| "sell B, buy A; >0 before fees".to_string()),
         },
         SpreadSummaryRow {
             direction: "mid diff".to_string(),
-            formula: format!("{} mid - {} mid", venue_a.as_str(), venue_b.as_str()),
-            value: diff_fixed(
-                first.and_then(|tick| tick.mid),
-                second.and_then(|tick| tick.mid),
-            ),
+            formula: format!("{label_a} mid - {label_b} mid"),
+            value: diff_mid(snapshot, first, second),
             bp: "-".to_string(),
             meaning: data_status
                 .unwrap_or_else(|| "-90s left -> now right; zero = break-even".to_string()),
@@ -437,29 +443,32 @@ fn spread_summary_rows(
     ]
 }
 
-fn missing_data_status(
-    venue_a: Venue,
-    first: Option<&BboTick>,
-    venue_b: Venue,
-    second: Option<&BboTick>,
+fn comparability_status(
+    snapshot: &BboSnapshot,
+    first: Option<&InstrumentCatalog>,
+    second: Option<&InstrumentCatalog>,
 ) -> Option<String> {
-    match (first.is_some(), second.is_some()) {
-        (true, true) => None,
-        (false, true) => Some(format!("missing {} BBO for this market", venue_a.as_str())),
-        (true, false) => Some(format!("missing {} BBO for this market", venue_b.as_str())),
-        (false, false) => Some("missing both venues for this market".to_string()),
+    let (Some(first), Some(second)) = (first, second) else {
+        return Some("missing catalog for this instrument".to_string());
+    };
+    if common_quote(snapshot, first, second).is_some() {
+        None
+    } else {
+        Some(format!(
+            "not comparable: missing rate for {} vs {}",
+            first.quote_asset, second.quote_asset
+        ))
     }
 }
 
 fn draw_spread_summary_table(
     frame: &mut Frame<'_>,
     area: Rect,
-    venue_a: Venue,
-    first: Option<&BboTick>,
-    venue_b: Venue,
-    second: Option<&BboTick>,
+    snapshot: &BboSnapshot,
+    first: &crate::state::BboRow<'_>,
+    second: &crate::state::BboRow<'_>,
 ) {
-    let rows = spread_summary_rows(venue_a, first, venue_b, second)
+    let rows = spread_summary_rows(snapshot, first, second)
         .into_iter()
         .map(|row| {
             let style = if row.direction.starts_with("green") {
@@ -543,21 +552,13 @@ fn draw_spread_chart(
 
     let datasets = vec![
         Dataset::default()
-            .name(format!(
-                "{} bid - {} ask",
-                key.venue_a.as_str(),
-                key.venue_b.as_str()
-            ))
+            .name("A bid - B ask")
             .marker(symbols::Marker::Braille)
             .graph_type(GraphType::Line)
             .style(Style::default().fg(Color::Green))
             .data(&a_to_b),
         Dataset::default()
-            .name(format!(
-                "{} bid - {} ask",
-                key.venue_b.as_str(),
-                key.venue_a.as_str()
-            ))
+            .name("B bid - A ask")
             .marker(symbols::Marker::Braille)
             .graph_type(GraphType::Line)
             .style(Style::default().fg(Color::Magenta))
@@ -624,32 +625,61 @@ fn format_chart_value(value: f64) -> String {
     }
 }
 
-fn cross_spread(sell_venue: Option<&BboTick>, buy_venue: Option<&BboTick>) -> String {
-    cross_spread_value(sell_venue, buy_venue)
-        .map(|spread| spread.to_string())
+fn cross_spread(
+    snapshot: &BboSnapshot,
+    sell: &crate::state::BboRow<'_>,
+    buy: &crate::state::BboRow<'_>,
+) -> String {
+    cross_spread_value(snapshot, sell, buy)
+        .map(format_decimal)
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn cross_spread_value(sell_venue: Option<&BboTick>, buy_venue: Option<&BboTick>) -> Option<Fixed> {
-    let Some(sell_bid) = sell_venue.and_then(|tick| tick.bid.as_ref()) else {
-        return None;
-    };
-    let Some(buy_ask) = buy_venue.and_then(|tick| tick.ask.as_ref()) else {
-        return None;
-    };
-
-    sell_bid.price.checked_sub(buy_ask.price).ok()
+fn cross_spread_value(
+    snapshot: &BboSnapshot,
+    sell: &crate::state::BboRow<'_>,
+    buy: &crate::state::BboRow<'_>,
+) -> Option<f64> {
+    let target_quote = common_quote(snapshot, sell.catalog?, buy.catalog?)?;
+    let sell_bid = converted_price(
+        snapshot,
+        sell.tick.bid.as_ref()?.price,
+        sell.catalog?,
+        &target_quote,
+    )?;
+    let buy_ask = converted_price(
+        snapshot,
+        buy.tick.ask.as_ref()?.price,
+        buy.catalog?,
+        &target_quote,
+    )?;
+    Some(sell_bid - buy_ask)
 }
 
-fn spread_bp(sell_venue: Option<&BboTick>, buy_venue: Option<&BboTick>) -> String {
-    let Some(spread) = cross_spread_value(sell_venue, buy_venue) else {
+fn spread_bp(
+    snapshot: &BboSnapshot,
+    sell: &crate::state::BboRow<'_>,
+    buy: &crate::state::BboRow<'_>,
+) -> String {
+    let Some(spread) = cross_spread_value(snapshot, sell, buy) else {
         return "-".to_string();
     };
-    let Some(buy_ask) = buy_venue.and_then(|tick| tick.ask.as_ref()) else {
+    let (Some(sell_catalog), Some(buy_catalog)) = (sell.catalog, buy.catalog) else {
+        return "-".to_string();
+    };
+    let Some(target_quote) = common_quote(snapshot, sell_catalog, buy_catalog) else {
+        return "-".to_string();
+    };
+    let Some(buy_ask) = buy
+        .tick
+        .ask
+        .as_ref()
+        .and_then(|ask| converted_price(snapshot, ask.price, buy_catalog, &target_quote))
+    else {
         return "-".to_string();
     };
 
-    format_bp(spread.to_f64(), buy_ask.price.to_f64())
+    format_bp(spread, buy_ask)
 }
 
 fn format_bp(numerator: f64, denominator: f64) -> String {
@@ -659,19 +689,116 @@ fn format_bp(numerator: f64, denominator: f64) -> String {
     format!("{:.2}", numerator / denominator * 10_000.0)
 }
 
-fn diff_fixed(lhs: Option<Fixed>, rhs: Option<Fixed>) -> String {
-    let (Some(lhs), Some(rhs)) = (lhs, rhs) else {
+fn common_quote(
+    snapshot: &BboSnapshot,
+    first: &InstrumentCatalog,
+    second: &InstrumentCatalog,
+) -> Option<String> {
+    if first.quote_asset == second.quote_asset {
+        return Some(first.quote_asset.clone());
+    }
+    if snapshot.rates.rate(&first.quote_asset, "USD").is_some()
+        && snapshot.rates.rate(&second.quote_asset, "USD").is_some()
+    {
+        return Some("USD".to_string());
+    }
+    if snapshot
+        .rates
+        .rate(&first.quote_asset, &second.quote_asset)
+        .is_some()
+    {
+        return Some(second.quote_asset.clone());
+    }
+    if snapshot
+        .rates
+        .rate(&second.quote_asset, &first.quote_asset)
+        .is_some()
+    {
+        return Some(first.quote_asset.clone());
+    }
+    None
+}
+
+fn converted_price(
+    snapshot: &BboSnapshot,
+    price: Fixed,
+    catalog: &InstrumentCatalog,
+    target_quote: &str,
+) -> Option<f64> {
+    let rate = snapshot.rates.rate(&catalog.quote_asset, target_quote)?;
+    Some(price.to_f64() * rate.to_f64())
+}
+
+fn format_decimal(value: f64) -> String {
+    if !value.is_finite() {
+        return "-".to_string();
+    }
+    if value.abs() >= 100.0 {
+        format!("{value:.2}")
+    } else if value.abs() >= 1.0 {
+        format!("{value:.4}")
+    } else {
+        format!("{value:.6}")
+    }
+}
+
+fn diff_mid(
+    snapshot: &BboSnapshot,
+    lhs: &crate::state::BboRow<'_>,
+    rhs: &crate::state::BboRow<'_>,
+) -> String {
+    let (Some(lhs_catalog), Some(rhs_catalog)) = (lhs.catalog, rhs.catalog) else {
         return "-".to_string();
     };
-    lhs.checked_sub(rhs)
-        .map(|diff| diff.to_string())
-        .unwrap_or_else(|_| "-".to_string())
+    let Some(target_quote) = common_quote(snapshot, lhs_catalog, rhs_catalog) else {
+        return "-".to_string();
+    };
+    let Some(lhs_mid) = lhs
+        .tick
+        .mid
+        .and_then(|mid| converted_price(snapshot, mid, lhs_catalog, &target_quote))
+    else {
+        return "-".to_string();
+    };
+    let Some(rhs_mid) = rhs
+        .tick
+        .mid
+        .and_then(|mid| converted_price(snapshot, mid, rhs_catalog, &target_quote))
+    else {
+        return "-".to_string();
+    };
+    format_decimal(lhs_mid - rhs_mid)
 }
 
 fn level_price(level: Option<&crate::domain::BestLevel>) -> String {
     level
         .map(|level| level.price.to_string())
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn instrument_venue(tick: &BboTick, catalog: Option<&InstrumentCatalog>) -> String {
+    catalog
+        .map(|catalog| catalog.venue_instance_id.clone())
+        .unwrap_or_else(|| tick.instrument.venue_instance_id.clone())
+}
+
+fn instrument_symbol(tick: &BboTick, catalog: Option<&InstrumentCatalog>) -> String {
+    catalog
+        .map(|catalog| catalog.display_symbol().to_string())
+        .unwrap_or_else(|| tick.instrument.instrument_id.clone())
+}
+
+fn instrument_quote(catalog: Option<&InstrumentCatalog>) -> String {
+    catalog
+        .map(|catalog| catalog.quote_asset.clone())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn instrument_short_label(tick: &BboTick, catalog: Option<&InstrumentCatalog>) -> String {
+    let venue = instrument_venue(tick, catalog);
+    let symbol = instrument_symbol(tick, catalog);
+    let quote = instrument_quote(catalog);
+    format!("{venue} {symbol}/{quote}")
 }
 
 fn level_size(level: Option<&crate::domain::BestLevel>) -> String {
@@ -700,16 +827,22 @@ fn selected_market(snapshot: &BboSnapshot, index: usize) -> Option<&str> {
     snapshot.markets.get(index).map(String::as_str)
 }
 
-fn selected_venue(snapshot: &BboSnapshot, index: usize) -> Option<Venue> {
-    snapshot.venues.get(index).copied()
+fn selected_spread_key(snapshot: &BboSnapshot, selection: &TuiSelection) -> Option<SpreadKey> {
+    let market = selected_market(snapshot, selection.spread_market)?;
+    let first = snapshot.row_for_market(market, selection.spread_row_a)?;
+    let second = snapshot.row_for_market(market, selection.spread_row_b)?;
+    Some(SpreadKey {
+        market: market.to_string(),
+        instrument_a: first.tick.instrument.catalog_id.clone(),
+        instrument_b: second.tick.instrument.catalog_id.clone(),
+    })
 }
 
-fn selected_spread_key(snapshot: &BboSnapshot, selection: &TuiSelection) -> Option<SpreadKey> {
-    Some(SpreadKey {
-        market: selected_market(snapshot, selection.spread_market)?.to_string(),
-        venue_a: selected_venue(snapshot, selection.spread_venue_a)?,
-        venue_b: selected_venue(snapshot, selection.spread_venue_b)?,
-    })
+fn row_index_for_catalog(snapshot: &BboSnapshot, market: &str, catalog_id: &str) -> Option<usize> {
+    snapshot
+        .rows_for_market(market)
+        .into_iter()
+        .position(|row| row.tick.instrument.catalog_id == catalog_id)
 }
 
 impl SpreadHistory {
@@ -717,16 +850,28 @@ impl SpreadHistory {
         let Some(key) = selected_spread_key(snapshot, selection) else {
             return;
         };
-        if key.venue_a == key.venue_b {
+        if key.instrument_a == key.instrument_b {
             return;
         }
 
-        let first = snapshot.find(key.venue_a, &key.market);
-        let second = snapshot.find(key.venue_b, &key.market);
-        let Some(a_sell_b_buy) = cross_spread_value(first, second).map(Fixed::to_f64) else {
+        let Some(first_index) = row_index_for_catalog(snapshot, &key.market, &key.instrument_a)
+        else {
             return;
         };
-        let Some(b_sell_a_buy) = cross_spread_value(second, first).map(Fixed::to_f64) else {
+        let Some(second_index) = row_index_for_catalog(snapshot, &key.market, &key.instrument_b)
+        else {
+            return;
+        };
+        let Some(first) = snapshot.row_for_market(&key.market, first_index) else {
+            return;
+        };
+        let Some(second) = snapshot.row_for_market(&key.market, second_index) else {
+            return;
+        };
+        let Some(a_sell_b_buy) = cross_spread_value(snapshot, &first, &second) else {
+            return;
+        };
+        let Some(b_sell_a_buy) = cross_spread_value(snapshot, &second, &first) else {
             return;
         };
 
@@ -757,16 +902,19 @@ impl TuiSelection {
     fn clamp(&mut self, snapshot: &BboSnapshot) {
         self.bbo_market = clamp_index(self.bbo_market, snapshot.markets.len());
         self.spread_market = clamp_index(self.spread_market, snapshot.markets.len());
-        self.bbo_venue = clamp_index(
-            self.bbo_venue,
+        self.bbo_row = clamp_index(
+            self.bbo_row,
             selected_market(snapshot, self.bbo_market)
                 .map(|market| snapshot.rows_for_market(market).len())
                 .unwrap_or_default(),
         );
-        self.spread_venue_a = clamp_index(self.spread_venue_a, snapshot.venues.len());
-        self.spread_venue_b = clamp_index(self.spread_venue_b, snapshot.venues.len());
-        if snapshot.venues.len() > 1 && self.spread_venue_a == self.spread_venue_b {
-            self.spread_venue_b = (self.spread_venue_a + 1) % snapshot.venues.len();
+        let spread_rows = selected_market(snapshot, self.spread_market)
+            .map(|market| snapshot.rows_for_market(market).len())
+            .unwrap_or_default();
+        self.spread_row_a = clamp_index(self.spread_row_a, spread_rows);
+        self.spread_row_b = clamp_index(self.spread_row_b, spread_rows);
+        if spread_rows > 1 && self.spread_row_a == self.spread_row_b {
+            self.spread_row_b = (self.spread_row_a + 1) % spread_rows;
         }
     }
 
@@ -806,7 +954,7 @@ impl TuiSelection {
                     .map(|market| snapshot.rows_for_market(market).len())
                     .unwrap_or_default();
                 if len > 0 {
-                    self.bbo_venue = wrap_prev(self.bbo_venue, len);
+                    self.bbo_row = wrap_prev(self.bbo_row, len);
                 }
             }
             FocusPanel::Spread => self.prev_spread_venue(snapshot),
@@ -820,7 +968,7 @@ impl TuiSelection {
                     .map(|market| snapshot.rows_for_market(market).len())
                     .unwrap_or_default();
                 if len > 0 {
-                    self.bbo_venue = (self.bbo_venue + 1) % len;
+                    self.bbo_row = (self.bbo_row + 1) % len;
                 }
             }
             FocusPanel::Spread => self.next_spread_venue(snapshot),
@@ -828,24 +976,28 @@ impl TuiSelection {
     }
 
     fn prev_spread_venue(&mut self, snapshot: &BboSnapshot) {
-        let len = snapshot.venues.len();
+        let len = selected_market(snapshot, self.spread_market)
+            .map(|market| snapshot.rows_for_market(market).len())
+            .unwrap_or_default();
         if len == 0 {
             return;
         }
         match self.spread_leg {
-            SpreadLeg::First => self.spread_venue_a = wrap_prev(self.spread_venue_a, len),
-            SpreadLeg::Second => self.spread_venue_b = wrap_prev(self.spread_venue_b, len),
+            SpreadLeg::First => self.spread_row_a = wrap_prev(self.spread_row_a, len),
+            SpreadLeg::Second => self.spread_row_b = wrap_prev(self.spread_row_b, len),
         }
     }
 
     fn next_spread_venue(&mut self, snapshot: &BboSnapshot) {
-        let len = snapshot.venues.len();
+        let len = selected_market(snapshot, self.spread_market)
+            .map(|market| snapshot.rows_for_market(market).len())
+            .unwrap_or_default();
         if len == 0 {
             return;
         }
         match self.spread_leg {
-            SpreadLeg::First => self.spread_venue_a = (self.spread_venue_a + 1) % len,
-            SpreadLeg::Second => self.spread_venue_b = (self.spread_venue_b + 1) % len,
+            SpreadLeg::First => self.spread_row_a = (self.spread_row_a + 1) % len,
+            SpreadLeg::Second => self.spread_row_b = (self.spread_row_b + 1) % len,
         }
     }
 }
@@ -863,83 +1015,126 @@ mod tests {
     use std::str::FromStr;
 
     use crate::{
-        domain::{BboTick, BestLevel, Fixed, MarketRef, SourceKind, Venue},
+        domain::{BboTick, BestLevel, Fixed, InstrumentCatalog, ProductType, SourceKind},
         pipeline::normalizer,
         state::BboStore,
         tui::{SpreadHistory, TuiSelection, cross_spread, main_areas, spread_summary_rows},
     };
 
-    fn tick(venue: Venue, bid: &str, ask: &str) -> BboTick {
-        normalizer::normalize(BboTick::new(
+    fn catalog(venue: &str) -> InstrumentCatalog {
+        InstrumentCatalog::new(
             venue,
-            MarketRef::new("ETH", Some("ETH".to_string())),
-            123,
-            Some(456),
+            "ETH",
+            "ETH",
+            Some("ETH".to_string()),
+            ProductType::Perp,
+            "ETH",
+            "USDC",
+            "USDC",
+            "USDC",
             None,
-            Some(BestLevel::new(
-                Fixed::from_str(bid).unwrap(),
-                Fixed::from_str("1").unwrap(),
+            None,
+            None,
+            "active",
+            None,
+        )
+    }
+
+    fn tick(catalog: &InstrumentCatalog, bid: &str, ask: &str) -> BboTick {
+        normalizer::normalize(
+            BboTick::new(
+                catalog.instrument_ref(),
+                123,
+                Some(456),
                 None,
-            )),
-            Some(BestLevel::new(
-                Fixed::from_str(ask).unwrap(),
-                Fixed::from_str("2").unwrap(),
-                None,
-            )),
-            SourceKind::Bbo,
-        ))
+                Some(BestLevel::new(
+                    Fixed::from_str(bid).unwrap(),
+                    Fixed::from_str("1").unwrap(),
+                    None,
+                )),
+                Some(BestLevel::new(
+                    Fixed::from_str(ask).unwrap(),
+                    Fixed::from_str("2").unwrap(),
+                    None,
+                )),
+                SourceKind::Bbo,
+            ),
+            5_000,
+        )
     }
 
     #[test]
     fn calculates_cross_spread() {
-        let first = tick(Venue::Hyperliquid, "101", "102");
-        let second = tick(Venue::Lighter, "100", "100.5");
+        let mut store = BboStore::default();
+        let first_catalog = catalog("hyperliquid");
+        let second_catalog = catalog("lighter");
+        store.update_catalog(first_catalog.clone());
+        store.update_catalog(second_catalog.clone());
+        store.update_tick(tick(&first_catalog, "101", "102"));
+        store.update_tick(tick(&second_catalog, "100", "100.5"));
+        let snapshot = store.snapshot();
+        let first = snapshot.row_for_market("ETH", 0).unwrap();
+        let second = snapshot.row_for_market("ETH", 1).unwrap();
 
-        assert_eq!(cross_spread(Some(&first), Some(&second)), "0.5");
-        assert_eq!(cross_spread(Some(&second), Some(&first)), "-2");
+        assert_eq!(cross_spread(&snapshot, &first, &second), "0.500000");
+        assert_eq!(cross_spread(&snapshot, &second, &first), "-2.0000");
     }
 
     #[test]
     fn calculates_spread_profit_bp_from_buy_ask() {
-        let first = tick(Venue::Hyperliquid, "101", "102");
-        let second = tick(Venue::Lighter, "100", "100.5");
+        let mut store = BboStore::default();
+        let first_catalog = catalog("hyperliquid");
+        let second_catalog = catalog("lighter");
+        store.update_catalog(first_catalog.clone());
+        store.update_catalog(second_catalog.clone());
+        store.update_tick(tick(&first_catalog, "101", "102"));
+        store.update_tick(tick(&second_catalog, "100", "100.5"));
+        let snapshot = store.snapshot();
+        let first = snapshot.row_for_market("ETH", 0).unwrap();
+        let second = snapshot.row_for_market("ETH", 1).unwrap();
 
-        assert_eq!(super::spread_bp(Some(&first), Some(&second)), "49.75");
-        assert_eq!(super::spread_bp(Some(&second), Some(&first)), "-196.08");
+        assert_eq!(super::spread_bp(&snapshot, &first, &second), "49.75");
+        assert_eq!(super::spread_bp(&snapshot, &second, &first), "-196.08");
     }
 
     #[test]
     fn selection_clamps_to_available_snapshot() {
         let mut store = BboStore::default();
-        store.update(tick(Venue::Hyperliquid, "101", "102"));
+        let first_catalog = catalog("hyperliquid");
+        store.update_catalog(first_catalog.clone());
+        store.update_tick(tick(&first_catalog, "101", "102"));
         let snapshot = store.snapshot();
         let mut selection = TuiSelection {
             bbo_market: 99,
-            bbo_venue: 99,
+            bbo_row: 99,
             spread_market: 99,
-            spread_venue_a: 99,
-            spread_venue_b: 99,
+            spread_row_a: 99,
+            spread_row_b: 99,
             ..TuiSelection::default()
         };
 
         selection.clamp(&snapshot);
         assert_eq!(selection.bbo_market, 0);
-        assert_eq!(selection.bbo_venue, 0);
+        assert_eq!(selection.bbo_row, 0);
         assert_eq!(selection.spread_market, 0);
-        assert_eq!(selection.spread_venue_a, 0);
-        assert_eq!(selection.spread_venue_b, 0);
+        assert_eq!(selection.spread_row_a, 0);
+        assert_eq!(selection.spread_row_b, 0);
     }
 
     #[test]
     fn spread_history_keeps_recent_samples_for_selected_pair() {
         let mut store = BboStore::default();
-        store.update(tick(Venue::Hyperliquid, "101", "102"));
-        store.update(tick(Venue::Lighter, "100", "100.5"));
+        let first_catalog = catalog("hyperliquid");
+        let second_catalog = catalog("lighter");
+        store.update_catalog(first_catalog.clone());
+        store.update_catalog(second_catalog.clone());
+        store.update_tick(tick(&first_catalog, "101", "102"));
+        store.update_tick(tick(&second_catalog, "100", "100.5"));
         let snapshot = store.snapshot();
         let mut selection = TuiSelection {
             spread_market: 0,
-            spread_venue_a: 0,
-            spread_venue_b: 1,
+            spread_row_a: 0,
+            spread_row_b: 1,
             ..TuiSelection::default()
         };
         selection.clamp(&snapshot);
@@ -956,15 +1151,18 @@ mod tests {
 
     #[test]
     fn spread_summary_explains_chart_rows() {
-        let first = tick(Venue::Hyperliquid, "101", "102");
-        let second = tick(Venue::Lighter, "100", "100.5");
+        let mut store = BboStore::default();
+        let first_catalog = catalog("hyperliquid");
+        let second_catalog = catalog("lighter");
+        store.update_catalog(first_catalog.clone());
+        store.update_catalog(second_catalog.clone());
+        store.update_tick(tick(&first_catalog, "101", "102"));
+        store.update_tick(tick(&second_catalog, "100", "100.5"));
+        let snapshot = store.snapshot();
+        let first = snapshot.row_for_market("ETH", 0).unwrap();
+        let second = snapshot.row_for_market("ETH", 1).unwrap();
 
-        let rows = spread_summary_rows(
-            Venue::Hyperliquid,
-            Some(&first),
-            Venue::Lighter,
-            Some(&second),
-        );
+        let rows = spread_summary_rows(&snapshot, &first, &second);
 
         assert_eq!(rows[0].bp, "49.75");
         assert_eq!(rows[1].bp, "-196.08");
@@ -981,7 +1179,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(joined.contains("hyperliquid bid - lighter ask"));
+        assert!(joined.contains("hyperliquid ETH/USDC bid - lighter ETH/USDC ask"));
         assert!(joined.contains("zero = break-even"));
         assert!(joined.contains("-90s"));
     }

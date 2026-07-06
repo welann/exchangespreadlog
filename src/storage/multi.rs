@@ -3,7 +3,10 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use async_trait::async_trait;
 
-use crate::{domain::BboTick, storage::BboSink};
+use crate::{
+    domain::{BboTick, InstrumentCatalog},
+    storage::BboSink,
+};
 
 pub struct MultiSink {
     sinks: Vec<Arc<dyn BboSink>>,
@@ -26,10 +29,10 @@ impl MultiSink {
 
 #[async_trait]
 impl BboSink for MultiSink {
-    async fn write(&self, tick: &BboTick) -> anyhow::Result<()> {
+    async fn write_catalog(&self, catalog: &InstrumentCatalog) -> anyhow::Result<()> {
         let mut errors = Vec::new();
         for sink in &self.sinks {
-            if let Err(err) = sink.write(tick).await {
+            if let Err(err) = sink.write_catalog(catalog).await {
                 errors.push(err);
             }
         }
@@ -37,7 +40,22 @@ impl BboSink for MultiSink {
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(Self::combine_errors("write", errors))
+            Err(Self::combine_errors("write catalog", errors))
+        }
+    }
+
+    async fn write_tick(&self, tick: &BboTick) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        for sink in &self.sinks {
+            if let Err(err) = sink.write_tick(tick).await {
+                errors.push(err);
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(Self::combine_errors("write tick", errors))
         }
     }
 

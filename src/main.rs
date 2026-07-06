@@ -54,7 +54,9 @@ async fn main() -> Result<()> {
 }
 
 fn install_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls ring crypto provider");
 }
 
 fn parse_storage_mode(value: &str) -> Result<StorageMode, String> {

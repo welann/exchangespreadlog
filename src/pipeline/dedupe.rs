@@ -9,7 +9,7 @@ pub struct DedupeFilter {
 
 impl DedupeFilter {
     pub fn should_emit(&mut self, tick: &BboTick) -> bool {
-        let key = format!("{}:{}", tick.venue.as_str(), tick.market.id);
+        let key = tick.instrument.catalog_id.clone();
         match self.last_by_market.get(&key) {
             Some(last) if same_observable_bbo(last, tick) => false,
             _ => {
@@ -32,14 +32,33 @@ mod tests {
     use std::str::FromStr;
 
     use crate::{
-        domain::{BboTick, BestLevel, Fixed, MarketRef, SourceKind, Venue},
+        domain::{BboTick, BestLevel, Fixed, InstrumentCatalog, ProductType, SourceKind},
         pipeline::dedupe::DedupeFilter,
     };
 
+    fn catalog() -> InstrumentCatalog {
+        InstrumentCatalog::new(
+            "lighter",
+            "0",
+            "ETH",
+            Some("0".to_string()),
+            ProductType::Perp,
+            "ETH",
+            "USDC",
+            "USDC",
+            "USDC",
+            None,
+            None,
+            None,
+            "active",
+            None,
+        )
+    }
+
     fn tick(sequence: Option<i128>, bid_size: &str) -> BboTick {
+        let catalog = catalog();
         BboTick::new(
-            Venue::Lighter,
-            MarketRef::new("0", Some("ETH".to_string())),
+            catalog.instrument_ref(),
             123,
             Some(456),
             sequence,

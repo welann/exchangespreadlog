@@ -19,3 +19,13 @@ pub struct DataQuality {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
+
+impl DataQuality {
+    pub fn add_note(&mut self, note: impl Into<String>) {
+        let note = note.into();
+        self.note = match self.note.take() {
+            Some(existing) => Some(format!("{existing}; {note}")),
+            None => Some(note),
+        };
+    }
+}

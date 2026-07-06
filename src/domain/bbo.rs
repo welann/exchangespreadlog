@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{DataQuality, Fixed, MarketRef, SourceKind, Venue};
+use super::{DataQuality, Fixed, InstrumentCatalog, InstrumentRef, SourceKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BestLevel {
@@ -22,8 +22,7 @@ impl BestLevel {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BboTick {
-    pub venue: Venue,
-    pub market: MarketRef,
+    pub instrument: InstrumentRef,
     pub recv_ts_ns: i128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exchange_ts_ms: Option<i64>,
@@ -44,8 +43,7 @@ pub struct BboTick {
 
 impl BboTick {
     pub fn new(
-        venue: Venue,
-        market: MarketRef,
+        instrument: InstrumentRef,
         recv_ts_ns: i128,
         exchange_ts_ms: Option<i64>,
         sequence: Option<i128>,
@@ -54,8 +52,7 @@ impl BboTick {
         source: SourceKind,
     ) -> Self {
         Self {
-            venue,
-            market,
+            instrument,
             recv_ts_ns,
             exchange_ts_ms,
             sequence,
@@ -67,4 +64,11 @@ impl BboTick {
             quality: DataQuality::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MarketEvent {
+    Catalog { instrument: InstrumentCatalog },
+    Tick { tick: BboTick },
 }

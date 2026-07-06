@@ -6,6 +6,7 @@ use tracing::{info, warn};
 
 use crate::{
     config::{Config, StorageMode, VenueConfig},
+    domain::MarketEvent,
     exchange::{
         ExchangeAdapter, hyperliquid::HyperliquidAdapter, lighter::LighterAdapter,
         risex::RisexAdapter, zero_one::ZeroOneAdapter,
@@ -29,11 +30,17 @@ impl AppRunner {
 
     pub async fn run(self) -> anyhow::Result<()> {
         let sink = self.build_sink().await?;
-        let state = new_shared_state();
-        let (tx, rx) = mpsc::channel(self.config.pipeline.channel_capacity);
+        let state = new_shared_state(self.config.quote_rate_book());
+        let (tx, rx) = mpsc::channel::<MarketEvent>(self.config.pipeline.channel_capacity);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let stale_after_ms = self.config.pipeline.stale_after_ms;
 
-        let writer = tokio::spawn(fanout::run_pipeline(rx, sink, state.clone()));
+        let writer = tokio::spawn(fanout::run_pipeline(
+            rx,
+            sink,
+            state.clone(),
+            stale_after_ms,
+        ));
         let mut handles = Vec::new();
         let mut tui_handle = None;
         let (tui_done_tx, mut tui_done_rx) = watch::channel(false);
@@ -130,7 +137,7 @@ impl AppRunner {
 }
 
 fn build_adapter(config: &VenueConfig) -> anyhow::Result<Box<dyn ExchangeAdapter>> {
-    match config.name.as_str() {
+    match config.adapter.as_str() {
         "hyperliquid" => Ok(Box::new(HyperliquidAdapter::from_config(config))),
         "lighter" => Ok(Box::new(LighterAdapter::from_config(config))),
         "rise" | "risex" => Ok(Box::new(RisexAdapter::from_config(config))),
