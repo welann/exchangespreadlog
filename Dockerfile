@@ -22,14 +22,11 @@ WORKDIR /app
 COPY --from=builder /app/target/release/exchangespreadlog /usr/local/bin/exchangespreadlog
 COPY config.example.toml /app/config.toml
 
-RUN mkdir -p /app/data \
-    && chown -R app:app /app
+RUN chown -R app:app /app
 
 USER app
 
 ENV RUST_LOG=info
 
-VOLUME ["/app/data"]
-
 ENTRYPOINT ["exchangespreadlog"]
-CMD ["--config", "/app/config.toml", "--no-tui"]
+CMD ["--config", "/app/config.toml", "--storage", "clickhouse", "--no-tui"]
