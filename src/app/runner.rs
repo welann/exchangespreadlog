@@ -12,7 +12,9 @@ use crate::{
     },
     pipeline::fanout,
     state::new_shared_state,
-    storage::{BboSink, jsonl::JsonlSink, noop::NoopSink},
+    storage::{
+        BboSink, clickhouse::ClickHouseSink, jsonl::JsonlSink, multi::MultiSink, noop::NoopSink,
+    },
     tui,
 };
 
@@ -26,7 +28,7 @@ impl AppRunner {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        let sink = self.build_sink();
+        let sink = self.build_sink().await?;
         let state = new_shared_state();
         let (tx, rx) = mpsc::channel(self.config.pipeline.channel_capacity);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -96,12 +98,26 @@ impl AppRunner {
         Ok(())
     }
 
-    fn build_sink(&self) -> Arc<dyn BboSink> {
+    async fn build_sink(&self) -> anyhow::Result<Arc<dyn BboSink>> {
+        let mut sinks: Vec<Arc<dyn BboSink>> = Vec::new();
+
         if self.config.storage.jsonl_enabled {
-            Arc::new(JsonlSink::new(&self.config.storage.jsonl_dir))
-        } else {
-            Arc::new(NoopSink)
+            sinks.push(Arc::new(JsonlSink::new(&self.config.storage.jsonl_dir)));
         }
+
+        if self.config.storage.clickhouse.enabled {
+            sinks.push(Arc::new(
+                ClickHouseSink::new(&self.config.storage.clickhouse).await?,
+            ));
+        }
+
+        let sink: Arc<dyn BboSink> = match sinks.len() {
+            0 => Arc::new(NoopSink),
+            1 => sinks.pop().expect("sink exists"),
+            _ => Arc::new(MultiSink::new(sinks)),
+        };
+
+        Ok(sink)
     }
 }
 

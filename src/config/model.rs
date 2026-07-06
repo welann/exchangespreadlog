@@ -25,6 +25,21 @@ pub struct PipelineConfig {
 pub struct StorageConfig {
     pub jsonl_enabled: bool,
     pub jsonl_dir: String,
+    pub clickhouse: ClickHouseConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClickHouseConfig {
+    pub enabled: bool,
+    pub url: String,
+    pub database: String,
+    pub table: String,
+    pub username: String,
+    pub password: Option<String>,
+    pub password_env: Option<String>,
+    pub create_table: bool,
+    pub batch_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +137,23 @@ impl Default for StorageConfig {
         Self {
             jsonl_enabled: true,
             jsonl_dir: "data/bbo".to_string(),
+            clickhouse: ClickHouseConfig::default(),
+        }
+    }
+}
+
+impl Default for ClickHouseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: "https://obdata.zeabur.app/".to_string(),
+            database: "zeabur".to_string(),
+            table: "bbo_ticks".to_string(),
+            username: "zeabur".to_string(),
+            password: None,
+            password_env: Some("CLICKHOUSE_PASSWORD".to_string()),
+            create_table: true,
+            batch_size: 100,
         }
     }
 }
@@ -159,6 +191,9 @@ mod tests {
         assert_eq!(config.mode, "bbo");
         assert!(config.tui.enabled);
         assert_eq!(config.tui.refresh_ms, 250);
+        assert!(!config.storage.clickhouse.enabled);
+        assert_eq!(config.storage.clickhouse.url, "https://obdata.zeabur.app/");
+        assert_eq!(config.storage.clickhouse.table, "bbo_ticks");
         assert_eq!(config.venues.len(), 4);
         assert_eq!(config.venues[0].name, "hyperliquid");
         assert_eq!(config.venues[0].channel.as_deref(), Some("bbo"));

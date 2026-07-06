@@ -1,6 +1,6 @@
 # Exchange Spread Log
 
-Exchange Spread Log is a Rust collector for top-of-book/BBO data from perpetual DEX venues. It connects to exchange WebSocket feeds, normalizes best bid/ask updates, calculates spread and mid price, deduplicates unchanged ticks, shows the latest state in a terminal UI, and optionally persists ticks as JSONL.
+Exchange Spread Log is a Rust collector for top-of-book/BBO data from perpetual DEX venues. It connects to exchange WebSocket feeds, normalizes best bid/ask updates, calculates spread and mid price, deduplicates unchanged ticks, shows the latest state in a terminal UI, and optionally persists ticks as JSONL and/or ClickHouse rows.
 
 Currently supported venues:
 
@@ -32,7 +32,7 @@ By default, Hyperliquid, Lighter, RiseX, and 01 are enabled in `config.example.t
     |-- ingest/             # WebSocket connection, retry/backoff, time helpers
     |-- pipeline/           # Normalize, dedupe, update state, write sinks
     |-- state.rs            # Shared latest-BBO state for the TUI
-    |-- storage/            # JSONL and no-op storage sinks
+    |-- storage/            # JSONL, ClickHouse, fan-out, and no-op storage sinks
     |-- telemetry/          # tracing/logging initialization
     `-- tui.rs              # Ratatui terminal interface
 ```
@@ -68,9 +68,36 @@ Important config sections:
 - `pipeline.stale_after_ms`: stale threshold reserved in the config model.
 - `storage.jsonl_enabled`: write normalized ticks to JSONL when `true`.
 - `storage.jsonl_dir`: base output directory, default `data/bbo`.
+- `storage.clickhouse.enabled`: write normalized ticks to ClickHouse when `true`.
+- `storage.clickhouse.url`: ClickHouse HTTP endpoint.
+- `storage.clickhouse.database`: ClickHouse database name.
+- `storage.clickhouse.table`: ClickHouse table name. The collector creates it when `create_table = true`.
+- `storage.clickhouse.username`: ClickHouse HTTP username.
+- `storage.clickhouse.password_env`: environment variable holding the ClickHouse password.
+- `storage.clickhouse.batch_size`: number of rows buffered before each HTTP insert.
 - `tui.enabled`: enable or disable the terminal UI.
 - `tui.refresh_ms`: terminal UI refresh interval.
 - `venues`: exchange WebSocket settings.
+
+Example ClickHouse storage config for the Zeabur service:
+
+```toml
+[storage.clickhouse]
+enabled = true
+url = "https://obdata.zeabur.app/"
+database = "zeabur"
+table = "bbo_ticks"
+username = "zeabur"
+password_env = "CLICKHOUSE_PASSWORD"
+create_table = true
+batch_size = 100
+```
+
+Set the password before running:
+
+```bash
+export CLICKHOUSE_PASSWORD='your-clickhouse-password'
+```
 
 Example venue entries:
 
@@ -163,6 +190,13 @@ Each line is one normalized `BboTick` JSON object. Common fields include:
 - `mid`: midpoint between bid and ask.
 - `source`: source feed type such as `bbo`, `ticker`, or `l2_book`.
 - `quality`: quality flags, including `inconsistent` for negative spread.
+
+When `storage.clickhouse.enabled = true`, ticks are inserted through the ClickHouse HTTP interface into `storage.clickhouse.table`. The table includes:
+
+- identifiers and timestamps: `venue`, `market_id`, `market_symbol`, `recv_ts_ns`, `recv_time`, `exchange_ts_ms`, `sequence`, `source`.
+- bid/ask values as both Float64 and exact text fields, for example `bid_price` and `bid_price_text`.
+- derived `spread` and `mid` values as both Float64 and exact text fields.
+- quality flags: `quality_gap`, `quality_stale`, `quality_inconsistent`, `quality_note`.
 
 ## Build and Test
 

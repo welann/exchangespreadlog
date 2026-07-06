@@ -1,4 +1,6 @@
+pub mod clickhouse;
 pub mod jsonl;
+pub mod multi;
 pub mod noop;
 
 use async_trait::async_trait;

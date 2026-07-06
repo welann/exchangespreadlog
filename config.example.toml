@@ -8,6 +8,16 @@ stale_after_ms = 5000
 jsonl_enabled = true
 jsonl_dir = "data/bbo"
 
+[storage.clickhouse]
+enabled = false
+url = "https://obdata.zeabur.app/"
+database = "zeabur"
+table = "bbo_ticks"
+username = "zeabur"
+password_env = "CLICKHOUSE_PASSWORD"
+create_table = true
+batch_size = 100
+
 [tui]
 enabled = true
 refresh_ms = 250
