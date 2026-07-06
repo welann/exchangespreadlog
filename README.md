@@ -7,8 +7,9 @@ Currently supported venues:
 - `hyperliquid`
 - `lighter`
 - `risex`
+- `01`
 
-By default, Hyperliquid, Lighter, and RiseX are enabled in `config.example.toml`.
+By default, Hyperliquid, Lighter, RiseX, and 01 are enabled in `config.example.toml`.
 
 ## Project Structure
 
@@ -26,7 +27,8 @@ By default, Hyperliquid, Lighter, and RiseX are enabled in `config.example.toml`
     |-- exchange/           # Exchange adapters and message parsers
     |   |-- hyperliquid/
     |   |-- lighter/
-    |   `-- risex/
+    |   |-- risex/
+    |   `-- zero_one/
     |-- ingest/             # WebSocket connection, retry/backoff, time helpers
     |-- pipeline/           # Normalize, dedupe, update state, write sinks
     |-- state.rs            # Shared latest-BBO state for the TUI
@@ -93,9 +95,16 @@ enabled = true
 url = "wss://ws.rise.trade/ws"
 markets = ["1:BTC", "2:ETH", "4:SOL"]
 channel = "orderbook"
+
+[[venues]]
+name = "01"
+enabled = true
+url = "wss://zo-mainnet.n1.xyz"
+markets = ["0:BTC:BTCUSD", "1:ETH:ETHUSD", "2:SOL:SOLUSD"]
+channel = "deltas"
 ```
 
-For Hyperliquid, market values are symbols such as `BTC` or `ETH`. For Lighter, market values are market IDs such as `0` or `1`. For RiseX, market values are numeric mainnet market IDs; use `id:symbol` such as `1:BTC` to align the TUI market label with other venues.
+For Hyperliquid, market values are symbols such as `BTC` or `ETH`. For Lighter, market values are market IDs such as `0` or `1`. For RiseX, market values are numeric mainnet market IDs; use `id:symbol` such as `1:BTC` to align the TUI market label with other venues. For 01, use `id:label:feed_symbol`, for example `0:BTC:BTCUSD`; the adapter fetches `GET /market/{id}/orderbook` for the snapshot and subscribes to `deltas@{feed_symbol}` for updates.
 
 ## Running
 

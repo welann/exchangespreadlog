@@ -8,7 +8,7 @@ use crate::{
     config::{Config, VenueConfig},
     exchange::{
         ExchangeAdapter, hyperliquid::HyperliquidAdapter, lighter::LighterAdapter,
-        risex::RisexAdapter,
+        risex::RisexAdapter, zero_one::ZeroOneAdapter,
     },
     pipeline::fanout,
     state::new_shared_state,
@@ -110,6 +110,7 @@ fn build_adapter(config: &VenueConfig) -> anyhow::Result<Box<dyn ExchangeAdapter
         "hyperliquid" => Ok(Box::new(HyperliquidAdapter::from_config(config))),
         "lighter" => Ok(Box::new(LighterAdapter::from_config(config))),
         "rise" | "risex" => Ok(Box::new(RisexAdapter::from_config(config))),
+        "01" | "zero_one" | "zeroone" => Ok(Box::new(ZeroOneAdapter::from_config(config))),
         other => Err(anyhow!("unsupported venue: {other}")),
     }
 }

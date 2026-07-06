@@ -92,6 +92,17 @@ impl Default for Config {
                     ],
                     channel: Some("orderbook".to_string()),
                 },
+                VenueConfig {
+                    name: "01".to_string(),
+                    enabled: true,
+                    url: Some("wss://zo-mainnet.n1.xyz".to_string()),
+                    markets: vec![
+                        "0:BTC:BTCUSD".to_string(),
+                        "1:ETH:ETHUSD".to_string(),
+                        "2:SOL:SOLUSD".to_string(),
+                    ],
+                    channel: Some("deltas".to_string()),
+                },
             ],
         }
     }
@@ -148,7 +159,7 @@ mod tests {
         assert_eq!(config.mode, "bbo");
         assert!(config.tui.enabled);
         assert_eq!(config.tui.refresh_ms, 250);
-        assert_eq!(config.venues.len(), 3);
+        assert_eq!(config.venues.len(), 4);
         assert_eq!(config.venues[0].name, "hyperliquid");
         assert_eq!(config.venues[0].channel.as_deref(), Some("bbo"));
         assert_eq!(config.venues[1].name, "lighter");
@@ -161,5 +172,16 @@ mod tests {
         );
         assert_eq!(config.venues[2].channel.as_deref(), Some("orderbook"));
         assert!(config.venues[2].markets.contains(&"4:SOL".to_string()));
+        assert_eq!(config.venues[3].name, "01");
+        assert_eq!(
+            config.venues[3].url.as_deref(),
+            Some("wss://zo-mainnet.n1.xyz")
+        );
+        assert_eq!(config.venues[3].channel.as_deref(), Some("deltas"));
+        assert!(
+            config.venues[3]
+                .markets
+                .contains(&"2:SOL:SOLUSD".to_string())
+        );
     }
 }

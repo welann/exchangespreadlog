@@ -6,6 +6,8 @@ pub enum Venue {
     Hyperliquid,
     Lighter,
     Risex,
+    #[serde(rename = "01")]
+    ZeroOne,
 }
 
 impl Venue {
@@ -14,6 +16,7 @@ impl Venue {
             Self::Hyperliquid => "hyperliquid",
             Self::Lighter => "lighter",
             Self::Risex => "risex",
+            Self::ZeroOne => "01",
         }
     }
 }

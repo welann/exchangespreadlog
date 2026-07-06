@@ -44,3 +44,14 @@ markets = [
     "4:SOL",
 ]
 channel = "orderbook"
+
+[[venues]]
+name = "01"
+enabled = true
+url = "wss://zo-mainnet.n1.xyz"
+markets = [
+    "0:BTC:BTCUSD",
+    "1:ETH:ETHUSD",
+    "2:SOL:SOLUSD",
+]
+channel = "deltas"
