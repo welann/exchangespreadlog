@@ -7,6 +7,10 @@ pub struct Backoff {
 }
 
 impl Backoff {
+    pub fn new(current: Duration, max: Duration) -> Self {
+        Self { current, max }
+    }
+
     pub fn next_delay(&mut self) -> Duration {
         let delay = self.current;
         self.current = (self.current * 2).min(self.max);

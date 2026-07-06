@@ -16,10 +16,10 @@ use crate::{
     config::{CatalogSource, VenueConfig},
     domain::{Fixed, InstrumentCatalog, MarketEvent, ProductType},
     exchange::{
-        CatalogIndex, ExchangeAdapter, decimal_tick, merge_configured_catalog, run_with_reconnect,
-        warn_catalog_miss,
+        CatalogIndex, ExchangeAdapter, decimal_tick, merge_configured_catalog,
+        run_with_reconnect_backoff, warn_catalog_miss,
     },
-    ingest::ws,
+    ingest::{supervisor::Backoff, ws},
 };
 
 use super::parser;
@@ -41,10 +41,9 @@ impl LighterAdapter {
     pub fn from_config(config: &VenueConfig) -> Self {
         Self {
             venue_instance_id: config.venue_instance_id.clone(),
-            url: config
-                .url
-                .clone()
-                .unwrap_or_else(|| "wss://mainnet.zklighter.elliot.ai/stream".to_string()),
+            url: config.url.clone().unwrap_or_else(|| {
+                "wss://mainnet.zklighter.elliot.ai/stream?readonly=true".to_string()
+            }),
             configured_catalog: config.catalog(),
             catalog_source: config.catalog_source,
             metadata_url: config.metadata_url.clone(),
@@ -60,10 +59,10 @@ impl LighterAdapter {
 
     async fn run_once(
         &self,
+        catalog: &CatalogIndex,
         tx: Sender<MarketEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let catalog = self.bootstrap_catalog().await?;
         for instrument in catalog.instruments() {
             tx.send(MarketEvent::Catalog {
                 instrument: instrument.clone(),
@@ -264,8 +263,10 @@ impl ExchangeAdapter for LighterAdapter {
         tx: Sender<MarketEvent>,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        run_with_reconnect("lighter", tx, shutdown, |tx, shutdown| {
-            self.run_once(tx, shutdown)
+        let catalog = self.bootstrap_catalog().await?;
+        let backoff = Backoff::new(Duration::from_secs(15), Duration::from_secs(300));
+        run_with_reconnect_backoff("lighter", tx, shutdown, backoff, |tx, shutdown| {
+            self.run_once(&catalog, tx, shutdown)
         })
         .await
     }

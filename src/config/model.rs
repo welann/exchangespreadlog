@@ -190,7 +190,7 @@ impl Default for Config {
                     venue_instance_id: "lighter".to_string(),
                     adapter: "lighter".to_string(),
                     enabled: true,
-                    url: Some("wss://mainnet.zklighter.elliot.ai/stream".to_string()),
+                    url: Some("wss://mainnet.zklighter.elliot.ai/stream?readonly=true".to_string()),
                     channel: Some("ticker".to_string()),
                     catalog_source: CatalogSource::Exchange,
                     metadata_url: Some(

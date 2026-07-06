@@ -117,7 +117,7 @@ rate = "1"
 venue_instance_id = "lighter"
 adapter = "lighter"
 enabled = true
-url = "wss://mainnet.zklighter.elliot.ai/stream"
+url = "wss://mainnet.zklighter.elliot.ai/stream?readonly=true"
 channel = "ticker"
 default_quote_asset = "USDC"
 default_settle_asset = "USDC"

@@ -30,13 +30,26 @@ pub async fn run_with_reconnect<F, Fut>(
     venue: &'static str,
     tx: Sender<MarketEvent>,
     shutdown: watch::Receiver<bool>,
+    run_once: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(Sender<MarketEvent>, watch::Receiver<bool>) -> Fut + Send,
+    Fut: Future<Output = anyhow::Result<()>> + Send,
+{
+    run_with_reconnect_backoff(venue, tx, shutdown, Backoff::default(), run_once).await
+}
+
+pub async fn run_with_reconnect_backoff<F, Fut>(
+    venue: &'static str,
+    tx: Sender<MarketEvent>,
+    shutdown: watch::Receiver<bool>,
+    mut backoff: Backoff,
     mut run_once: F,
 ) -> anyhow::Result<()>
 where
     F: FnMut(Sender<MarketEvent>, watch::Receiver<bool>) -> Fut + Send,
     Fut: Future<Output = anyhow::Result<()>> + Send,
 {
-    let mut backoff = Backoff::default();
     while !*shutdown.borrow() {
         match run_once(tx.clone(), shutdown.clone()).await {
             Ok(()) => return Ok(()),
