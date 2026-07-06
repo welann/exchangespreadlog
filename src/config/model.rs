@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fmt, fs, path::Path, str::FromStr};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -21,17 +21,31 @@ pub struct PipelineConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
 pub struct StorageConfig {
-    pub jsonl_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<StorageMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jsonl_enabled: Option<bool>,
+    #[serde(default = "default_jsonl_dir")]
     pub jsonl_dir: String,
+    #[serde(default)]
     pub clickhouse: ClickHouseConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageMode {
+    None,
+    Jsonl,
+    Clickhouse,
+    Both,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClickHouseConfig {
-    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     pub url: String,
     pub database: String,
     pub table: String,
@@ -135,17 +149,76 @@ impl Default for PipelineConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            jsonl_enabled: true,
+            mode: Some(StorageMode::Jsonl),
+            jsonl_enabled: None,
             jsonl_dir: "data/bbo".to_string(),
             clickhouse: ClickHouseConfig::default(),
         }
     }
 }
 
+fn default_jsonl_dir() -> String {
+    "data/bbo".to_string()
+}
+
+impl StorageConfig {
+    pub fn effective_mode(&self) -> StorageMode {
+        if let Some(mode) = self.mode {
+            return mode;
+        }
+
+        match (
+            self.jsonl_enabled.unwrap_or(true),
+            self.clickhouse.enabled.unwrap_or(false),
+        ) {
+            (false, false) => StorageMode::None,
+            (true, false) => StorageMode::Jsonl,
+            (false, true) => StorageMode::Clickhouse,
+            (true, true) => StorageMode::Both,
+        }
+    }
+}
+
+impl StorageMode {
+    pub const VALUES: [&'static str; 4] = ["none", "jsonl", "clickhouse", "both"];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Jsonl => "jsonl",
+            Self::Clickhouse => "clickhouse",
+            Self::Both => "both",
+        }
+    }
+}
+
+impl FromStr for StorageMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "noop" | "off" => Ok(Self::None),
+            "jsonl" | "local" => Ok(Self::Jsonl),
+            "clickhouse" | "ch" => Ok(Self::Clickhouse),
+            "both" | "all" => Ok(Self::Both),
+            other => Err(format!(
+                "unsupported storage mode `{other}`; expected one of: {}",
+                Self::VALUES.join(", ")
+            )),
+        }
+    }
+}
+
+impl fmt::Display for StorageMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl Default for ClickHouseConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: None,
             url: "https://obdata.zeabur.app/".to_string(),
             database: "zeabur".to_string(),
             table: "bbo_ticks".to_string(),
@@ -181,7 +254,7 @@ impl Default for TuiConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, StorageConfig, StorageMode};
 
     #[test]
     fn default_config_round_trips_through_toml() {
@@ -191,7 +264,9 @@ mod tests {
         assert_eq!(config.mode, "bbo");
         assert!(config.tui.enabled);
         assert_eq!(config.tui.refresh_ms, 250);
-        assert!(!config.storage.clickhouse.enabled);
+        assert_eq!(config.storage.mode, Some(StorageMode::Jsonl));
+        assert_eq!(config.storage.effective_mode(), StorageMode::Jsonl);
+        assert_eq!(config.storage.clickhouse.enabled, None);
         assert_eq!(config.storage.clickhouse.url, "https://obdata.zeabur.app/");
         assert_eq!(config.storage.clickhouse.table, "bbo_ticks");
         assert_eq!(config.venues.len(), 4);
@@ -218,5 +293,32 @@ mod tests {
                 .markets
                 .contains(&"2:SOL:SOLUSD".to_string())
         );
+    }
+
+    #[test]
+    fn legacy_storage_flags_still_select_effective_mode() {
+        let config: StorageConfig = toml::from_str(
+            r#"
+jsonl_enabled = false
+
+[clickhouse]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.mode, None);
+        assert_eq!(config.effective_mode(), StorageMode::Clickhouse);
+    }
+
+    #[test]
+    fn parses_storage_mode_aliases() {
+        assert_eq!("none".parse::<StorageMode>().unwrap(), StorageMode::None);
+        assert_eq!("local".parse::<StorageMode>().unwrap(), StorageMode::Jsonl);
+        assert_eq!(
+            "clickhouse".parse::<StorageMode>().unwrap(),
+            StorageMode::Clickhouse
+        );
+        assert!("sqlite".parse::<StorageMode>().is_err());
     }
 }

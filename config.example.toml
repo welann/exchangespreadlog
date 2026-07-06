@@ -5,11 +5,10 @@ channel_capacity = 4096
 stale_after_ms = 5000
 
 [storage]
-jsonl_enabled = true
+mode = "jsonl"
 jsonl_dir = "data/bbo"
 
 [storage.clickhouse]
-enabled = false
 url = "https://obdata.zeabur.app/"
 database = "zeabur"
 table = "bbo_ticks"

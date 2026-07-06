@@ -66,9 +66,8 @@ Important config sections:
 
 - `pipeline.channel_capacity`: internal tick channel size.
 - `pipeline.stale_after_ms`: stale threshold reserved in the config model.
-- `storage.jsonl_enabled`: write normalized ticks to JSONL when `true`.
+- `storage.mode`: storage target. Supported values are `none`, `jsonl`, `clickhouse`, and `both`.
 - `storage.jsonl_dir`: base output directory, default `data/bbo`.
-- `storage.clickhouse.enabled`: write normalized ticks to ClickHouse when `true`.
 - `storage.clickhouse.url`: ClickHouse HTTP endpoint.
 - `storage.clickhouse.database`: ClickHouse database name.
 - `storage.clickhouse.table`: ClickHouse table name. The collector creates it when `create_table = true`.
@@ -82,8 +81,11 @@ Important config sections:
 Example ClickHouse storage config for the Zeabur service:
 
 ```toml
+[storage]
+mode = "clickhouse"
+jsonl_dir = "data/bbo"
+
 [storage.clickhouse]
-enabled = true
 url = "https://obdata.zeabur.app/"
 database = "zeabur"
 table = "bbo_ticks"
@@ -147,11 +149,33 @@ Run with an explicit config:
 cargo run -- --config config.toml
 ```
 
-Run without the terminal UI, while still collecting and writing data:
+The `--storage` flag overrides `[storage].mode` for that run. Use these commands for the common modes:
+
+1. TUI only, no local or ClickHouse writes:
 
 ```bash
-cargo run -- --config config.toml --no-tui
+cargo run -- --config config.toml --storage none
 ```
+
+2. TUI plus local JSONL storage:
+
+```bash
+cargo run -- --config config.toml --storage jsonl
+```
+
+3. TUI plus ClickHouse storage:
+
+```bash
+CLICKHOUSE_PASSWORD='your-clickhouse-password' cargo run -- --config config.toml --storage clickhouse
+```
+
+4. ClickHouse only, no TUI and no local JSONL storage:
+
+```bash
+CLICKHOUSE_PASSWORD='your-clickhouse-password' cargo run -- --config config.toml --storage clickhouse --no-tui
+```
+
+If `config.toml` contains `storage.clickhouse.password`, you can omit the `CLICKHOUSE_PASSWORD=...` prefix. Prefer the environment variable for shared or committed configs.
 
 Set log verbosity with `RUST_LOG`:
 
@@ -172,7 +196,7 @@ Stop the collector with `Ctrl-C`. When the TUI is enabled, `q` or `Esc` also exi
 
 ## Output
 
-When `storage.jsonl_enabled = true`, ticks are written under:
+When `storage.mode = "jsonl"` or `storage.mode = "both"`, ticks are written under:
 
 ```text
 data/bbo/YYYY-MM-DD/<venue>.jsonl
@@ -191,7 +215,7 @@ Each line is one normalized `BboTick` JSON object. Common fields include:
 - `source`: source feed type such as `bbo`, `ticker`, or `l2_book`.
 - `quality`: quality flags, including `inconsistent` for negative spread.
 
-When `storage.clickhouse.enabled = true`, ticks are inserted through the ClickHouse HTTP interface into `storage.clickhouse.table`. The table includes:
+When `storage.mode = "clickhouse"` or `storage.mode = "both"`, ticks are inserted through the ClickHouse HTTP interface into `storage.clickhouse.table`. The table includes:
 
 - identifiers and timestamps: `venue`, `market_id`, `market_symbol`, `recv_ts_ns`, `recv_time`, `exchange_ts_ms`, `sequence`, `source`.
 - bid/ask values as both Float64 and exact text fields, for example `bid_price` and `bid_price_text`.
@@ -232,6 +256,7 @@ Usage: exchangespreadlog [OPTIONS]
 Options:
   -c, --config <CONFIG>       [default: config.toml]
       --no-tui
+      --storage <MODE>        Override storage mode: none, jsonl, clickhouse, or both
       --print-default-config
   -h, --help                  Print help
   -V, --version               Print version

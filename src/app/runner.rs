@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::{
-    config::{Config, VenueConfig},
+    config::{Config, StorageMode, VenueConfig},
     exchange::{
         ExchangeAdapter, hyperliquid::HyperliquidAdapter, lighter::LighterAdapter,
         risex::RisexAdapter, zero_one::ZeroOneAdapter,
@@ -101,14 +101,22 @@ impl AppRunner {
     async fn build_sink(&self) -> anyhow::Result<Arc<dyn BboSink>> {
         let mut sinks: Vec<Arc<dyn BboSink>> = Vec::new();
 
-        if self.config.storage.jsonl_enabled {
-            sinks.push(Arc::new(JsonlSink::new(&self.config.storage.jsonl_dir)));
-        }
-
-        if self.config.storage.clickhouse.enabled {
-            sinks.push(Arc::new(
-                ClickHouseSink::new(&self.config.storage.clickhouse).await?,
-            ));
+        match self.config.storage.effective_mode() {
+            StorageMode::None => {}
+            StorageMode::Jsonl => {
+                sinks.push(Arc::new(JsonlSink::new(&self.config.storage.jsonl_dir)));
+            }
+            StorageMode::Clickhouse => {
+                sinks.push(Arc::new(
+                    ClickHouseSink::new(&self.config.storage.clickhouse).await?,
+                ));
+            }
+            StorageMode::Both => {
+                sinks.push(Arc::new(JsonlSink::new(&self.config.storage.jsonl_dir)));
+                sinks.push(Arc::new(
+                    ClickHouseSink::new(&self.config.storage.clickhouse).await?,
+                ));
+            }
         }
 
         let sink: Arc<dyn BboSink> = match sinks.len() {

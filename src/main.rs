@@ -2,7 +2,11 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use exchangespreadlog::{app::runner::AppRunner, config::Config, telemetry};
+use exchangespreadlog::{
+    app::runner::AppRunner,
+    config::{Config, StorageMode},
+    telemetry,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -15,6 +19,14 @@ struct Args {
 
     #[arg(long)]
     no_tui: bool,
+
+    #[arg(
+        long,
+        value_name = "MODE",
+        value_parser = parse_storage_mode,
+        help = "Override storage mode: none, jsonl, clickhouse, or both"
+    )]
+    storage: Option<StorageMode>,
 
     #[arg(long)]
     print_default_config: bool,
@@ -35,9 +47,16 @@ async fn main() -> Result<()> {
     if args.no_tui {
         config.tui.enabled = false;
     }
+    if let Some(storage) = args.storage {
+        config.storage.mode = Some(storage);
+    }
     AppRunner::new(config).run().await
 }
 
 fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+fn parse_storage_mode(value: &str) -> Result<StorageMode, String> {
+    value.parse()
 }
