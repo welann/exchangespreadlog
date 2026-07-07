@@ -26,6 +26,23 @@
     { from: 'USDT', to: 'USD', rate: '1' }
   ];
 
+  type QueryState = {
+    baseAsset?: string;
+    catalogA?: string;
+    catalogB?: string;
+    preset?: string;
+    fromMs?: number;
+    toMs?: number;
+  };
+
+  type Opportunity = {
+    label: string;
+    route: string;
+    value: number | null;
+    bp: number | null;
+    tone: 'positive' | 'negative' | 'neutral';
+  };
+
   let markets: Market[] = [];
   let selectedBase = '';
   let selectedA = '';
@@ -35,6 +52,13 @@
   let customEnd = toDateInput(Date.now());
   let rangeAnchorMs = Date.now();
   let rates: QuoteRate[] = structuredClone(defaultRates);
+  let hydrated = false;
+  let nowMs = Date.now();
+  let showAToB = true;
+  let showBToA = true;
+  let autoRefresh = false;
+  let refreshSeconds = 30;
+  let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
   let marketError = '';
   let queryError = '';
@@ -47,22 +71,40 @@
   $: currentMarket = markets.find((market) => market.baseAsset === selectedBase);
   $: currentInstruments = currentMarket?.instruments ?? [];
   $: marketLatestMs = latestForInstruments(currentInstruments);
+  $: marketFreshness = freshnessFor(marketLatestMs, nowMs);
+  $: totalTicks = currentInstruments.reduce((sum, instrument) => sum + instrument.tickCount, 0);
+  $: selectedInstrumentA = currentInstruments.find((instrument) => instrument.catalogId === selectedA) ?? null;
+  $: selectedInstrumentB = currentInstruments.find((instrument) => instrument.catalogId === selectedB) ?? null;
   $: selectedRange = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
   $: points = spread?.points ?? [];
   $: xBounds = computeXBounds(points, selectedRange);
-  $: yBounds = computeYBounds(points);
-  $: aPath = linePath(points, 'aToB', xBounds, yBounds);
-  $: bPath = linePath(points, 'bToA', xBounds, yBounds);
+  $: yBounds = computeYBounds(points, showAToB, showBToA);
+  $: aPath = showAToB ? linePath(points, 'aToB', xBounds, yBounds) : '';
+  $: bPath = showBToA ? linePath(points, 'bToA', xBounds, yBounds) : '';
   $: zeroY = yScale(0, yBounds);
   $: activeIndex = hoverIndex >= 0 ? hoverIndex : selectedIndex;
   $: activePoint = points[activeIndex] ?? null;
+  $: latestPoint = points.length > 0 ? points[points.length - 1] : null;
+  $: latestOpportunity = opportunityForPoint(latestPoint);
+  $: activeOpportunity = opportunityForPoint(activePoint);
+  $: pointRows = pointTableRows(points, activeIndex);
 
   onMount(() => {
+    hydrated = true;
     loadStoredRates();
-    void loadMarkets();
+    const queryState = readQueryState();
+    void loadMarkets(queryState);
+    const clockTimer = setInterval(() => {
+      nowMs = Date.now();
+    }, 30_000);
+
+    return () => {
+      clearInterval(clockTimer);
+      stopAutoRefresh();
+    };
   });
 
-  async function loadMarkets() {
+  async function loadMarkets(state: QueryState | null = captureQueryState()) {
     loadingMarkets = true;
     marketError = '';
     try {
@@ -71,7 +113,7 @@
       if (!response.ok) throw new Error(body.error ?? 'Failed to load markets');
       markets = body.markets ?? [];
       if (markets.length > 0) {
-        selectBase(markets[0].baseAsset);
+        applySelectionState(state);
         await loadSpread();
       } else {
         marketError = 'No comparable markets were found. Check /api/health for ClickHouse table status.';
@@ -90,6 +132,11 @@
     }
 
     const range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
+    if (!Number.isFinite(range.fromMs) || !Number.isFinite(range.toMs) || range.fromMs >= range.toMs) {
+      queryError = 'Choose a valid time range with From before To';
+      return;
+    }
+
     loadingSpread = true;
     queryError = '';
     hoverIndex = -1;
@@ -109,6 +156,7 @@
       if (!response.ok) throw new Error(body.error ?? 'Failed to query spread');
       spread = body as SpreadResponse;
       selectedIndex = spread.points.length > 0 ? spread.points.length - 1 : -1;
+      syncQueryState();
     } catch (error) {
       spread = null;
       selectedIndex = -1;
@@ -119,18 +167,7 @@
   }
 
   function selectBase(baseAsset: string) {
-    selectedBase = baseAsset;
-    const instruments = markets.find((market) => market.baseAsset === baseAsset)?.instruments ?? [];
-    selectedA = instruments[0]?.catalogId ?? '';
-    selectedB = instruments[1]?.catalogId ?? instruments[0]?.catalogId ?? '';
-    rangeAnchorMs = latestForInstruments(instruments) ?? Date.now();
-    if (selectedPreset !== 'custom') {
-      const range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
-      customStart = toDateInput(range.fromMs);
-      customEnd = toDateInput(range.toMs);
-    }
-    selectedIndex = -1;
-    hoverIndex = -1;
+    applySelectionState({ ...captureQueryState(), baseAsset });
   }
 
   function selectLegA(catalogId: string) {
@@ -138,6 +175,8 @@
     if (selectedA === selectedB) {
       selectedB = currentInstruments.find((instrument) => instrument.catalogId !== catalogId)?.catalogId ?? '';
     }
+    selectedIndex = -1;
+    hoverIndex = -1;
   }
 
   function selectLegB(catalogId: string) {
@@ -145,6 +184,72 @@
     if (selectedA === selectedB) {
       selectedA = currentInstruments.find((instrument) => instrument.catalogId !== catalogId)?.catalogId ?? '';
     }
+    selectedIndex = -1;
+    hoverIndex = -1;
+  }
+
+  function swapLegs() {
+    if (!selectedA || !selectedB) return;
+    const previousA = selectedA;
+    selectedA = selectedB;
+    selectedB = previousA;
+    selectedIndex = -1;
+    hoverIndex = -1;
+  }
+
+  async function refreshData() {
+    nowMs = Date.now();
+    await loadMarkets(captureQueryState());
+  }
+
+  function toggleAutoRefresh(enabled: boolean) {
+    autoRefresh = enabled;
+    configureAutoRefresh();
+  }
+
+  function updateRefreshSeconds(value: string) {
+    const parsed = Number(value);
+    refreshSeconds = Number.isFinite(parsed) ? parsed : 30;
+    configureAutoRefresh();
+  }
+
+  function configureAutoRefresh() {
+    stopAutoRefresh();
+    if (!autoRefresh) return;
+    refreshTimer = setInterval(() => {
+      if (!loadingMarkets && !loadingSpread) void refreshData();
+    }, refreshSeconds * 1000);
+  }
+
+  function stopAutoRefresh() {
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+
+  function toggleSeries(series: 'aToB' | 'bToA') {
+    if (series === 'aToB') {
+      showAToB = !showAToB;
+      if (!showAToB && !showBToA) showBToA = true;
+    } else {
+      showBToA = !showBToA;
+      if (!showAToB && !showBToA) showAToB = true;
+    }
+  }
+
+  function selectPoint(index: number) {
+    selectedIndex = clamp(index, 0, points.length - 1);
+    hoverIndex = -1;
+  }
+
+  function jumpPoint(delta: number) {
+    if (points.length === 0) return;
+    const current = selectedIndex >= 0 ? selectedIndex : points.length - 1;
+    selectPoint(current + delta);
+  }
+
+  function jumpLatest() {
+    if (points.length === 0) return;
+    selectPoint(points.length - 1);
   }
 
   function updateRate(index: number, field: keyof QuoteRate, value: string) {
@@ -217,6 +322,103 @@
     };
   }
 
+  function captureQueryState(): QueryState {
+    const range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
+    return {
+      baseAsset: selectedBase,
+      catalogA: selectedA,
+      catalogB: selectedB,
+      preset: selectedPreset,
+      fromMs: range.fromMs,
+      toMs: range.toMs
+    };
+  }
+
+  function applySelectionState(state: QueryState | null = null) {
+    const baseAsset =
+      markets.find((market) => market.baseAsset === state?.baseAsset)?.baseAsset ??
+      markets.find((market) => market.baseAsset === selectedBase)?.baseAsset ??
+      markets[0]?.baseAsset ??
+      '';
+    selectedBase = baseAsset;
+
+    const instruments = markets.find((market) => market.baseAsset === baseAsset)?.instruments ?? [];
+    const catalogA =
+      instruments.find((instrument) => instrument.catalogId === state?.catalogA)?.catalogId ??
+      instruments.find((instrument) => instrument.catalogId === selectedA)?.catalogId ??
+      instruments[0]?.catalogId ??
+      '';
+    selectedA = catalogA;
+
+    const catalogB =
+      instruments.find(
+        (instrument) => instrument.catalogId === state?.catalogB && instrument.catalogId !== selectedA
+      )?.catalogId ??
+      instruments.find(
+        (instrument) => instrument.catalogId === selectedB && instrument.catalogId !== selectedA
+      )?.catalogId ??
+      instruments.find((instrument) => instrument.catalogId !== selectedA)?.catalogId ??
+      selectedA;
+    selectedB = catalogB;
+
+    rangeAnchorMs = latestForInstruments(instruments) ?? Date.now();
+    selectedPreset = presets.some((preset) => preset.value === state?.preset)
+      ? (state?.preset ?? selectedPreset)
+      : selectedPreset;
+
+    if (
+      selectedPreset === 'custom' &&
+      state?.fromMs !== undefined &&
+      state?.toMs !== undefined &&
+      Number.isFinite(state.fromMs) &&
+      Number.isFinite(state.toMs)
+    ) {
+      customStart = toDateInput(state.fromMs);
+      customEnd = toDateInput(state.toMs);
+    } else {
+      const range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
+      customStart = toDateInput(range.fromMs);
+      customEnd = toDateInput(range.toMs);
+    }
+
+    selectedIndex = -1;
+    hoverIndex = -1;
+  }
+
+  function readQueryState(): QueryState | null {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    const state: QueryState = {};
+    const baseAsset = params.get('base');
+    const catalogA = params.get('a');
+    const catalogB = params.get('b');
+    const preset = params.get('preset');
+    const fromMs = Number(params.get('from'));
+    const toMs = Number(params.get('to'));
+
+    if (baseAsset) state.baseAsset = baseAsset;
+    if (catalogA) state.catalogA = catalogA;
+    if (catalogB) state.catalogB = catalogB;
+    if (preset) state.preset = preset;
+    if (Number.isFinite(fromMs)) state.fromMs = fromMs;
+    if (Number.isFinite(toMs)) state.toMs = toMs;
+
+    return Object.keys(state).length > 0 ? state : null;
+  }
+
+  function syncQueryState() {
+    if (typeof window === 'undefined') return;
+    const range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
+    const params = new URLSearchParams();
+    if (selectedBase) params.set('base', selectedBase);
+    if (selectedA) params.set('a', selectedA);
+    if (selectedB) params.set('b', selectedB);
+    params.set('preset', selectedPreset);
+    params.set('from', String(Math.trunc(range.fromMs)));
+    params.set('to', String(Math.trunc(range.toMs)));
+    window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}${window.location.hash}`);
+  }
+
   function handlePreset(value: string) {
     selectedPreset = value;
     if (value !== 'custom') {
@@ -224,6 +426,8 @@
       customStart = toDateInput(range.fromMs);
       customEnd = toDateInput(range.toMs);
     }
+    selectedIndex = -1;
+    hoverIndex = -1;
   }
 
   function selectValue(event: Event) {
@@ -292,9 +496,12 @@
     };
   }
 
-  function computeYBounds(data: SpreadPoint[]) {
+  function computeYBounds(data: SpreadPoint[], includeAToB: boolean, includeBToA: boolean) {
     const values = data
-      .flatMap((point) => [point.aToB, point.bToA])
+      .flatMap((point) => [
+        includeAToB ? point.aToB : null,
+        includeBToA ? point.bToA : null
+      ])
       .filter((value): value is number => value !== null && Number.isFinite(value));
 
     if (values.length === 0) return { min: -1, max: 1 };
@@ -355,19 +562,84 @@
     return latest.length > 0 ? Math.max(...latest) : null;
   }
 
+  function opportunityForPoint(point: SpreadPoint | null): Opportunity | null {
+    if (!point) return null;
+    const aBp = point.aToBBp ?? Number.NEGATIVE_INFINITY;
+    const bBp = point.bToABp ?? Number.NEGATIVE_INFINITY;
+    if (aBp === Number.NEGATIVE_INFINITY && bBp === Number.NEGATIVE_INFINITY) return null;
+
+    const useA = aBp >= bBp;
+    const bp = useA ? point.aToBBp : point.bToABp;
+    const value = useA ? point.aToB : point.bToA;
+    const tone = bp === null || Math.abs(bp) < 0.01 ? 'neutral' : bp > 0 ? 'positive' : 'negative';
+
+    return {
+      label: useA ? 'Sell A / Buy B' : 'Sell B / Buy A',
+      route: useA
+        ? `${selectedLabel(selectedA)} bid minus ${selectedLabel(selectedB)} ask`
+        : `${selectedLabel(selectedB)} bid minus ${selectedLabel(selectedA)} ask`,
+      value,
+      bp,
+      tone
+    };
+  }
+
+  function pointTableRows(data: SpreadPoint[], active: number) {
+    if (data.length === 0) return [];
+    const limit = 9;
+    const anchor = active >= 0 ? active : data.length - 1;
+    const start = clamp(anchor - Math.floor(limit / 2), 0, Math.max(0, data.length - limit));
+    return data.slice(start, start + limit).map((point, offset) => ({
+      point,
+      index: start + offset
+    }));
+  }
+
+  function freshnessFor(ms: number | null, now: number) {
+    if (ms === null) {
+      return { label: 'No ticks', detail: 'No market data in ClickHouse', className: 'stale' };
+    }
+    const ageMs = Math.max(0, now - ms);
+    const className = ageMs <= 2 * 60 * 1000 ? 'fresh' : ageMs <= 30 * 60 * 1000 ? 'lagging' : 'stale';
+    return {
+      label: `${formatDuration(ageMs)} old`,
+      detail: formatTime(ms),
+      className
+    };
+  }
+
+  function formatDuration(ms: number) {
+    const seconds = Math.round(ms / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.round(minutes / 60);
+    if (hours < 48) return `${hours}h`;
+    return `${Math.round(hours / 24)}d`;
+  }
+
+  function formatInteger(value: number) {
+    return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
+  }
+
   function formatNumber(value: number | null, digits = 6) {
     if (value === null || !Number.isFinite(value)) return '-';
-    if (Math.abs(value) >= 100) return value.toFixed(2);
-    if (Math.abs(value) >= 1) return value.toFixed(4);
-    return value.toFixed(digits);
+    const maximumFractionDigits = Math.abs(value) >= 100 ? 2 : Math.abs(value) >= 1 ? 4 : digits;
+    return new Intl.NumberFormat(undefined, {
+      maximumFractionDigits
+    }).format(value);
   }
 
   function formatBp(value: number | null) {
     if (value === null || !Number.isFinite(value)) return '-';
-    return `${value.toFixed(2)} bp`;
+    return `${new Intl.NumberFormat(undefined, {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(value)} bp`;
   }
 
-  function formatTime(ms: number) {
+  function formatTime(ms: number | null) {
+    if (ms === null || !Number.isFinite(ms)) return '-';
     return new Intl.DateTimeFormat(undefined, {
       month: '2-digit',
       day: '2-digit',
@@ -377,7 +649,8 @@
     }).format(new Date(ms));
   }
 
-  function formatAxisTime(ms: number) {
+  function formatAxisTime(ms: number | null) {
+    if (ms === null || !Number.isFinite(ms)) return '-';
     return new Intl.DateTimeFormat(undefined, {
       hour: '2-digit',
       minute: '2-digit'
@@ -402,34 +675,47 @@
   />
 </svelte:head>
 
-<main class="page-shell">
+<a class="skip-link" href="#spread-main">Skip to main content</a>
+
+<main id="spread-main" class="page-shell">
   <header class="topbar">
     <div>
       <p class="eyebrow">ClickHouse spread console</p>
       <h1>Cross-venue spread curves</h1>
     </div>
-    <div class="connection">
-      <span class:live={points.length > 0}></span>
-      {#if loadingMarkets}
-        Loading markets
-      {:else if points.length > 0}
-        {points.length} samples, {spread?.meta.bucketSeconds}s buckets
-      {:else if currentMarket}
-        {formatLatest(marketLatestMs)}
-      {:else}
-        Waiting for query
-      {/if}
+    <div class="topbar-actions">
+      <div class="connection" aria-live="polite">
+        <span class:live={points.length > 0} aria-hidden="true"></span>
+        {#if loadingMarkets}
+          Loading markets…
+        {:else if points.length > 0}
+          {formatInteger(points.length)} samples, {spread?.meta.bucketSeconds}s buckets
+        {:else if currentMarket}
+          {formatLatest(marketLatestMs)}
+        {:else}
+          Waiting for query
+        {/if}
+      </div>
+      <button
+        class="ghost-button"
+        type="button"
+        disabled={loadingMarkets || loadingSpread || markets.length === 0}
+        on:click={refreshData}
+      >
+        Refresh Latest
+      </button>
     </div>
   </header>
 
   {#if marketError}
-    <section class="notice error">{marketError}</section>
+    <section class="notice error" role="alert">{marketError}</section>
   {/if}
 
   <section class="control-strip" aria-label="Spread query controls">
     <label>
       <span>Market</span>
       <select
+        name="market"
         value={selectedBase}
         disabled={loadingMarkets || markets.length === 0}
         on:change={(event) => selectBase(selectValue(event))}
@@ -445,6 +731,7 @@
     <label>
       <span>Leg A</span>
       <select
+        name="leg-a"
         value={selectedA}
         disabled={currentInstruments.length < 2}
         on:change={(event) => selectLegA(selectValue(event))}
@@ -458,6 +745,7 @@
     <label>
       <span>Leg B</span>
       <select
+        name="leg-b"
         value={selectedB}
         disabled={currentInstruments.length < 2}
         on:change={(event) => selectLegB(selectValue(event))}
@@ -467,6 +755,15 @@
         {/each}
       </select>
     </label>
+
+    <button
+      class="swap-button"
+      type="button"
+      disabled={!selectedA || !selectedB || selectedA === selectedB}
+      on:click={swapLegs}
+    >
+      Swap Legs
+    </button>
 
     <div class="preset-group" aria-label="Time range presets">
       {#each presets as preset}
@@ -483,11 +780,21 @@
     {#if selectedPreset === 'custom'}
       <label class="time-input">
         <span>From</span>
-        <input type="datetime-local" bind:value={customStart} />
+        <input
+          type="datetime-local"
+          name="spread-from"
+          autocomplete="off"
+          bind:value={customStart}
+        />
       </label>
       <label class="time-input">
         <span>To</span>
-        <input type="datetime-local" bind:value={customEnd} />
+        <input
+          type="datetime-local"
+          name="spread-to"
+          autocomplete="off"
+          bind:value={customEnd}
+        />
       </label>
     {/if}
 
@@ -497,13 +804,68 @@
       disabled={loadingSpread || loadingMarkets || currentInstruments.length < 2}
       on:click={loadSpread}
     >
-      {loadingSpread ? 'Querying...' : 'Run query'}
+      {loadingSpread ? 'Querying…' : 'Run Query'}
     </button>
+
+    <div class="auto-refresh">
+      <span>Refresh</span>
+      <label class="checkbox-line">
+        <input
+          type="checkbox"
+          name="auto-refresh"
+          checked={autoRefresh}
+          on:change={(event) => toggleAutoRefresh((event.currentTarget as HTMLInputElement).checked)}
+        />
+        Auto
+      </label>
+      <select
+        name="refresh-interval"
+        aria-label="Auto refresh interval"
+        value={refreshSeconds}
+        disabled={!autoRefresh}
+        on:change={(event) => updateRefreshSeconds(selectValue(event))}
+      >
+        <option value="15">15s</option>
+        <option value="30">30s</option>
+        <option value="60">60s</option>
+      </select>
+    </div>
   </section>
 
   {#if queryError}
-    <section class="notice error">{queryError}</section>
+    <section class="notice error" role="alert">{queryError}</section>
   {/if}
+
+  <section class="metric-strip" aria-label="Current spread summary">
+    <article class={`metric ${latestOpportunity?.tone ?? 'neutral'}`}>
+      <p class="metric-label">Latest Best Route</p>
+      <strong>{latestOpportunity?.label ?? 'No route'}</strong>
+      <span>
+        {formatNumber(latestOpportunity?.value ?? null)} {spread?.meta.targetQuote ?? ''}
+        · {formatBp(latestOpportunity?.bp ?? null)}
+      </span>
+    </article>
+
+    <article class="metric">
+      <p class="metric-label">Selected Point</p>
+      <strong>{activePoint ? formatTime(activePoint.tsMs) : 'No point selected'}</strong>
+      <span>{activeOpportunity?.route ?? 'Hover, click, or use arrow keys on the chart'}</span>
+    </article>
+
+    <article class="metric">
+      <p class="metric-label">Data Freshness</p>
+      <strong>
+        <span class={`freshness ${marketFreshness.className}`}>{marketFreshness.label}</span>
+      </strong>
+      <span>{marketFreshness.detail}</span>
+    </article>
+
+    <article class="metric">
+      <p class="metric-label">Market Coverage</p>
+      <strong>{formatInteger(currentInstruments.length)} venues</strong>
+      <span>{formatInteger(totalTicks)} ticks · {selectedPreset} window</span>
+    </article>
+  </section>
 
   <section class="workspace">
     <section class="chart-panel">
@@ -511,16 +873,39 @@
         <div>
           <p class="eyebrow">{selectedBase || 'No market selected'}</p>
           <h2>{selectedLabel(selectedA)} vs {selectedLabel(selectedB)}</h2>
+          <p class="chart-subtitle">
+            {hydrated ? `${formatTime(selectedRange.fromMs)} - ${formatTime(selectedRange.toMs)}` : 'Loading range…'}
+            · target {spread?.meta.targetQuote ?? selectedInstrumentA?.quoteAsset ?? selectedInstrumentB?.quoteAsset ?? '-'}
+          </p>
         </div>
         <div class="legend">
-          <span><i class="line-a"></i>A bid - B ask</span>
-          <span><i class="line-b"></i>B bid - A ask</span>
-          <span><i class="zero"></i>zero</span>
+          <button
+            class="series-toggle"
+            class:inactive={!showAToB}
+            type="button"
+            aria-pressed={showAToB}
+            on:click={() => toggleSeries('aToB')}
+          >
+            <i class="line-a" aria-hidden="true"></i>A bid - B ask
+          </button>
+          <button
+            class="series-toggle"
+            class:inactive={!showBToA}
+            type="button"
+            aria-pressed={showBToA}
+            on:click={() => toggleSeries('bToA')}
+          >
+            <i class="line-b" aria-hidden="true"></i>B bid - A ask
+          </button>
+          <span><i class="zero" aria-hidden="true"></i>zero</span>
         </div>
       </div>
+      <p id="chart-help" class="chart-help">
+        Click the curve to pin a sample. Use Left, Right, Home, and End while focused on the chart.
+      </p>
 
       {#if loadingSpread}
-        <div class="empty-state">Querying ClickHouse...</div>
+        <div class="empty-state">Querying ClickHouse…</div>
       {:else if points.length === 0}
         <div class="empty-state">
           No joined BBO samples for this pair and time range. Adjust the range or pair.
@@ -532,6 +917,7 @@
           role="button"
           tabindex="0"
           aria-label="Cross venue spread chart. Hover, click, or use arrow keys to inspect samples."
+          aria-describedby="chart-help"
           on:pointermove={handlePointerMove}
           on:pointerleave={() => (hoverIndex = -1)}
           on:click={handleChartClick}
@@ -569,8 +955,12 @@
             y1={zeroY}
             y2={zeroY}
           />
-          <path class="spread-line a" d={aPath} />
-          <path class="spread-line b" d={bPath} />
+          {#if showAToB}
+            <path class="spread-line a" d={aPath} />
+          {/if}
+          {#if showBToA}
+            <path class="spread-line b" d={bPath} />
+          {/if}
 
           <text class="axis-label y top" x="12" y={CHART.top + 4}>{formatNumber(yBounds.max)}</text>
           <text class="axis-label y middle" x="12" y={zeroY + 4}>0</text>
@@ -592,7 +982,7 @@
               y1={CHART.top}
               y2={CHART.height - CHART.bottom}
             />
-            {#if activePoint.aToB !== null}
+            {#if showAToB && activePoint.aToB !== null}
               <circle
                 class="point a"
                 cx={xScale(activePoint.tsMs, xBounds)}
@@ -600,7 +990,7 @@
                 r="5"
               />
             {/if}
-            {#if activePoint.bToA !== null}
+            {#if showBToA && activePoint.bToA !== null}
               <circle
                 class="point b"
                 cx={xScale(activePoint.tsMs, xBounds)}
@@ -618,6 +1008,16 @@
         <p class="eyebrow">Point inspector</p>
         {#if activePoint && spread}
           <h3>{formatTime(activePoint.tsMs)}</h3>
+          {#if activeOpportunity}
+            <div class={`route-card ${activeOpportunity.tone}`}>
+              <span>{activeOpportunity.label}</span>
+              <strong>
+                {formatNumber(activeOpportunity.value)} {spread.meta.targetQuote}
+                · {formatBp(activeOpportunity.bp)}
+              </strong>
+              <small>{activeOpportunity.route}</small>
+            </div>
+          {/if}
           <dl>
             <div>
               <dt>A bid - B ask</dt>
@@ -644,9 +1044,108 @@
             <span>A bid/ask {formatNumber(activePoint.aBid)} / {formatNumber(activePoint.aAsk)}</span>
             <span>B bid/ask {formatNumber(activePoint.bBid)} / {formatNumber(activePoint.bAsk)}</span>
           </div>
+          <div class="point-actions">
+            <button type="button" disabled={points.length === 0} on:click={() => jumpPoint(-1)}>
+              Previous
+            </button>
+            <button type="button" disabled={points.length === 0} on:click={() => jumpPoint(1)}>
+              Next
+            </button>
+            <button type="button" disabled={points.length === 0} on:click={jumpLatest}>Latest</button>
+          </div>
         {:else}
           <p class="muted">Hover or click the curve after a query to inspect exact values.</p>
         {/if}
+      </section>
+
+      <section class="points-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Sample table</p>
+            <h3>Nearby points</h3>
+          </div>
+        </div>
+        {#if pointRows.length === 0}
+          <p class="muted">Run a query to show a keyboard-friendly table for the chart.</p>
+        {:else}
+          <div class="table-scroll">
+            <table aria-label="Nearby spread samples">
+              <thead>
+                <tr>
+                  <th scope="col">Time</th>
+                  <th scope="col">A -> B</th>
+                  <th scope="col">B -> A</th>
+                  <th scope="col">Best bp</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each pointRows as row}
+                  {@const rowOpportunity = opportunityForPoint(row.point)}
+                  <tr class:active={row.index === activeIndex}>
+                    <td>
+                      <button
+                        class="row-select"
+                        type="button"
+                        aria-pressed={row.index === activeIndex}
+                        on:click={() => selectPoint(row.index)}
+                      >
+                        {formatAxisTime(row.point.tsMs)}
+                      </button>
+                    </td>
+                    <td>{formatNumber(row.point.aToB)}</td>
+                    <td>{formatNumber(row.point.bToA)}</td>
+                    <td>{formatBp(rowOpportunity?.bp ?? null)}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      </section>
+
+      <section class="coverage-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Market coverage</p>
+            <h3>Venue data status</h3>
+          </div>
+        </div>
+        <div class="coverage-list">
+          {#each currentInstruments as instrument}
+            {@const instrumentFreshness = freshnessFor(instrument.latestRecvMs, nowMs)}
+            <div
+              class="coverage-row"
+              class:selected={instrument.catalogId === selectedA || instrument.catalogId === selectedB}
+            >
+              <div class="coverage-main">
+                <strong>{instrument.venueInstanceId}</strong>
+                <span>{instrument.rawSymbol} · {instrument.quoteAsset}</span>
+              </div>
+              <div class="coverage-meta">
+                <span class={`freshness ${instrumentFreshness.className}`}>{instrumentFreshness.label}</span>
+                <span>{formatInteger(instrument.tickCount)} ticks</span>
+              </div>
+              <div class="leg-actions" aria-label={`Set ${instrument.label} as chart leg`}>
+                <button
+                  type="button"
+                  class:active={instrument.catalogId === selectedA}
+                  aria-pressed={instrument.catalogId === selectedA}
+                  on:click={() => selectLegA(instrument.catalogId)}
+                >
+                  A
+                </button>
+                <button
+                  type="button"
+                  class:active={instrument.catalogId === selectedB}
+                  aria-pressed={instrument.catalogId === selectedB}
+                  on:click={() => selectLegB(instrument.catalogId)}
+                >
+                  B
+                </button>
+              </div>
+            </div>
+          {/each}
+        </div>
       </section>
 
       <section class="rates-panel">
@@ -668,21 +1167,26 @@
           <div class="rate-grid">
             <input
               aria-label="Quote from"
+              name={`quote-from-${index}`}
+              autocomplete="off"
               value={rate.from}
-              placeholder="USDC"
+              placeholder="e.g. USDC…"
               on:input={(event) => updateRate(index, 'from', inputValue(event))}
             />
             <input
               aria-label="Quote to"
+              name={`quote-to-${index}`}
+              autocomplete="off"
               value={rate.to}
-              placeholder="USD"
+              placeholder="e.g. USD…"
               on:input={(event) => updateRate(index, 'to', inputValue(event))}
             />
             <input
               aria-label="Quote rate"
+              name={`quote-rate-${index}`}
               value={rate.rate}
               inputmode="decimal"
-              placeholder="1"
+              placeholder="e.g. 1…"
               on:input={(event) => updateRate(index, 'rate', inputValue(event))}
             />
             <button type="button" aria-label="Remove quote rate" on:click={() => removeRate(index)}>
@@ -704,14 +1208,16 @@
   :global(body) {
     margin: 0;
     min-width: 320px;
-    color: #151917;
+    overflow-x: hidden;
+    color: #1e293b;
     background:
-      linear-gradient(90deg, rgba(28, 99, 72, 0.055) 1px, transparent 1px),
-      linear-gradient(180deg, rgba(28, 99, 72, 0.045) 1px, transparent 1px),
-      #f5f7f2;
+      linear-gradient(90deg, rgba(37, 99, 235, 0.055) 1px, transparent 1px),
+      linear-gradient(180deg, rgba(37, 99, 235, 0.045) 1px, transparent 1px),
+      #f8fafc;
     background-size: 28px 28px;
     font-family:
       Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-tap-highlight-color: rgba(37, 99, 235, 0.14);
   }
 
   :global(button),
@@ -726,31 +1232,50 @@
     padding: 28px 0 36px;
   }
 
+  .skip-link {
+    position: fixed;
+    top: 12px;
+    left: 12px;
+    z-index: 20;
+    border-radius: 6px;
+    padding: 10px 12px;
+    color: #ffffff;
+    background: #0f172a;
+    transform: translateY(-160%);
+    transition: transform 180ms ease;
+  }
+
+  .skip-link:focus-visible {
+    transform: translateY(0);
+    outline: 3px solid rgba(37, 99, 235, 0.35);
+  }
+
   .topbar,
   .control-strip,
-  .workspace,
+  .metric,
   .chart-panel,
-  .side-panel,
   .readout,
+  .points-panel,
+  .coverage-panel,
   .rates-panel,
   .notice {
-    border: 1px solid #cfd8d0;
-    background: rgba(252, 253, 248, 0.92);
-    box-shadow: 0 18px 50px rgba(35, 48, 40, 0.08);
+    border: 1px solid #dbe4ef;
+    background: rgba(255, 255, 255, 0.94);
+    box-shadow: 0 18px 46px rgba(15, 23, 42, 0.07);
   }
 
   .topbar {
     display: flex;
-    align-items: end;
+    align-items: center;
     justify-content: space-between;
     gap: 20px;
-    padding: 22px 24px;
+    padding: 18px 22px;
     border-radius: 8px 8px 0 0;
   }
 
   .eyebrow {
     margin: 0 0 7px;
-    color: #617168;
+    color: #64748b;
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
     font-size: 0.72rem;
     font-weight: 700;
@@ -767,8 +1292,8 @@
 
   h1 {
     max-width: 760px;
-    font-size: clamp(2rem, 4vw, 4.6rem);
-    line-height: 0.95;
+    font-size: clamp(1.55rem, 3vw, 2.55rem);
+    line-height: 1.05;
   }
 
   h2 {
@@ -779,12 +1304,18 @@
     font-size: 1.05rem;
   }
 
+  .topbar-actions {
+    display: grid;
+    justify-items: end;
+    gap: 10px;
+  }
+
   .connection {
     display: inline-flex;
     align-items: center;
     gap: 10px;
     min-width: max-content;
-    color: #3d4a43;
+    color: #475569;
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
     font-size: 0.86rem;
   }
@@ -793,12 +1324,12 @@
     width: 10px;
     height: 10px;
     border-radius: 999px;
-    background: #b9c4bc;
+    background: #cbd5e1;
   }
 
   .connection span.live {
-    background: #23815e;
-    box-shadow: 0 0 0 5px rgba(35, 129, 94, 0.14);
+    background: #2563eb;
+    box-shadow: 0 0 0 5px rgba(37, 99, 235, 0.14);
   }
 
   .notice {
@@ -808,14 +1339,14 @@
   }
 
   .notice.error {
-    border-color: #e1b8b8;
-    color: #8e2c32;
-    background: #fff7f5;
+    border-color: #fecaca;
+    color: #991b1b;
+    background: #fff7f7;
   }
 
   .control-strip {
     display: grid;
-    grid-template-columns: minmax(120px, 0.7fr) minmax(220px, 1.1fr) minmax(220px, 1.1fr) auto auto;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     align-items: end;
     gap: 14px;
     padding: 18px;
@@ -828,8 +1359,9 @@
     gap: 7px;
   }
 
-  label span {
-    color: #617168;
+  label span,
+  .auto-refresh > span {
+    color: #64748b;
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
     font-size: 0.72rem;
     font-weight: 700;
@@ -839,45 +1371,52 @@
   select,
   input {
     width: 100%;
-    min-height: 42px;
-    border: 1px solid #bfcbbf;
+    min-height: 44px;
+    border: 1px solid #cbd5e1;
     border-radius: 6px;
     padding: 0 11px;
-    color: #151917;
+    color: #0f172a;
     background: #ffffff;
-    outline: none;
+    outline: 2px solid transparent;
   }
 
-  select:focus,
-  input:focus,
-  button:focus-visible {
-    border-color: #23815e;
-    box-shadow: 0 0 0 3px rgba(35, 129, 94, 0.17);
+  select:focus-visible,
+  input:focus-visible,
+  button:focus-visible,
+  .spread-chart:focus-visible {
+    border-color: #2563eb;
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18);
   }
 
   .preset-group {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    min-height: 42px;
+    min-height: 44px;
     padding: 4px;
-    border: 1px solid #cbd5cb;
+    border: 1px solid #cbd5e1;
     border-radius: 999px;
-    background: #edf2ed;
+    background: #eff6ff;
   }
 
   button {
-    min-height: 36px;
-    border: 1px solid #c3cec4;
+    min-height: 44px;
+    border: 1px solid #cbd5e1;
     border-radius: 999px;
     padding: 0 13px;
-    color: #17221d;
+    color: #0f172a;
     background: #ffffff;
     cursor: pointer;
+    touch-action: manipulation;
+    transition:
+      border-color 180ms ease,
+      background 180ms ease,
+      color 180ms ease,
+      opacity 180ms ease;
   }
 
   button:hover:not(:disabled) {
-    border-color: #23815e;
+    border-color: #2563eb;
   }
 
   button:disabled {
@@ -886,7 +1425,7 @@
   }
 
   .preset-group button {
-    min-height: 32px;
+    min-height: 34px;
     border-color: transparent;
     background: transparent;
   }
@@ -894,31 +1433,134 @@
   .preset-group button.active,
   .query-button {
     color: #ffffff;
-    background: #151917;
+    background: #0f172a;
   }
 
-  .query-button {
-    min-height: 42px;
+  .query-button,
+  .swap-button,
+  .ghost-button {
+    min-height: 44px;
     border-radius: 6px;
     padding: 0 18px;
+  }
+
+  .ghost-button {
+    min-width: 142px;
   }
 
   .time-input {
     min-width: 190px;
   }
 
+  .auto-refresh {
+    display: grid;
+    grid-template-columns: auto minmax(82px, 1fr);
+    align-items: end;
+    gap: 7px 10px;
+  }
+
+  .auto-refresh > span {
+    grid-column: 1 / -1;
+  }
+
+  .checkbox-line {
+    display: inline-flex;
+    min-height: 44px;
+    align-items: center;
+    gap: 8px;
+    color: #334155;
+  }
+
+  .checkbox-line input {
+    width: 18px;
+    min-height: 18px;
+    accent-color: #2563eb;
+  }
+
+  .metric-strip {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 14px;
+  }
+
+  .metric {
+    display: grid;
+    min-height: 118px;
+    align-content: space-between;
+    gap: 8px;
+    border-left: 4px solid #cbd5e1;
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+
+  .metric.positive {
+    border-left-color: #0f766e;
+  }
+
+  .metric.negative {
+    border-left-color: #f97316;
+  }
+
+  .metric-label {
+    margin: 0;
+    color: #64748b;
+    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  .metric strong {
+    color: #0f172a;
+    font-size: 1.08rem;
+  }
+
+  .metric span {
+    color: #475569;
+    font-size: 0.88rem;
+  }
+
+  .freshness {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .freshness::before {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    content: "";
+  }
+
+  .freshness.fresh::before {
+    background: #0f766e;
+  }
+
+  .freshness.lagging::before {
+    background: #f97316;
+  }
+
+  .freshness.stale::before {
+    background: #dc2626;
+  }
+
   .workspace {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 360px;
+    grid-template-columns: minmax(0, 1fr) 390px;
     gap: 16px;
     margin-top: 16px;
     padding: 16px;
     border-radius: 8px;
-    background: rgba(235, 241, 235, 0.72);
+    border: 1px solid #dbe4ef;
+    background: rgba(239, 246, 255, 0.68);
   }
 
   .chart-panel,
   .readout,
+  .points-panel,
+  .coverage-panel,
   .rates-panel {
     border-radius: 8px;
   }
@@ -933,7 +1575,20 @@
     align-items: start;
     justify-content: space-between;
     gap: 20px;
-    padding: 20px 22px 12px;
+    padding: 20px 22px 8px;
+  }
+
+  .chart-subtitle,
+  .chart-help {
+    margin: 7px 0 0;
+    color: #64748b;
+    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 0.78rem;
+  }
+
+  .chart-help {
+    margin: 0;
+    padding: 0 22px 8px;
   }
 
   .legend {
@@ -941,15 +1596,29 @@
     flex-wrap: wrap;
     justify-content: end;
     gap: 12px;
-    color: #4e5e55;
+    color: #475569;
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
     font-size: 0.78rem;
   }
 
-  .legend span {
+  .legend span,
+  .series-toggle {
     display: inline-flex;
     align-items: center;
     gap: 7px;
+  }
+
+  .series-toggle {
+    min-height: 34px;
+    border-radius: 6px;
+    padding: 0 9px;
+    font-size: 0.78rem;
+  }
+
+  .series-toggle.inactive {
+    color: #64748b;
+    background: #f8fafc;
+    opacity: 0.64;
   }
 
   .legend i {
@@ -960,15 +1629,15 @@
   }
 
   .line-a {
-    background: #23815e;
+    background: #2563eb;
   }
 
   .line-b {
-    background: #b33572;
+    background: #f97316;
   }
 
   .zero {
-    background: #9aa59d;
+    background: #94a3b8;
   }
 
   .empty-state {
@@ -976,7 +1645,7 @@
     min-height: 430px;
     place-items: center;
     padding: 32px;
-    color: #617168;
+    color: #64748b;
     text-align: center;
   }
 
@@ -989,11 +1658,11 @@
   }
 
   .plot-bg {
-    fill: #f8faf6;
+    fill: #f8fafc;
   }
 
   .grid-line {
-    stroke: #dce5dd;
+    stroke: #dbe4ef;
     stroke-width: 1;
   }
 
@@ -1002,7 +1671,7 @@
   }
 
   .zero-line {
-    stroke: #6c7770;
+    stroke: #94a3b8;
     stroke-dasharray: 7 7;
     stroke-width: 1.5;
   }
@@ -1015,15 +1684,15 @@
   }
 
   .spread-line.a {
-    stroke: #23815e;
+    stroke: #2563eb;
   }
 
   .spread-line.b {
-    stroke: #b33572;
+    stroke: #f97316;
   }
 
   .cursor-line {
-    stroke: #171d19;
+    stroke: #0f172a;
     stroke-width: 1;
     stroke-dasharray: 4 5;
   }
@@ -1034,15 +1703,15 @@
   }
 
   .point.a {
-    fill: #23815e;
+    fill: #2563eb;
   }
 
   .point.b {
-    fill: #b33572;
+    fill: #f97316;
   }
 
   .axis-label {
-    fill: #617168;
+    fill: #64748b;
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
     font-size: 12px;
   }
@@ -1054,14 +1723,41 @@
   .side-panel {
     display: grid;
     gap: 16px;
-    border: 0;
-    background: transparent;
-    box-shadow: none;
   }
 
   .readout,
+  .points-panel,
+  .coverage-panel,
   .rates-panel {
     padding: 18px;
+  }
+
+  .route-card {
+    display: grid;
+    gap: 4px;
+    margin-top: 14px;
+    border: 1px solid #dbe4ef;
+    border-left: 4px solid #cbd5e1;
+    border-radius: 6px;
+    padding: 10px 12px;
+    background: #f8fafc;
+  }
+
+  .route-card.positive {
+    border-left-color: #0f766e;
+  }
+
+  .route-card.negative {
+    border-left-color: #f97316;
+  }
+
+  .route-card span,
+  .route-card small {
+    color: #64748b;
+  }
+
+  .route-card strong {
+    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
   }
 
   .readout dl {
@@ -1075,18 +1771,19 @@
     align-items: baseline;
     justify-content: space-between;
     gap: 12px;
-    border-bottom: 1px solid #e3e9e3;
+    border-bottom: 1px solid #e2e8f0;
     padding-bottom: 9px;
   }
 
   dt {
-    color: #617168;
+    color: #64748b;
     font-size: 0.86rem;
   }
 
   dd {
     margin: 0;
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    font-variant-numeric: tabular-nums;
     font-weight: 700;
   }
 
@@ -1094,14 +1791,26 @@
     display: grid;
     gap: 8px;
     margin-top: 16px;
-    color: #4d5b53;
+    color: #475569;
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
     font-size: 0.78rem;
   }
 
+  .point-actions {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 16px;
+  }
+
+  .point-actions button {
+    border-radius: 6px;
+    padding: 0 8px;
+  }
+
   .muted {
     margin: 10px 0 0;
-    color: #617168;
+    color: #64748b;
   }
 
   .panel-heading {
@@ -1113,7 +1822,111 @@
   }
 
   .panel-heading button {
+    min-height: 36px;
+  }
+
+  .table-scroll {
+    overflow-x: auto;
+  }
+
+  table {
+    width: 100%;
+    min-width: 520px;
+    border-collapse: collapse;
+    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 0.78rem;
+  }
+
+  th,
+  td {
+    border-bottom: 1px solid #e2e8f0;
+    padding: 8px 7px;
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  th:first-child,
+  td:first-child {
+    text-align: left;
+  }
+
+  th {
+    color: #64748b;
+    font-weight: 700;
+  }
+
+  tr.active {
+    background: #eff6ff;
+  }
+
+  .row-select {
     min-height: 32px;
+    border-radius: 6px;
+    padding: 0 8px;
+    font-family: inherit;
+  }
+
+  .coverage-list {
+    display: grid;
+    gap: 10px;
+  }
+
+  .coverage-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 10px;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 10px;
+    background: #ffffff;
+  }
+
+  .coverage-row.selected {
+    border-color: #93c5fd;
+    background: #eff6ff;
+  }
+
+  .coverage-main {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .coverage-main strong,
+  .coverage-main span {
+    overflow-wrap: anywhere;
+  }
+
+  .coverage-main span,
+  .coverage-meta {
+    color: #64748b;
+    font-size: 0.8rem;
+  }
+
+  .coverage-meta {
+    display: grid;
+    justify-items: end;
+    gap: 4px;
+    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  }
+
+  .leg-actions {
+    display: inline-flex;
+    gap: 4px;
+  }
+
+  .leg-actions button {
+    min-width: 34px;
+    min-height: 34px;
+    border-radius: 6px;
+    padding: 0;
+  }
+
+  .leg-actions button.active {
+    color: #ffffff;
+    border-color: #2563eb;
+    background: #2563eb;
   }
 
   .rate-grid {
@@ -1125,7 +1938,7 @@
 
   .rate-grid.heading {
     margin-top: 0;
-    color: #617168;
+    color: #64748b;
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
     font-size: 0.72rem;
     font-weight: 700;
@@ -1133,13 +1946,13 @@
   }
 
   .rate-grid input {
-    min-height: 36px;
+    min-height: 38px;
     padding: 0 8px;
   }
 
   .rate-grid button {
     min-width: 34px;
-    min-height: 36px;
+    min-height: 38px;
     border-radius: 6px;
     padding: 0;
   }
@@ -1151,7 +1964,7 @@
   }
 
   @media (max-width: 1180px) {
-    .control-strip {
+    .metric-strip {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
@@ -1182,6 +1995,10 @@
       display: grid;
     }
 
+    .topbar-actions {
+      justify-items: stretch;
+    }
+
     .connection,
     .legend {
       justify-content: start;
@@ -1192,12 +2009,36 @@
       justify-content: start;
     }
 
+    .metric-strip {
+      grid-template-columns: 1fr;
+    }
+
     .side-panel {
       grid-template-columns: 1fr;
     }
 
     .workspace {
       padding: 10px;
+    }
+
+    .coverage-row {
+      grid-template-columns: 1fr;
+      align-items: stretch;
+    }
+
+    .coverage-meta {
+      justify-items: start;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
     }
   }
 </style>
