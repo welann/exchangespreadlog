@@ -173,3 +173,39 @@ feed_symbol = "SOLUSD"
 product_type = "perp"
 base_asset = "SOL"
 status = "active"
+
+[[venues]]
+venue_instance_id = "ethereal"
+adapter = "ethereal"
+enabled = true
+url = "wss://ws2.ethereal.trade/v1/stream"
+channel = "L2Book"
+catalog_source = "exchange"
+metadata_url = "https://api.ethereal.trade/v1/product"
+default_quote_asset = "USD"
+default_settle_asset = "USD"
+default_margin_asset = "USD"
+
+[[venues.instruments]]
+instrument_id = "BTCUSD"
+raw_symbol = "BTC-USD"
+feed_symbol = "BTCUSD"
+product_type = "perp"
+base_asset = "BTC"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "ETHUSD"
+raw_symbol = "ETH-USD"
+feed_symbol = "ETHUSD"
+product_type = "perp"
+base_asset = "ETH"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "SOLUSD"
+raw_symbol = "SOL-USD"
+feed_symbol = "SOLUSD"
+product_type = "perp"
+base_asset = "SOL"
+status = "active"

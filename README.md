@@ -8,8 +8,9 @@ Currently supported venues:
 - `lighter`
 - `risex`
 - `01`
+- `ethereal`
 
-By default, Hyperliquid, Lighter, RiseX, and 01 are enabled in `config.example.toml`.
+By default, Hyperliquid, Lighter, RiseX, 01, and Ethereal are enabled in `config.example.toml`.
 
 ## Project Structure
 
@@ -25,6 +26,7 @@ By default, Hyperliquid, Lighter, RiseX, and 01 are enabled in `config.example.t
     |-- config/             # TOML config model and defaults
     |-- domain/             # BBO tick, market catalog, fixed decimal, quality models
     |-- exchange/           # Exchange adapters and message parsers
+    |   |-- ethereal/
     |   |-- hyperliquid/
     |   |-- lighter/
     |   |-- risex/

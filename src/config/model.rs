@@ -227,6 +227,19 @@ impl Default for Config {
                     default_margin_asset: "USD".to_string(),
                     instruments: default_zero_one_instruments(),
                 },
+                VenueConfig {
+                    venue_instance_id: "ethereal".to_string(),
+                    adapter: "ethereal".to_string(),
+                    enabled: true,
+                    url: Some("wss://ws2.ethereal.trade/v1/stream".to_string()),
+                    channel: Some("L2Book".to_string()),
+                    catalog_source: CatalogSource::Exchange,
+                    metadata_url: Some("https://api.ethereal.trade/v1/product".to_string()),
+                    default_quote_asset: "USD".to_string(),
+                    default_settle_asset: "USD".to_string(),
+                    default_margin_asset: "USD".to_string(),
+                    instruments: default_ethereal_instruments(),
+                },
             ],
         }
     }
@@ -451,6 +464,14 @@ fn default_zero_one_instruments() -> Vec<InstrumentConfig> {
     ]
 }
 
+fn default_ethereal_instruments() -> Vec<InstrumentConfig> {
+    vec![
+        instrument("BTCUSD", "BTC-USD", Some("BTCUSD"), "BTC"),
+        instrument("ETHUSD", "ETH-USD", Some("ETHUSD"), "ETH"),
+        instrument("SOLUSD", "SOL-USD", Some("SOLUSD"), "SOL"),
+    ]
+}
+
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
@@ -483,7 +504,7 @@ mod tests {
             "instrument_catalog"
         );
         assert_eq!(config.quote_rates.len(), 2);
-        assert_eq!(config.venues.len(), 4);
+        assert_eq!(config.venues.len(), 5);
         assert_eq!(config.venues[0].venue_instance_id, "hyperliquid");
         assert_eq!(config.venues[0].adapter, "hyperliquid");
         assert_eq!(config.venues[0].channel.as_deref(), Some("bbo"));
@@ -518,6 +539,18 @@ mod tests {
         );
         assert_eq!(config.venues[3].channel.as_deref(), Some("deltas"));
         assert_eq!(config.venues[3].catalog()[2].feed_key(), "SOLUSD");
+        assert_eq!(config.venues[4].venue_instance_id, "ethereal");
+        assert_eq!(
+            config.venues[4].url.as_deref(),
+            Some("wss://ws2.ethereal.trade/v1/stream")
+        );
+        assert_eq!(config.venues[4].channel.as_deref(), Some("L2Book"));
+        assert_eq!(config.venues[4].catalog_source, CatalogSource::Exchange);
+        assert_eq!(
+            config.venues[4].metadata_url.as_deref(),
+            Some("https://api.ethereal.trade/v1/product")
+        );
+        assert_eq!(config.venues[4].catalog()[0].feed_key(), "BTCUSD");
     }
 
     #[test]

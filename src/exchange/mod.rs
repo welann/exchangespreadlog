@@ -1,3 +1,4 @@
+pub mod ethereal;
 pub mod hyperliquid;
 pub mod lighter;
 pub mod risex;
@@ -10,7 +11,7 @@ use tokio::{
     sync::{mpsc::Sender, watch},
     time,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     domain::{BboTick, Fixed, InstrumentCatalog, InstrumentRef, MarketEvent},
@@ -55,12 +56,40 @@ where
             Ok(()) => return Ok(()),
             Err(err) => {
                 let sleep = backoff.next_delay();
-                warn!(venue = %venue, error = %err, ?sleep, "adapter restarting");
+                log_adapter_restart(venue, &err, sleep);
                 time::sleep(sleep).await;
             }
         }
     }
     Ok(())
+}
+
+fn log_adapter_restart(venue: &str, err: &anyhow::Error, sleep: std::time::Duration) {
+    if is_transient_websocket_disconnect(err) {
+        info!(
+            venue,
+            reason = %err,
+            ?sleep,
+            "adapter reconnecting after transient websocket disconnect"
+        );
+    } else {
+        warn!(venue, error = %err, ?sleep, "adapter restarting");
+    }
+}
+
+fn is_transient_websocket_disconnect(err: &anyhow::Error) -> bool {
+    let mut text = String::new();
+    for cause in err.chain() {
+        if !text.is_empty() {
+            text.push_str(": ");
+        }
+        text.push_str(&cause.to_string());
+    }
+    let text = text.to_ascii_lowercase();
+
+    text.contains("connection reset without closing handshake")
+        || text.contains("connection reset by peer")
+        || text.contains("broken pipe")
 }
 
 #[derive(Debug, Clone)]
@@ -176,7 +205,9 @@ fn catalog_keys(instrument: &InstrumentCatalog) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CatalogIndex, decimal_tick, merge_configured_catalog};
+    use super::{
+        CatalogIndex, decimal_tick, is_transient_websocket_disconnect, merge_configured_catalog,
+    };
     use crate::domain::{BboTick, BestLevel, InstrumentCatalog, ProductType, SourceKind};
 
     fn catalog(id: &str, raw: &str, feed: &str, price_tick: Option<&str>) -> InstrumentCatalog {
@@ -230,5 +261,15 @@ mod tests {
         assert_eq!(merged[0].price_tick, None);
         assert_eq!(merged[1].instrument_id, "2");
         assert_eq!(merged[1].price_tick, decimal_tick(2));
+    }
+
+    #[test]
+    fn classifies_connection_reset_as_transient_disconnect() {
+        let err =
+            anyhow::anyhow!("WebSocket protocol error: Connection reset without closing handshake");
+        assert!(is_transient_websocket_disconnect(&err));
+
+        let err = anyhow::anyhow!("Ethereal L2Book gap for BTCUSD");
+        assert!(!is_transient_websocket_disconnect(&err));
     }
 }
