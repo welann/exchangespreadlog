@@ -43,6 +43,8 @@
     tone: 'positive' | 'negative' | 'neutral';
   };
 
+  type WorkMode = 'compare' | 'qualify' | 'normalize';
+
   let markets: Market[] = [];
   let selectedBase = '';
   let selectedA = '';
@@ -59,6 +61,7 @@
   let autoRefresh = false;
   let refreshSeconds = 30;
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  let activeMode: WorkMode = 'compare';
 
   let marketError = '';
   let queryError = '';
@@ -88,6 +91,23 @@
   $: latestOpportunity = opportunityForPoint(latestPoint);
   $: activeOpportunity = opportunityForPoint(activePoint);
   $: pointRows = pointTableRows(points, activeIndex);
+  $: routeCode =
+    marketError
+      ? 'SETUP'
+      : latestOpportunity?.label === 'Sell A / Buy B'
+        ? 'A/B'
+        : latestOpportunity?.label === 'Sell B / Buy A'
+          ? 'B/A'
+          : 'WAIT';
+  $: spreadStatus = latestOpportunity
+    ? latestOpportunity.tone === 'positive'
+      ? 'Actionable on latest joined sample'
+      : latestOpportunity.tone === 'negative'
+        ? 'No positive cross on latest sample'
+        : 'Flat at latest joined sample'
+    : marketError
+      ? 'ClickHouse connection is not ready'
+      : 'Waiting for comparable samples';
 
   onMount(() => {
     hydrated = true;
@@ -677,41 +697,65 @@
 
 <a class="skip-link" href="#spread-main">Skip to main content</a>
 
-<main id="spread-main" class="page-shell">
-  <header class="topbar">
-    <div>
-      <p class="eyebrow">ClickHouse spread console</p>
-      <h1>Cross-venue spread curves</h1>
+<main id="spread-main" class="swiss-shell">
+  <header class="chrome">
+    <div class="chrome-left">
+      <span>Exchange Spread Console</span>
+      <span>{selectedBase || 'No market'}</span>
     </div>
-    <div class="topbar-actions">
-      <div class="connection" aria-live="polite">
-        <span class:live={points.length > 0} aria-hidden="true"></span>
-        {#if loadingMarkets}
-          Loading markets…
-        {:else if points.length > 0}
-          {formatInteger(points.length)} samples, {spread?.meta.bucketSeconds}s buckets
-        {:else if currentMarket}
-          {formatLatest(marketLatestMs)}
-        {:else}
-          Waiting for query
-        {/if}
-      </div>
-      <button
-        class="ghost-button"
-        type="button"
-        disabled={loadingMarkets || loadingSpread || markets.length === 0}
-        on:click={refreshData}
-      >
-        Refresh Latest
-      </button>
+    <div class="chrome-right" aria-live="polite">
+      {#if loadingMarkets}
+        Loading markets
+      {:else if points.length > 0}
+        {formatInteger(points.length)} joined samples / {spread?.meta.bucketSeconds}s bucket
+      {:else}
+        {formatLatest(marketLatestMs)}
+      {/if}
     </div>
   </header>
 
   {#if marketError}
     <section class="notice error" role="alert">{marketError}</section>
   {/if}
+  {#if queryError}
+    <section class="notice error" role="alert">{queryError}</section>
+  {/if}
 
-  <section class="control-strip" aria-label="Spread query controls">
+  <section class="decision-grid" aria-label="Latest trading decision">
+    <div class="hero-copy">
+      <p class="kicker">DECIDE / latest joined BBO</p>
+      <h1>
+        {routeCode}
+        <span>{formatBp(latestOpportunity?.bp ?? null)}</span>
+      </h1>
+      <p class="decision-line">{spreadStatus}</p>
+      <div class="route-line">
+        <strong>{latestOpportunity?.label ?? 'Choose a comparable pair'}</strong>
+        <span>{latestOpportunity?.route ?? 'Run a query to build the spread tape.'}</span>
+      </div>
+    </div>
+
+    <aside class="hero-ledger" aria-label="Current market ledger">
+      <div class="ledger-row">
+        <span>Spread</span>
+        <strong>{formatNumber(latestOpportunity?.value ?? null)} {spread?.meta.targetQuote ?? ''}</strong>
+      </div>
+      <div class="ledger-row">
+        <span>Freshness</span>
+        <strong>{marketFreshness.label}</strong>
+      </div>
+      <div class="ledger-row">
+        <span>Coverage</span>
+        <strong>{formatInteger(currentInstruments.length)} venues / {formatInteger(totalTicks)} ticks</strong>
+      </div>
+      <div class="ledger-row">
+        <span>Window</span>
+        <strong>{hydrated ? `${formatTime(selectedRange.fromMs)} -> ${formatTime(selectedRange.toMs)}` : '-'}</strong>
+      </div>
+    </aside>
+  </section>
+
+  <section class="query-board" aria-label="Spread query controls">
     <label>
       <span>Market</span>
       <select
@@ -722,7 +766,7 @@
       >
         {#each markets as market}
           <option value={market.baseAsset}>
-            {market.baseAsset} · {formatLatest(latestForInstruments(market.instruments))}
+            {market.baseAsset} / {formatLatest(latestForInstruments(market.instruments))}
           </option>
         {/each}
       </select>
@@ -742,6 +786,15 @@
       </select>
     </label>
 
+    <button
+      class="axis-button"
+      type="button"
+      disabled={!selectedA || !selectedB || selectedA === selectedB}
+      on:click={swapLegs}
+    >
+      Swap
+    </button>
+
     <label>
       <span>Leg B</span>
       <select
@@ -756,16 +809,7 @@
       </select>
     </label>
 
-    <button
-      class="swap-button"
-      type="button"
-      disabled={!selectedA || !selectedB || selectedA === selectedB}
-      on:click={swapLegs}
-    >
-      Swap Legs
-    </button>
-
-    <div class="preset-group" aria-label="Time range presets">
+    <div class="preset-grid" aria-label="Time range presets">
       {#each presets as preset}
         <button
           type="button"
@@ -778,23 +822,13 @@
     </div>
 
     {#if selectedPreset === 'custom'}
-      <label class="time-input">
+      <label>
         <span>From</span>
-        <input
-          type="datetime-local"
-          name="spread-from"
-          autocomplete="off"
-          bind:value={customStart}
-        />
+        <input type="datetime-local" name="spread-from" autocomplete="off" bind:value={customStart} />
       </label>
-      <label class="time-input">
+      <label>
         <span>To</span>
-        <input
-          type="datetime-local"
-          name="spread-to"
-          autocomplete="off"
-          bind:value={customEnd}
-        />
+        <input type="datetime-local" name="spread-to" autocomplete="off" bind:value={customEnd} />
       </label>
     {/if}
 
@@ -804,400 +838,333 @@
       disabled={loadingSpread || loadingMarkets || currentInstruments.length < 2}
       on:click={loadSpread}
     >
-      {loadingSpread ? 'Querying…' : 'Run Query'}
+      {loadingSpread ? 'Querying' : 'Run Query'}
     </button>
-
-    <div class="auto-refresh">
-      <span>Refresh</span>
-      <label class="checkbox-line">
-        <input
-          type="checkbox"
-          name="auto-refresh"
-          checked={autoRefresh}
-          on:change={(event) => toggleAutoRefresh((event.currentTarget as HTMLInputElement).checked)}
-        />
-        Auto
-      </label>
-      <select
-        name="refresh-interval"
-        aria-label="Auto refresh interval"
-        value={refreshSeconds}
-        disabled={!autoRefresh}
-        on:change={(event) => updateRefreshSeconds(selectValue(event))}
-      >
-        <option value="15">15s</option>
-        <option value="30">30s</option>
-        <option value="60">60s</option>
-      </select>
-    </div>
   </section>
 
-  {#if queryError}
-    <section class="notice error" role="alert">{queryError}</section>
-  {/if}
+  <nav class="mode-rail" aria-label="Analysis workspaces">
+    <button
+      type="button"
+      class:active={activeMode === 'compare'}
+      aria-pressed={activeMode === 'compare'}
+      on:click={() => (activeMode = 'compare')}
+    >
+      <span>COMPARE</span>
+      <small>curve / tape / point</small>
+    </button>
+    <button
+      type="button"
+      class:active={activeMode === 'qualify'}
+      aria-pressed={activeMode === 'qualify'}
+      on:click={() => (activeMode = 'qualify')}
+    >
+      <span>QUALIFY</span>
+      <small>venue health / legs</small>
+    </button>
+    <button
+      type="button"
+      class:active={activeMode === 'normalize'}
+      aria-pressed={activeMode === 'normalize'}
+      on:click={() => (activeMode = 'normalize')}
+    >
+      <span>NORMALIZE</span>
+      <small>quote rates / refresh</small>
+    </button>
+  </nav>
 
-  <section class="metric-strip" aria-label="Current spread summary">
-    <article class={`metric ${latestOpportunity?.tone ?? 'neutral'}`}>
-      <p class="metric-label">Latest Best Route</p>
-      <strong>{latestOpportunity?.label ?? 'No route'}</strong>
-      <span>
-        {formatNumber(latestOpportunity?.value ?? null)} {spread?.meta.targetQuote ?? ''}
-        · {formatBp(latestOpportunity?.bp ?? null)}
-      </span>
-    </article>
-
-    <article class="metric">
-      <p class="metric-label">Selected Point</p>
-      <strong>{activePoint ? formatTime(activePoint.tsMs) : 'No point selected'}</strong>
-      <span>{activeOpportunity?.route ?? 'Hover, click, or use arrow keys on the chart'}</span>
-    </article>
-
-    <article class="metric">
-      <p class="metric-label">Data Freshness</p>
-      <strong>
-        <span class={`freshness ${marketFreshness.className}`}>{marketFreshness.label}</span>
-      </strong>
-      <span>{marketFreshness.detail}</span>
-    </article>
-
-    <article class="metric">
-      <p class="metric-label">Market Coverage</p>
-      <strong>{formatInteger(currentInstruments.length)} venues</strong>
-      <span>{formatInteger(totalTicks)} ticks · {selectedPreset} window</span>
-    </article>
-  </section>
-
-  <section class="workspace">
-    <section class="chart-panel">
-      <div class="chart-title">
-        <div>
-          <p class="eyebrow">{selectedBase || 'No market selected'}</p>
-          <h2>{selectedLabel(selectedA)} vs {selectedLabel(selectedB)}</h2>
-          <p class="chart-subtitle">
-            {hydrated ? `${formatTime(selectedRange.fromMs)} - ${formatTime(selectedRange.toMs)}` : 'Loading range…'}
-            · target {spread?.meta.targetQuote ?? selectedInstrumentA?.quoteAsset ?? selectedInstrumentB?.quoteAsset ?? '-'}
-          </p>
-        </div>
-        <div class="legend">
-          <button
-            class="series-toggle"
-            class:inactive={!showAToB}
-            type="button"
-            aria-pressed={showAToB}
-            on:click={() => toggleSeries('aToB')}
-          >
-            <i class="line-a" aria-hidden="true"></i>A bid - B ask
-          </button>
-          <button
-            class="series-toggle"
-            class:inactive={!showBToA}
-            type="button"
-            aria-pressed={showBToA}
-            on:click={() => toggleSeries('bToA')}
-          >
-            <i class="line-b" aria-hidden="true"></i>B bid - A ask
-          </button>
-          <span><i class="zero" aria-hidden="true"></i>zero</span>
-        </div>
-      </div>
-      <p id="chart-help" class="chart-help">
-        Click the curve to pin a sample. Use Left, Right, Home, and End while focused on the chart.
-      </p>
-
-      {#if loadingSpread}
-        <div class="empty-state">Querying ClickHouse…</div>
-      {:else if points.length === 0}
-        <div class="empty-state">
-          No joined BBO samples for this pair and time range. Adjust the range or pair.
-        </div>
-      {:else}
-        <svg
-          class="spread-chart"
-          viewBox={`0 0 ${CHART.width} ${CHART.height}`}
-          role="button"
-          tabindex="0"
-          aria-label="Cross venue spread chart. Hover, click, or use arrow keys to inspect samples."
-          aria-describedby="chart-help"
-          on:pointermove={handlePointerMove}
-          on:pointerleave={() => (hoverIndex = -1)}
-          on:click={handleChartClick}
-          on:keydown={handleChartKeydown}
-        >
-          <rect
-            class="plot-bg"
-            x={CHART.left}
-            y={CHART.top}
-            width={plotWidth()}
-            height={plotHeight()}
-          />
-          {#each [0, 0.25, 0.5, 0.75, 1] as tick}
-            <line
-              class="grid-line"
-              x1={CHART.left}
-              x2={CHART.width - CHART.right}
-              y1={CHART.top + tick * plotHeight()}
-              y2={CHART.top + tick * plotHeight()}
-            />
-          {/each}
-          {#each [0, 0.25, 0.5, 0.75, 1] as tick}
-            <line
-              class="grid-line vertical"
-              x1={CHART.left + tick * plotWidth()}
-              x2={CHART.left + tick * plotWidth()}
-              y1={CHART.top}
-              y2={CHART.height - CHART.bottom}
-            />
-          {/each}
-          <line
-            class="zero-line"
-            x1={CHART.left}
-            x2={CHART.width - CHART.right}
-            y1={zeroY}
-            y2={zeroY}
-          />
-          {#if showAToB}
-            <path class="spread-line a" d={aPath} />
-          {/if}
-          {#if showBToA}
-            <path class="spread-line b" d={bPath} />
-          {/if}
-
-          <text class="axis-label y top" x="12" y={CHART.top + 4}>{formatNumber(yBounds.max)}</text>
-          <text class="axis-label y middle" x="12" y={zeroY + 4}>0</text>
-          <text class="axis-label y bottom" x="12" y={CHART.height - CHART.bottom}>
-            {formatNumber(yBounds.min)}
-          </text>
-          <text class="axis-label x" x={CHART.left} y={CHART.height - 12}>
-            {formatAxisTime(xBounds.min)}
-          </text>
-          <text class="axis-label x end" x={CHART.width - CHART.right} y={CHART.height - 12}>
-            {formatAxisTime(xBounds.max)}
-          </text>
-
-          {#if activePoint}
-            <line
-              class="cursor-line"
-              x1={xScale(activePoint.tsMs, xBounds)}
-              x2={xScale(activePoint.tsMs, xBounds)}
-              y1={CHART.top}
-              y2={CHART.height - CHART.bottom}
-            />
-            {#if showAToB && activePoint.aToB !== null}
-              <circle
-                class="point a"
-                cx={xScale(activePoint.tsMs, xBounds)}
-                cy={yScale(activePoint.aToB, yBounds)}
-                r="5"
-              />
-            {/if}
-            {#if showBToA && activePoint.bToA !== null}
-              <circle
-                class="point b"
-                cx={xScale(activePoint.tsMs, xBounds)}
-                cy={yScale(activePoint.bToA, yBounds)}
-                r="5"
-              />
-            {/if}
-          {/if}
-        </svg>
-      {/if}
-    </section>
-
-    <aside class="side-panel">
-      <section class="readout">
-        <p class="eyebrow">Point inspector</p>
-        {#if activePoint && spread}
-          <h3>{formatTime(activePoint.tsMs)}</h3>
-          {#if activeOpportunity}
-            <div class={`route-card ${activeOpportunity.tone}`}>
-              <span>{activeOpportunity.label}</span>
-              <strong>
-                {formatNumber(activeOpportunity.value)} {spread.meta.targetQuote}
-                · {formatBp(activeOpportunity.bp)}
-              </strong>
-              <small>{activeOpportunity.route}</small>
-            </div>
-          {/if}
-          <dl>
-            <div>
-              <dt>A bid - B ask</dt>
-              <dd>{formatNumber(activePoint.aToB)} {spread.meta.targetQuote}</dd>
-            </div>
-            <div>
-              <dt>A -> B bp</dt>
-              <dd>{formatBp(activePoint.aToBBp)}</dd>
-            </div>
-            <div>
-              <dt>B bid - A ask</dt>
-              <dd>{formatNumber(activePoint.bToA)} {spread.meta.targetQuote}</dd>
-            </div>
-            <div>
-              <dt>B -> A bp</dt>
-              <dd>{formatBp(activePoint.bToABp)}</dd>
-            </div>
-            <div>
-              <dt>Mid diff</dt>
-              <dd>{formatNumber(activePoint.midDiff)} {spread.meta.targetQuote}</dd>
-            </div>
-          </dl>
-          <div class="book-snapshot">
-            <span>A bid/ask {formatNumber(activePoint.aBid)} / {formatNumber(activePoint.aAsk)}</span>
-            <span>B bid/ask {formatNumber(activePoint.bBid)} / {formatNumber(activePoint.bAsk)}</span>
-          </div>
-          <div class="point-actions">
-            <button type="button" disabled={points.length === 0} on:click={() => jumpPoint(-1)}>
-              Previous
-            </button>
-            <button type="button" disabled={points.length === 0} on:click={() => jumpPoint(1)}>
-              Next
-            </button>
-            <button type="button" disabled={points.length === 0} on:click={jumpLatest}>Latest</button>
-          </div>
-        {:else}
-          <p class="muted">Hover or click the curve after a query to inspect exact values.</p>
-        {/if}
-      </section>
-
-      <section class="points-panel">
-        <div class="panel-heading">
+  {#if activeMode === 'compare'}
+    <section class="workbench compare-layout" aria-label="Spread comparison">
+      <section class="chart-panel">
+        <div class="section-head">
           <div>
-            <p class="eyebrow">Sample table</p>
-            <h3>Nearby points</h3>
+            <p class="kicker">COMPARE / {spread?.meta.targetQuote ?? selectedInstrumentA?.quoteAsset ?? '-'}</p>
+            <h2>{selectedLabel(selectedA)} against {selectedLabel(selectedB)}</h2>
           </div>
-        </div>
-        {#if pointRows.length === 0}
-          <p class="muted">Run a query to show a keyboard-friendly table for the chart.</p>
-        {:else}
-          <div class="table-scroll">
-            <table aria-label="Nearby spread samples">
-              <thead>
-                <tr>
-                  <th scope="col">Time</th>
-                  <th scope="col">A -> B</th>
-                  <th scope="col">B -> A</th>
-                  <th scope="col">Best bp</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each pointRows as row}
-                  {@const rowOpportunity = opportunityForPoint(row.point)}
-                  <tr class:active={row.index === activeIndex}>
-                    <td>
-                      <button
-                        class="row-select"
-                        type="button"
-                        aria-pressed={row.index === activeIndex}
-                        on:click={() => selectPoint(row.index)}
-                      >
-                        {formatAxisTime(row.point.tsMs)}
-                      </button>
-                    </td>
-                    <td>{formatNumber(row.point.aToB)}</td>
-                    <td>{formatNumber(row.point.bToA)}</td>
-                    <td>{formatBp(rowOpportunity?.bp ?? null)}</td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-          </div>
-        {/if}
-      </section>
-
-      <section class="coverage-panel">
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">Market coverage</p>
-            <h3>Venue data status</h3>
-          </div>
-        </div>
-        <div class="coverage-list">
-          {#each currentInstruments as instrument}
-            {@const instrumentFreshness = freshnessFor(instrument.latestRecvMs, nowMs)}
-            <div
-              class="coverage-row"
-              class:selected={instrument.catalogId === selectedA || instrument.catalogId === selectedB}
+          <div class="series-controls">
+            <button
+              type="button"
+              class:active={showAToB}
+              aria-pressed={showAToB}
+              on:click={() => toggleSeries('aToB')}
             >
-              <div class="coverage-main">
-                <strong>{instrument.venueInstanceId}</strong>
-                <span>{instrument.rawSymbol} · {instrument.quoteAsset}</span>
-              </div>
-              <div class="coverage-meta">
-                <span class={`freshness ${instrumentFreshness.className}`}>{instrumentFreshness.label}</span>
-                <span>{formatInteger(instrument.tickCount)} ticks</span>
-              </div>
-              <div class="leg-actions" aria-label={`Set ${instrument.label} as chart leg`}>
-                <button
-                  type="button"
-                  class:active={instrument.catalogId === selectedA}
-                  aria-pressed={instrument.catalogId === selectedA}
-                  on:click={() => selectLegA(instrument.catalogId)}
-                >
-                  A
-                </button>
-                <button
-                  type="button"
-                  class:active={instrument.catalogId === selectedB}
-                  aria-pressed={instrument.catalogId === selectedB}
-                  on:click={() => selectLegB(instrument.catalogId)}
-                >
-                  B
-                </button>
-              </div>
-            </div>
+              A bid - B ask
+            </button>
+            <button
+              type="button"
+              class:active={showBToA}
+              aria-pressed={showBToA}
+              on:click={() => toggleSeries('bToA')}
+            >
+              B bid - A ask
+            </button>
+          </div>
+        </div>
+        <p id="chart-help" class="chart-help">
+          Click to pin. Use Left / Right / Home / End when the chart has focus.
+        </p>
+
+        {#if loadingSpread}
+          <div class="empty-state">Querying ClickHouse.</div>
+        {:else if points.length === 0}
+          <div class="empty-state">No joined BBO samples. Change pair or time range.</div>
+        {:else}
+          <svg
+            class="spread-chart"
+            viewBox={`0 0 ${CHART.width} ${CHART.height}`}
+            role="button"
+            tabindex="0"
+            aria-label="Cross venue spread chart. Hover, click, or use arrow keys to inspect samples."
+            aria-describedby="chart-help"
+            on:pointermove={handlePointerMove}
+            on:pointerleave={() => (hoverIndex = -1)}
+            on:click={handleChartClick}
+            on:keydown={handleChartKeydown}
+          >
+            <rect class="plot-bg" x={CHART.left} y={CHART.top} width={plotWidth()} height={plotHeight()} />
+            {#each [0, 0.25, 0.5, 0.75, 1] as tick}
+              <line
+                class="grid-line"
+                x1={CHART.left}
+                x2={CHART.width - CHART.right}
+                y1={CHART.top + tick * plotHeight()}
+                y2={CHART.top + tick * plotHeight()}
+              />
+            {/each}
+            {#each [0, 0.25, 0.5, 0.75, 1] as tick}
+              <line
+                class="grid-line vertical"
+                x1={CHART.left + tick * plotWidth()}
+                x2={CHART.left + tick * plotWidth()}
+                y1={CHART.top}
+                y2={CHART.height - CHART.bottom}
+              />
+            {/each}
+            <line class="zero-line" x1={CHART.left} x2={CHART.width - CHART.right} y1={zeroY} y2={zeroY} />
+            {#if showAToB}
+              <path class="spread-line a" d={aPath} />
+            {/if}
+            {#if showBToA}
+              <path class="spread-line b" d={bPath} />
+            {/if}
+            <text class="axis-label y top" x="12" y={CHART.top + 4}>{formatNumber(yBounds.max)}</text>
+            <text class="axis-label y middle" x="12" y={zeroY + 4}>0</text>
+            <text class="axis-label y bottom" x="12" y={CHART.height - CHART.bottom}>
+              {formatNumber(yBounds.min)}
+            </text>
+            <text class="axis-label x" x={CHART.left} y={CHART.height - 12}>
+              {formatAxisTime(xBounds.min)}
+            </text>
+            <text class="axis-label x end" x={CHART.width - CHART.right} y={CHART.height - 12}>
+              {formatAxisTime(xBounds.max)}
+            </text>
+            {#if activePoint}
+              <line
+                class="cursor-line"
+                x1={xScale(activePoint.tsMs, xBounds)}
+                x2={xScale(activePoint.tsMs, xBounds)}
+                y1={CHART.top}
+                y2={CHART.height - CHART.bottom}
+              />
+              {#if showAToB && activePoint.aToB !== null}
+                <rect
+                  class="point a"
+                  x={xScale(activePoint.tsMs, xBounds) - 5}
+                  y={yScale(activePoint.aToB, yBounds) - 5}
+                  width="10"
+                  height="10"
+                />
+              {/if}
+              {#if showBToA && activePoint.bToA !== null}
+                <rect
+                  class="point b"
+                  x={xScale(activePoint.tsMs, xBounds) - 5}
+                  y={yScale(activePoint.bToA, yBounds) - 5}
+                  width="10"
+                  height="10"
+                />
+              {/if}
+            {/if}
+          </svg>
+        {/if}
+      </section>
+
+      <aside class="point-panel">
+        <div class="section-head compact">
+          <div>
+            <p class="kicker">POINT / pinned sample</p>
+            <h2>{activePoint ? formatTime(activePoint.tsMs) : '-'}</h2>
+          </div>
+        </div>
+        {#if activePoint && spread}
+          <dl class="point-ledger">
+            <div><dt>Best route</dt><dd>{activeOpportunity?.label ?? '-'}</dd></div>
+            <div><dt>Best bp</dt><dd>{formatBp(activeOpportunity?.bp ?? null)}</dd></div>
+            <div><dt>A -> B</dt><dd>{formatNumber(activePoint.aToB)} {spread.meta.targetQuote}</dd></div>
+            <div><dt>B -> A</dt><dd>{formatNumber(activePoint.bToA)} {spread.meta.targetQuote}</dd></div>
+            <div><dt>Mid diff</dt><dd>{formatNumber(activePoint.midDiff)} {spread.meta.targetQuote}</dd></div>
+            <div><dt>A book</dt><dd>{formatNumber(activePoint.aBid)} / {formatNumber(activePoint.aAsk)}</dd></div>
+            <div><dt>B book</dt><dd>{formatNumber(activePoint.bBid)} / {formatNumber(activePoint.bAsk)}</dd></div>
+          </dl>
+          <div class="point-actions">
+            <button type="button" on:click={() => jumpPoint(-1)}>Previous</button>
+            <button type="button" on:click={() => jumpPoint(1)}>Next</button>
+            <button type="button" on:click={jumpLatest}>Latest</button>
+          </div>
+        {:else}
+          <p class="empty-copy">Pin a sample from the curve or tape.</p>
+        {/if}
+      </aside>
+
+      <section class="spread-tape" aria-label="Nearby spread samples">
+        <div class="tape-head">
+          <span>SPREAD TAPE</span>
+          <span>{pointRows.length > 0 ? `${pointRows[0].index + 1}-${pointRows[pointRows.length - 1].index + 1}` : '0'} / {points.length}</span>
+        </div>
+        <div class="tape-grid">
+          {#each pointRows as row}
+            {@const rowOpportunity = opportunityForPoint(row.point)}
+            <button
+              type="button"
+              class:active={row.index === activeIndex}
+              aria-pressed={row.index === activeIndex}
+              on:click={() => selectPoint(row.index)}
+            >
+              <span>{formatAxisTime(row.point.tsMs)}</span>
+              <strong>{formatBp(rowOpportunity?.bp ?? null)}</strong>
+              <small>{rowOpportunity?.label ?? '-'}</small>
+            </button>
           {/each}
         </div>
       </section>
-
-      <section class="rates-panel">
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">Quote conversion</p>
-            <h3>Rates used by this page</h3>
-          </div>
-          <button type="button" on:click={resetRates}>Reset</button>
+    </section>
+  {:else if activeMode === 'qualify'}
+    <section class="workbench qualify-layout" aria-label="Venue data quality">
+      <div class="section-head">
+        <div>
+          <p class="kicker">QUALIFY / data source</p>
+          <h2>Only compare legs with recent ticks and the same base asset.</h2>
         </div>
-
-        <div class="rate-grid heading" aria-hidden="true">
-          <span>From</span>
-          <span>To</span>
-          <span>Rate</span>
-          <span></span>
-        </div>
-        {#each rates as rate, index (index)}
-          <div class="rate-grid">
-            <input
-              aria-label="Quote from"
-              name={`quote-from-${index}`}
-              autocomplete="off"
-              value={rate.from}
-              placeholder="e.g. USDC…"
-              on:input={(event) => updateRate(index, 'from', inputValue(event))}
-            />
-            <input
-              aria-label="Quote to"
-              name={`quote-to-${index}`}
-              autocomplete="off"
-              value={rate.to}
-              placeholder="e.g. USD…"
-              on:input={(event) => updateRate(index, 'to', inputValue(event))}
-            />
-            <input
-              aria-label="Quote rate"
-              name={`quote-rate-${index}`}
-              value={rate.rate}
-              inputmode="decimal"
-              placeholder="e.g. 1…"
-              on:input={(event) => updateRate(index, 'rate', inputValue(event))}
-            />
-            <button type="button" aria-label="Remove quote rate" on:click={() => removeRate(index)}>
-              x
-            </button>
-          </div>
+        <button type="button" on:click={refreshData} disabled={loadingMarkets || loadingSpread}>Refresh catalog</button>
+      </div>
+      <div class="venue-grid">
+        {#each currentInstruments as instrument}
+          {@const instrumentFreshness = freshnessFor(instrument.latestRecvMs, nowMs)}
+          <article class:selected={instrument.catalogId === selectedA || instrument.catalogId === selectedB}>
+            <div class="venue-top">
+              <span>{instrument.venueInstanceId}</span>
+              <strong>{instrument.rawSymbol}</strong>
+            </div>
+            <dl>
+              <div><dt>Quote</dt><dd>{instrument.quoteAsset}</dd></div>
+              <div><dt>Freshness</dt><dd>{instrumentFreshness.label}</dd></div>
+              <div><dt>Ticks</dt><dd>{formatInteger(instrument.tickCount)}</dd></div>
+              <div><dt>Status</dt><dd>{instrument.status}</dd></div>
+            </dl>
+            <div class="leg-actions" aria-label={`Set ${instrument.label} as chart leg`}>
+              <button
+                type="button"
+                class:active={instrument.catalogId === selectedA}
+                aria-pressed={instrument.catalogId === selectedA}
+                on:click={() => selectLegA(instrument.catalogId)}
+              >
+                Set A
+              </button>
+              <button
+                type="button"
+                class:active={instrument.catalogId === selectedB}
+                aria-pressed={instrument.catalogId === selectedB}
+                on:click={() => selectLegB(instrument.catalogId)}
+              >
+                Set B
+              </button>
+            </div>
+          </article>
         {/each}
-        <button class="add-rate" type="button" on:click={addRate}>Add rate</button>
-      </section>
-    </aside>
-  </section>
+      </div>
+    </section>
+  {:else}
+    <section class="workbench normalize-layout" aria-label="Quote conversion and refresh settings">
+      <div class="section-head">
+        <div>
+          <p class="kicker">NORMALIZE / quote rates</p>
+          <h2>Rates apply before spread and bp are calculated.</h2>
+        </div>
+        <button type="button" on:click={resetRates}>Reset rates</button>
+      </div>
+      <div class="normal-grid">
+        <section class="rate-editor">
+          <div class="rate-grid heading" aria-hidden="true">
+            <span>From</span>
+            <span>To</span>
+            <span>Rate</span>
+            <span></span>
+          </div>
+          {#each rates as rate, index (index)}
+            <div class="rate-grid">
+              <input
+                aria-label="Quote from"
+                name={`quote-from-${index}`}
+                autocomplete="off"
+                value={rate.from}
+                placeholder="USDC"
+                on:input={(event) => updateRate(index, 'from', inputValue(event))}
+              />
+              <input
+                aria-label="Quote to"
+                name={`quote-to-${index}`}
+                autocomplete="off"
+                value={rate.to}
+                placeholder="USD"
+                on:input={(event) => updateRate(index, 'to', inputValue(event))}
+              />
+              <input
+                aria-label="Quote rate"
+                name={`quote-rate-${index}`}
+                value={rate.rate}
+                inputmode="decimal"
+                placeholder="1"
+                on:input={(event) => updateRate(index, 'rate', inputValue(event))}
+              />
+              <button type="button" aria-label="Remove quote rate" on:click={() => removeRate(index)}>
+                x
+              </button>
+            </div>
+          {/each}
+          <button class="add-rate" type="button" on:click={addRate}>Add rate</button>
+        </section>
+
+        <aside class="refresh-card">
+          <p class="kicker">Refresh policy</p>
+          <label class="checkbox-line">
+            <input
+              type="checkbox"
+              name="auto-refresh"
+              checked={autoRefresh}
+              on:change={(event) => toggleAutoRefresh((event.currentTarget as HTMLInputElement).checked)}
+            />
+            Auto refresh catalog and spread
+          </label>
+          <label>
+            <span>Interval</span>
+            <select
+              name="refresh-interval"
+              aria-label="Auto refresh interval"
+              value={refreshSeconds}
+              disabled={!autoRefresh}
+              on:change={(event) => updateRefreshSeconds(selectValue(event))}
+            >
+              <option value="15">15s</option>
+              <option value="30">30s</option>
+              <option value="60">60s</option>
+            </select>
+          </label>
+          <button type="button" on:click={refreshData} disabled={loadingMarkets || loadingSpread}>
+            Refresh now
+          </button>
+        </aside>
+      </div>
+    </section>
+  {/if}
 </main>
 
 <style>
@@ -1206,18 +1173,22 @@
   }
 
   :global(body) {
+    --paper: #fafaf8;
+    --ink: #0a0a0a;
+    --grey-1: #f0f0ee;
+    --grey-2: #d4d4d2;
+    --grey-3: #737373;
+    --accent: #002fa7;
+    --accent-on: #ffffff;
+    --hairline: 1px solid var(--grey-2);
     margin: 0;
     min-width: 320px;
     overflow-x: hidden;
-    color: #1e293b;
-    background:
-      linear-gradient(90deg, rgba(37, 99, 235, 0.055) 1px, transparent 1px),
-      linear-gradient(180deg, rgba(37, 99, 235, 0.045) 1px, transparent 1px),
-      #f8fafc;
-    background-size: 28px 28px;
+    color: var(--ink);
+    background: var(--paper);
     font-family:
-      Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    -webkit-tap-highlight-color: rgba(37, 99, 235, 0.14);
+      Inter, "Helvetica Neue", Helvetica, "Noto Sans SC", "Microsoft YaHei UI", Arial, sans-serif;
+    -webkit-tap-highlight-color: rgba(0, 47, 167, 0.14);
   }
 
   :global(button),
@@ -1226,426 +1197,380 @@
     font: inherit;
   }
 
-  .page-shell {
-    width: min(1480px, calc(100vw - 32px));
-    margin: 0 auto;
-    padding: 28px 0 36px;
-  }
-
   .skip-link {
     position: fixed;
     top: 12px;
     left: 12px;
     z-index: 20;
-    border-radius: 6px;
     padding: 10px 12px;
-    color: #ffffff;
-    background: #0f172a;
+    color: var(--accent-on);
+    background: var(--accent);
     transform: translateY(-160%);
-    transition: transform 180ms ease;
+    transition: transform 160ms ease;
   }
 
   .skip-link:focus-visible {
     transform: translateY(0);
-    outline: 3px solid rgba(37, 99, 235, 0.35);
+    outline: 2px solid var(--ink);
   }
 
-  .topbar,
-  .control-strip,
-  .metric,
-  .chart-panel,
-  .readout,
-  .points-panel,
-  .coverage-panel,
-  .rates-panel,
-  .notice {
-    border: 1px solid #dbe4ef;
-    background: rgba(255, 255, 255, 0.94);
-    box-shadow: 0 18px 46px rgba(15, 23, 42, 0.07);
+  .swiss-shell {
+    width: min(1680px, calc(100vw - 40px));
+    margin: 0 auto;
+    padding: 28px 0 56px;
   }
 
-  .topbar {
+  .chrome {
     display: flex;
-    align-items: center;
     justify-content: space-between;
-    gap: 20px;
-    padding: 18px 22px;
-    border-radius: 8px 8px 0 0;
+    gap: 24px;
+    border-bottom: var(--hairline);
+    padding: 0 0 18px;
+    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
   }
 
-  .eyebrow {
-    margin: 0 0 7px;
-    color: #64748b;
+  .chrome-left,
+  .chrome-right {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+  }
+
+  .chrome-right {
+    justify-content: flex-end;
+    color: var(--grey-3);
+  }
+
+  .notice {
+    margin-top: 16px;
+    border: var(--hairline);
+    border-left: 8px solid var(--ink);
+    padding: 14px 16px;
+    background: var(--paper);
+    font-weight: 500;
+  }
+
+  .notice.error {
+    border-left-color: var(--accent);
+  }
+
+  .decision-grid {
+    display: grid;
+    grid-template-columns: repeat(16, minmax(0, 1fr));
+    gap: 16px;
+    border-bottom: var(--hairline);
+    padding: 24px 0 22px;
+  }
+
+  .hero-copy {
+    grid-column: 1 / 11;
+    display: grid;
+    align-content: space-between;
+    min-height: 310px;
+  }
+
+  .kicker,
+  label span,
+  .tape-head,
+  .rate-grid.heading {
+    color: var(--grey-3);
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-    font-size: 0.72rem;
-    font-weight: 700;
-    letter-spacing: 0.08em;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
     text-transform: uppercase;
+  }
+
+  .kicker {
+    margin: 0;
   }
 
   h1,
   h2,
-  h3 {
+  p {
     margin: 0;
-    letter-spacing: 0;
   }
 
-  h1 {
-    max-width: 760px;
-    font-size: clamp(1.55rem, 3vw, 2.55rem);
+  .hero-copy h1 {
+    display: grid;
+    gap: 0.02em;
+    font-size: min(10vw, 16vh);
+    font-weight: 200;
+    letter-spacing: -0.07em;
+    line-height: 0.83;
+  }
+
+  .hero-copy h1 span {
+    color: var(--accent);
+    font-size: min(5.8vw, 9.4vh);
+    font-weight: 200;
+    letter-spacing: -0.05em;
+  }
+
+  .decision-line {
+    max-width: 36ch;
+    font-size: clamp(1.35rem, 2.2vw, 2.6rem);
+    font-weight: 300;
     line-height: 1.05;
+    letter-spacing: -0.035em;
   }
 
-  h2 {
-    font-size: clamp(1.2rem, 2vw, 2rem);
-  }
-
-  h3 {
-    font-size: 1.05rem;
-  }
-
-  .topbar-actions {
+  .route-line {
     display: grid;
-    justify-items: end;
-    gap: 10px;
+    gap: 8px;
+    border-top: 4px solid var(--accent);
+    padding-top: 16px;
   }
 
-  .connection {
-    display: inline-flex;
-    align-items: center;
-    gap: 10px;
-    min-width: max-content;
-    color: #475569;
-    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-    font-size: 0.86rem;
+  .route-line strong {
+    font-size: clamp(1.2rem, 1.8vw, 2rem);
+    font-weight: 400;
   }
 
-  .connection span {
-    width: 10px;
-    height: 10px;
-    border-radius: 999px;
-    background: #cbd5e1;
+  .route-line span {
+    color: var(--grey-3);
+    font-size: 1rem;
+    line-height: 1.5;
   }
 
-  .connection span.live {
-    background: #2563eb;
-    box-shadow: 0 0 0 5px rgba(37, 99, 235, 0.14);
+  .hero-ledger {
+    grid-column: 11 / 17;
+    align-self: stretch;
+    border-left: var(--hairline);
+    padding-left: 16px;
   }
 
-  .notice {
-    margin-top: 12px;
-    padding: 12px 14px;
-    border-radius: 8px;
-  }
-
-  .notice.error {
-    border-color: #fecaca;
-    color: #991b1b;
-    background: #fff7f7;
-  }
-
-  .control-strip {
+  .ledger-row {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    align-items: end;
+    grid-template-columns: minmax(96px, 0.65fr) minmax(0, 1fr);
     gap: 14px;
-    padding: 18px;
-    border-top: 0;
-    border-radius: 0 0 8px 8px;
+    border-bottom: var(--hairline);
+    padding: 18px 0;
+  }
+
+  .ledger-row span,
+  dt {
+    color: var(--grey-3);
+    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .ledger-row strong,
+  dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+  }
+
+  .query-board {
+    display: grid;
+    grid-template-columns: repeat(16, minmax(0, 1fr));
+    align-items: end;
+    gap: 12px;
+    border-bottom: var(--hairline);
+    padding: 18px 0;
   }
 
   label {
     display: grid;
+    grid-column: span 2;
     gap: 7px;
   }
 
-  label span,
-  .auto-refresh > span {
-    color: #64748b;
-    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-    font-size: 0.72rem;
-    font-weight: 700;
-    text-transform: uppercase;
+  .query-board label:nth-of-type(1) {
+    grid-column: span 3;
+  }
+
+  .query-board label:nth-of-type(2),
+  .query-board label:nth-of-type(3) {
+    grid-column: span 3;
+  }
+
+  .axis-button {
+    grid-column: span 1;
+  }
+
+  .preset-grid {
+    grid-column: span 3;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0;
+    border: var(--hairline);
+  }
+
+  .query-button {
+    grid-column: span 3;
+  }
+
+  select,
+  input,
+  button {
+    min-height: 44px;
+    border: var(--hairline);
+    border-radius: 0;
+    color: var(--ink);
+    background: var(--paper);
+    outline: 2px solid transparent;
+    touch-action: manipulation;
   }
 
   select,
   input {
     width: 100%;
-    min-height: 44px;
-    border: 1px solid #cbd5e1;
-    border-radius: 6px;
-    padding: 0 11px;
-    color: #0f172a;
-    background: #ffffff;
-    outline: 2px solid transparent;
+    padding: 0 10px;
+  }
+
+  button {
+    padding: 0 12px;
+    cursor: pointer;
+    font-weight: 600;
+    transition:
+      background 150ms ease,
+      color 150ms ease,
+      border-color 150ms ease;
+  }
+
+  button:hover:not(:disabled),
+  button.active {
+    color: var(--accent-on);
+    border-color: var(--accent);
+    background: var(--accent);
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
   }
 
   select:focus-visible,
   input:focus-visible,
   button:focus-visible,
   .spread-chart:focus-visible {
-    border-color: #2563eb;
-    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18);
+    border-color: var(--accent);
+    outline-color: var(--accent);
   }
 
-  .preset-group {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    min-height: 44px;
-    padding: 4px;
-    border: 1px solid #cbd5e1;
-    border-radius: 999px;
-    background: #eff6ff;
+  .preset-grid button {
+    min-height: 42px;
+    border: 0;
+    border-right: var(--hairline);
   }
 
-  button {
-    min-height: 44px;
-    border: 1px solid #cbd5e1;
-    border-radius: 999px;
-    padding: 0 13px;
-    color: #0f172a;
-    background: #ffffff;
-    cursor: pointer;
-    touch-action: manipulation;
-    transition:
-      border-color 180ms ease,
-      background 180ms ease,
-      color 180ms ease,
-      opacity 180ms ease;
+  .preset-grid button:last-child {
+    border-right: 0;
   }
 
-  button:hover:not(:disabled) {
-    border-color: #2563eb;
-  }
-
-  button:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-  }
-
-  .preset-group button {
-    min-height: 34px;
-    border-color: transparent;
-    background: transparent;
-  }
-
-  .preset-group button.active,
-  .query-button {
-    color: #ffffff;
-    background: #0f172a;
-  }
-
-  .query-button,
-  .swap-button,
-  .ghost-button {
-    min-height: 44px;
-    border-radius: 6px;
-    padding: 0 18px;
-  }
-
-  .ghost-button {
-    min-width: 142px;
-  }
-
-  .time-input {
-    min-width: 190px;
-  }
-
-  .auto-refresh {
+  .mode-rail {
     display: grid;
-    grid-template-columns: auto minmax(82px, 1fr);
-    align-items: end;
-    gap: 7px 10px;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-bottom: var(--hairline);
   }
 
-  .auto-refresh > span {
-    grid-column: 1 / -1;
-  }
-
-  .checkbox-line {
-    display: inline-flex;
-    min-height: 44px;
-    align-items: center;
-    gap: 8px;
-    color: #334155;
-  }
-
-  .checkbox-line input {
-    width: 18px;
-    min-height: 18px;
-    accent-color: #2563eb;
-  }
-
-  .metric-strip {
+  .mode-rail button {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 12px;
-    margin-top: 14px;
-  }
-
-  .metric {
-    display: grid;
-    min-height: 118px;
-    align-content: space-between;
-    gap: 8px;
-    border-left: 4px solid #cbd5e1;
-    border-radius: 8px;
+    justify-items: start;
+    min-height: 84px;
+    border: 0;
+    border-right: var(--hairline);
     padding: 14px 16px;
+    text-align: left;
   }
 
-  .metric.positive {
-    border-left-color: #0f766e;
+  .mode-rail button:last-child {
+    border-right: 0;
   }
 
-  .metric.negative {
-    border-left-color: #f97316;
-  }
-
-  .metric-label {
-    margin: 0;
-    color: #64748b;
+  .mode-rail span {
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-    font-size: 0.72rem;
-    font-weight: 700;
-    text-transform: uppercase;
+    letter-spacing: 0.1em;
   }
 
-  .metric strong {
-    color: #0f172a;
-    font-size: 1.08rem;
+  .mode-rail small {
+    color: var(--grey-3);
+    font-weight: 500;
   }
 
-  .metric span {
-    color: #475569;
-    font-size: 0.88rem;
+  .workbench {
+    border-bottom: var(--hairline);
+    padding: 18px 0 0;
   }
 
-  .freshness {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .freshness::before {
-    width: 8px;
-    height: 8px;
-    border-radius: 999px;
-    content: "";
-  }
-
-  .freshness.fresh::before {
-    background: #0f766e;
-  }
-
-  .freshness.lagging::before {
-    background: #f97316;
-  }
-
-  .freshness.stale::before {
-    background: #dc2626;
-  }
-
-  .workspace {
+  .compare-layout {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 390px;
+    grid-template-columns: repeat(16, minmax(0, 1fr));
     gap: 16px;
-    margin-top: 16px;
-    padding: 16px;
-    border-radius: 8px;
-    border: 1px solid #dbe4ef;
-    background: rgba(239, 246, 255, 0.68);
-  }
-
-  .chart-panel,
-  .readout,
-  .points-panel,
-  .coverage-panel,
-  .rates-panel {
-    border-radius: 8px;
   }
 
   .chart-panel {
+    grid-column: 1 / 12;
     min-width: 0;
-    overflow: hidden;
+    border-right: var(--hairline);
+    padding-right: 16px;
   }
 
-  .chart-title {
+  .point-panel {
+    grid-column: 12 / 17;
+    min-width: 0;
+  }
+
+  .section-head {
     display: flex;
     align-items: start;
     justify-content: space-between;
-    gap: 20px;
-    padding: 20px 22px 8px;
+    gap: 18px;
+    margin-bottom: 18px;
   }
 
-  .chart-subtitle,
-  .chart-help {
-    margin: 7px 0 0;
-    color: #64748b;
-    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-    font-size: 0.78rem;
+  .section-head h2 {
+    max-width: 26ch;
+    font-size: clamp(1.8rem, 3.3vw, 4.8rem);
+    font-weight: 200;
+    line-height: 0.95;
+    letter-spacing: -0.055em;
   }
 
-  .chart-help {
-    margin: 0;
-    padding: 0 22px 8px;
+  .section-head.compact h2 {
+    font-size: clamp(1.2rem, 1.8vw, 2.2rem);
+    letter-spacing: -0.035em;
   }
 
-  .legend {
+  .series-controls,
+  .point-actions,
+  .leg-actions {
     display: flex;
     flex-wrap: wrap;
-    justify-content: end;
-    gap: 12px;
-    color: #475569;
+    gap: 8px;
+  }
+
+  .series-controls button,
+  .point-actions button,
+  .leg-actions button {
+    min-height: 38px;
+  }
+
+  .chart-help,
+  .empty-copy {
+    margin: 0 0 10px;
+    color: var(--grey-3);
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
     font-size: 0.78rem;
-  }
-
-  .legend span,
-  .series-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-  }
-
-  .series-toggle {
-    min-height: 34px;
-    border-radius: 6px;
-    padding: 0 9px;
-    font-size: 0.78rem;
-  }
-
-  .series-toggle.inactive {
-    color: #64748b;
-    background: #f8fafc;
-    opacity: 0.64;
-  }
-
-  .legend i {
-    width: 24px;
-    height: 3px;
-    border-radius: 999px;
-    display: inline-block;
-  }
-
-  .line-a {
-    background: #2563eb;
-  }
-
-  .line-b {
-    background: #f97316;
-  }
-
-  .zero {
-    background: #94a3b8;
   }
 
   .empty-state {
     display: grid;
     min-height: 430px;
     place-items: center;
-    padding: 32px;
-    color: #64748b;
+    border: var(--hairline);
+    color: var(--grey-3);
     text-align: center;
   }
 
@@ -1658,60 +1583,60 @@
   }
 
   .plot-bg {
-    fill: #f8fafc;
+    fill: var(--paper);
   }
 
   .grid-line {
-    stroke: #dbe4ef;
+    stroke: var(--grey-2);
     stroke-width: 1;
   }
 
   .grid-line.vertical {
-    stroke-dasharray: 2 8;
+    stroke-dasharray: 1 10;
   }
 
   .zero-line {
-    stroke: #94a3b8;
-    stroke-dasharray: 7 7;
-    stroke-width: 1.5;
+    stroke: var(--grey-3);
+    stroke-dasharray: 8 8;
+    stroke-width: 1.2;
   }
 
   .spread-line {
     fill: none;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-    stroke-width: 2.4;
+    stroke-linecap: square;
+    stroke-linejoin: miter;
+    stroke-width: 2.2;
   }
 
   .spread-line.a {
-    stroke: #2563eb;
+    stroke: var(--accent);
   }
 
   .spread-line.b {
-    stroke: #f97316;
+    stroke: var(--ink);
+    stroke-dasharray: 7 5;
   }
 
   .cursor-line {
-    stroke: #0f172a;
+    stroke: var(--ink);
     stroke-width: 1;
-    stroke-dasharray: 4 5;
   }
 
   .point {
-    stroke: #ffffff;
-    stroke-width: 2.5;
+    stroke: var(--paper);
+    stroke-width: 2;
   }
 
   .point.a {
-    fill: #2563eb;
+    fill: var(--accent);
   }
 
   .point.b {
-    fill: #f97316;
+    fill: var(--ink);
   }
 
   .axis-label {
-    fill: #64748b;
+    fill: var(--grey-3);
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
     font-size: 12px;
   }
@@ -1720,314 +1645,277 @@
     text-anchor: end;
   }
 
-  .side-panel {
+  .point-ledger {
     display: grid;
-    gap: 16px;
-  }
-
-  .readout,
-  .points-panel,
-  .coverage-panel,
-  .rates-panel {
-    padding: 18px;
-  }
-
-  .route-card {
-    display: grid;
-    gap: 4px;
-    margin-top: 14px;
-    border: 1px solid #dbe4ef;
-    border-left: 4px solid #cbd5e1;
-    border-radius: 6px;
-    padding: 10px 12px;
-    background: #f8fafc;
-  }
-
-  .route-card.positive {
-    border-left-color: #0f766e;
-  }
-
-  .route-card.negative {
-    border-left-color: #f97316;
-  }
-
-  .route-card span,
-  .route-card small {
-    color: #64748b;
-  }
-
-  .route-card strong {
-    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-  }
-
-  .readout dl {
-    display: grid;
-    gap: 10px;
-    margin: 18px 0 0;
-  }
-
-  .readout dl div {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-    border-bottom: 1px solid #e2e8f0;
-    padding-bottom: 9px;
-  }
-
-  dt {
-    color: #64748b;
-    font-size: 0.86rem;
-  }
-
-  dd {
     margin: 0;
-    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-    font-variant-numeric: tabular-nums;
-    font-weight: 700;
   }
 
-  .book-snapshot {
+  .point-ledger div {
     display: grid;
-    gap: 8px;
-    margin-top: 16px;
-    color: #475569;
-    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-    font-size: 0.78rem;
+    grid-template-columns: minmax(92px, 0.62fr) minmax(0, 1fr);
+    gap: 12px;
+    border-bottom: var(--hairline);
+    padding: 12px 0;
   }
 
   .point-actions {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 8px;
-    margin-top: 16px;
+    margin-top: 14px;
   }
 
-  .point-actions button {
-    border-radius: 6px;
-    padding: 0 8px;
+  .spread-tape {
+    grid-column: 1 / 17;
+    border-top: var(--hairline);
+    padding: 16px 0 0;
   }
 
-  .muted {
-    margin: 10px 0 0;
-    color: #64748b;
-  }
-
-  .panel-heading {
+  .tape-head {
     display: flex;
-    align-items: start;
     justify-content: space-between;
-    gap: 12px;
-    margin-bottom: 14px;
+    margin-bottom: 10px;
   }
 
-  .panel-heading button {
-    min-height: 36px;
+  .tape-grid {
+    display: grid;
+    grid-template-columns: repeat(9, minmax(0, 1fr));
+    gap: 0;
+    border-left: var(--hairline);
+    border-top: var(--hairline);
   }
 
-  .table-scroll {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    min-width: 520px;
-    border-collapse: collapse;
-    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-    font-size: 0.78rem;
-  }
-
-  th,
-  td {
-    border-bottom: 1px solid #e2e8f0;
-    padding: 8px 7px;
-    text-align: right;
-    white-space: nowrap;
-  }
-
-  th:first-child,
-  td:first-child {
+  .tape-grid button {
+    display: grid;
+    min-height: 112px;
+    align-content: space-between;
+    justify-items: start;
+    border: 0;
+    border-right: var(--hairline);
+    border-bottom: var(--hairline);
+    padding: 10px;
     text-align: left;
   }
 
-  th {
-    color: #64748b;
-    font-weight: 700;
-  }
-
-  tr.active {
-    background: #eff6ff;
-  }
-
-  .row-select {
-    min-height: 32px;
-    border-radius: 6px;
-    padding: 0 8px;
-    font-family: inherit;
-  }
-
-  .coverage-list {
-    display: grid;
-    gap: 10px;
-  }
-
-  .coverage-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto auto;
-    align-items: center;
-    gap: 10px;
-    border: 1px solid #e2e8f0;
-    border-radius: 6px;
-    padding: 10px;
-    background: #ffffff;
-  }
-
-  .coverage-row.selected {
-    border-color: #93c5fd;
-    background: #eff6ff;
-  }
-
-  .coverage-main {
-    display: grid;
-    gap: 3px;
-    min-width: 0;
-  }
-
-  .coverage-main strong,
-  .coverage-main span {
-    overflow-wrap: anywhere;
-  }
-
-  .coverage-main span,
-  .coverage-meta {
-    color: #64748b;
-    font-size: 0.8rem;
-  }
-
-  .coverage-meta {
-    display: grid;
-    justify-items: end;
-    gap: 4px;
+  .tape-grid strong {
     font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 1rem;
   }
 
-  .leg-actions {
-    display: inline-flex;
-    gap: 4px;
+  .tape-grid small {
+    color: var(--grey-3);
   }
 
-  .leg-actions button {
-    min-width: 34px;
-    min-height: 34px;
-    border-radius: 6px;
-    padding: 0;
+  .qualify-layout,
+  .normalize-layout {
+    display: grid;
+    gap: 18px;
   }
 
-  .leg-actions button.active {
-    color: #ffffff;
-    border-color: #2563eb;
-    background: #2563eb;
+  .venue-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-left: var(--hairline);
+    border-top: var(--hairline);
+  }
+
+  .venue-grid article {
+    display: grid;
+    gap: 18px;
+    border-right: var(--hairline);
+    border-bottom: var(--hairline);
+    padding: 16px;
+  }
+
+  .venue-grid article.selected {
+    border-top: 8px solid var(--accent);
+    padding-top: 8px;
+  }
+
+  .venue-top {
+    display: grid;
+    gap: 8px;
+  }
+
+  .venue-top span {
+    color: var(--grey-3);
+    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+
+  .venue-top strong {
+    overflow-wrap: anywhere;
+    font-size: clamp(1.4rem, 2.3vw, 3.2rem);
+    font-weight: 200;
+    line-height: 0.95;
+    letter-spacing: -0.045em;
+  }
+
+  .venue-grid dl {
+    display: grid;
+    gap: 0;
+    margin: 0;
+  }
+
+  .venue-grid dl div {
+    display: grid;
+    grid-template-columns: minmax(86px, 0.5fr) minmax(0, 1fr);
+    gap: 12px;
+    border-bottom: var(--hairline);
+    padding: 9px 0;
+  }
+
+  .normal-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 360px;
+    gap: 16px;
+  }
+
+  .rate-editor,
+  .refresh-card {
+    border-top: var(--hairline);
+    padding-top: 12px;
   }
 
   .rate-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr 1.1fr 34px;
-    gap: 8px;
-    margin-top: 8px;
+    grid-template-columns: 1fr 1fr 1.1fr 46px;
+    gap: 0;
+    border-left: var(--hairline);
+    border-top: var(--hairline);
   }
 
-  .rate-grid.heading {
-    margin-top: 0;
-    color: #64748b;
-    font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-    font-size: 0.72rem;
-    font-weight: 700;
-    text-transform: uppercase;
+  .rate-grid + .rate-grid {
+    border-top: 0;
   }
 
-  .rate-grid input {
+  .rate-grid > * {
+    border: 0;
+    border-right: var(--hairline);
+    border-bottom: var(--hairline);
+  }
+
+  .rate-grid.heading span {
     min-height: 38px;
-    padding: 0 8px;
+    padding: 10px;
   }
 
   .rate-grid button {
-    min-width: 34px;
-    min-height: 38px;
-    border-radius: 6px;
     padding: 0;
   }
 
   .add-rate {
     width: 100%;
     margin-top: 12px;
-    border-radius: 6px;
+  }
+
+  .refresh-card {
+    display: grid;
+    align-content: start;
+    gap: 16px;
+  }
+
+  .checkbox-line {
+    display: flex;
+    min-height: 44px;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .checkbox-line input {
+    width: 18px;
+    min-height: 18px;
+    accent-color: var(--accent);
   }
 
   @media (max-width: 1180px) {
-    .metric-strip {
+    .decision-grid,
+    .query-board,
+    .compare-layout {
+      grid-template-columns: repeat(8, minmax(0, 1fr));
+    }
+
+    .hero-copy,
+    .hero-ledger,
+    .chart-panel,
+    .point-panel,
+    .spread-tape {
+      grid-column: 1 / -1;
+    }
+
+    .hero-ledger,
+    .chart-panel {
+      border-left: 0;
+      border-right: 0;
+      padding-left: 0;
+      padding-right: 0;
+    }
+
+    .query-board label,
+    .axis-button,
+    .preset-grid,
+    .query-button {
+      grid-column: span 4 !important;
+    }
+
+    .tape-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .venue-grid {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
-    .workspace {
+    .normal-grid {
       grid-template-columns: 1fr;
-    }
-
-    .side-panel {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
   }
 
   @media (max-width: 740px) {
-    .page-shell {
-      width: min(100vw - 20px, 1480px);
-      padding-top: 10px;
+    .swiss-shell {
+      width: min(100vw - 20px, 1680px);
+      padding-top: 14px;
     }
 
-    .topbar,
-    .chart-title,
-    .control-strip {
-      grid-template-columns: 1fr;
-      align-items: stretch;
-    }
-
-    .topbar,
-    .chart-title {
+    .chrome,
+    .section-head {
       display: grid;
     }
 
-    .topbar-actions {
-      justify-items: stretch;
+    .hero-copy {
+      min-height: 360px;
     }
 
-    .connection,
-    .legend {
-      justify-content: start;
+    .hero-copy h1 {
+      font-size: min(26vw, 16vh);
     }
 
-    .preset-group {
-      overflow-x: auto;
-      justify-content: start;
+    .hero-copy h1 span {
+      font-size: min(15vw, 9vh);
     }
 
-    .metric-strip {
+    .query-board label,
+    .axis-button,
+    .preset-grid,
+    .query-button {
+      grid-column: 1 / -1 !important;
+    }
+
+    .mode-rail,
+    .venue-grid {
       grid-template-columns: 1fr;
     }
 
-    .side-panel {
+    .mode-rail button {
+      border-right: 0;
+      border-bottom: var(--hairline);
+    }
+
+    .tape-grid {
       grid-template-columns: 1fr;
     }
 
-    .workspace {
-      padding: 10px;
-    }
-
-    .coverage-row {
+    .rate-grid {
       grid-template-columns: 1fr;
-      align-items: stretch;
-    }
-
-    .coverage-meta {
-      justify-items: start;
     }
   }
 
