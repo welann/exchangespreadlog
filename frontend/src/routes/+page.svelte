@@ -44,6 +44,12 @@
   };
 
   type DisplayMode = 'best' | 'both';
+  type LoadSpreadOptions = {
+    preservePoint?: boolean;
+    silent?: boolean;
+    slideWindow?: boolean;
+    updateUrl?: boolean;
+  };
 
   type IntervalStats = {
     max: number | null;
@@ -65,30 +71,30 @@
   let rangeAnchorMs = Date.now();
   let rates: QuoteRate[] = structuredClone(defaultRates);
   let hydrated = false;
-  let nowMs = Date.now();
   let showAToB = true;
   let showBToA = true;
   let displayMode: DisplayMode = 'both';
-  let autoRefresh = false;
-  let refreshSeconds = 30;
+  let autoRefresh = true;
+  let refreshSeconds = 15;
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  let spreadRequestSeq = 0;
 
   let marketError = '';
   let queryError = '';
   let loadingMarkets = false;
   let loadingSpread = false;
+  let refreshingSpread = false;
   let spread: SpreadResponse | null = null;
   let selectedIndex = -1;
   let hoverIndex = -1;
 
   $: currentMarket = markets.find((market) => market.baseAsset === selectedBase);
   $: currentInstruments = currentMarket?.instruments ?? [];
-  $: marketLatestMs = latestForInstruments(currentInstruments);
-  $: marketFreshness = freshnessFor(marketLatestMs, nowMs);
-  $: totalTicks = currentInstruments.reduce((sum, instrument) => sum + instrument.tickCount, 0);
+  $: totalTicks = tickCountForInstruments(currentInstruments);
   $: selectedInstrumentA = currentInstruments.find((instrument) => instrument.catalogId === selectedA) ?? null;
   $: selectedInstrumentB = currentInstruments.find((instrument) => instrument.catalogId === selectedB) ?? null;
   $: selectedRange = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
+  $: spreadBusy = loadingSpread || refreshingSpread;
   $: points = spread?.points ?? [];
   $: xBounds = computeXBounds(points, selectedRange);
   $: yBounds = computeYBounds(points, displayMode, showAToB, showBToA);
@@ -125,13 +131,9 @@
     hydrated = true;
     loadStoredRates();
     const queryState = readQueryState();
-    void loadMarkets(queryState);
-    const clockTimer = setInterval(() => {
-      nowMs = Date.now();
-    }, 30_000);
+    void loadMarkets(queryState).finally(() => configureAutoRefresh());
 
     return () => {
-      clearInterval(clockTimer);
       stopAutoRefresh();
     };
   });
@@ -146,7 +148,7 @@
       markets = body.markets ?? [];
       if (markets.length > 0) {
         applySelectionState(state);
-        await loadSpread();
+        await loadSpread({ slideWindow: true });
       } else {
         marketError = 'No comparable markets were found. Check /api/health for ClickHouse table status.';
       }
@@ -157,10 +159,16 @@
     }
   }
 
-  async function loadSpread() {
-    if (!selectedA || !selectedB || selectedA === selectedB) {
+  async function loadSpread(options: LoadSpreadOptions = {}) {
+    const catalogA = selectedA;
+    const catalogB = selectedB;
+    if (!catalogA || !catalogB || catalogA === catalogB) {
       queryError = 'Choose two different instruments from the same market';
       return;
+    }
+
+    if (options.slideWindow && selectedPreset !== 'custom') {
+      rangeAnchorMs = Date.now();
     }
 
     const range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
@@ -169,38 +177,56 @@
       return;
     }
 
-    loadingSpread = true;
+    const requestId = ++spreadRequestSeq;
+    const previousSelectedPoint = selectedIndex >= 0 ? points[selectedIndex] : null;
+    const wasFollowingLatest = selectedIndex < 0 || selectedIndex >= points.length - 1;
+
+    if (options.silent) {
+      refreshingSpread = true;
+    } else {
+      loadingSpread = true;
+    }
     queryError = '';
-    hoverIndex = -1;
+    if (!options.preservePoint) {
+      hoverIndex = -1;
+    }
     try {
       const response = await fetch('/api/spread', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          catalogA: selectedA,
-          catalogB: selectedB,
+          catalogA,
+          catalogB,
           fromMs: range.fromMs,
           toMs: range.toMs,
+          precision: precisionForRange(range),
           rates: cleanRates(rates)
         })
       });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error ?? 'Failed to query spread');
+      if (requestId !== spreadRequestSeq || selectedA !== catalogA || selectedB !== catalogB) return;
       spread = body as SpreadResponse;
-      selectedIndex = spread.points.length > 0 ? spread.points.length - 1 : -1;
-      syncQueryState();
+      selectedIndex = nextSelectedIndex(spread.points, previousSelectedPoint?.tsMs ?? null, wasFollowingLatest, options.preservePoint);
+      if (options.updateUrl !== false) {
+        syncQueryState();
+      }
     } catch (error) {
+      if (requestId !== spreadRequestSeq || selectedA !== catalogA || selectedB !== catalogB) return;
       spread = null;
       selectedIndex = -1;
       queryError = error instanceof Error ? error.message : 'Failed to query spread';
     } finally {
-      loadingSpread = false;
+      if (requestId === spreadRequestSeq) {
+        loadingSpread = false;
+        refreshingSpread = false;
+      }
     }
   }
 
   async function selectBase(baseAsset: string) {
     applySelectionState({ ...captureQueryState(), baseAsset });
-    await loadSpreadWhenReady();
+    await loadSpreadWhenReady({ slideWindow: true });
   }
 
   function selectLegA(catalogId: string) {
@@ -232,27 +258,26 @@
 
   async function selectLegAAndQuery(catalogId: string) {
     selectLegA(catalogId);
-    await loadSpreadWhenReady();
+    await loadSpreadWhenReady({ slideWindow: true });
   }
 
   async function selectLegBAndQuery(catalogId: string) {
     selectLegB(catalogId);
-    await loadSpreadWhenReady();
+    await loadSpreadWhenReady({ slideWindow: true });
   }
 
   async function swapLegsAndQuery() {
     swapLegs();
-    await loadSpreadWhenReady();
+    await loadSpreadWhenReady({ slideWindow: true });
   }
 
-  async function loadSpreadWhenReady() {
-    if (!selectedA || !selectedB || selectedA === selectedB || loadingSpread) return;
-    await loadSpread();
+  async function loadSpreadWhenReady(options: LoadSpreadOptions = {}) {
+    if (!selectedA || !selectedB || selectedA === selectedB) return;
+    await loadSpread(options);
   }
 
-  async function refreshData() {
-    nowMs = Date.now();
-    await loadMarkets(captureQueryState());
+  async function refreshCurrentSpread(options: LoadSpreadOptions = {}) {
+    await loadSpreadWhenReady({ slideWindow: true, ...options });
   }
 
   function toggleAutoRefresh(enabled: boolean) {
@@ -262,7 +287,7 @@
 
   function updateRefreshSeconds(value: string) {
     const parsed = Number(value);
-    refreshSeconds = Number.isFinite(parsed) ? parsed : 30;
+    refreshSeconds = Number.isFinite(parsed) ? parsed : 15;
     configureAutoRefresh();
   }
 
@@ -270,7 +295,9 @@
     stopAutoRefresh();
     if (!autoRefresh) return;
     refreshTimer = setInterval(() => {
-      if (!loadingMarkets && !loadingSpread) void refreshData();
+      if (!loadingMarkets && !spreadBusy) {
+        void refreshCurrentSpread({ preservePoint: true, silent: true, updateUrl: false });
+      }
     }, refreshSeconds * 1000);
   }
 
@@ -292,7 +319,7 @@
 
   async function toggleSeriesAndQuery(series: 'aToB' | 'bToA') {
     toggleSeries(series);
-    if (points.length === 0) await loadSpreadWhenReady();
+    if (points.length === 0) await loadSpreadWhenReady({ slideWindow: true });
   }
 
   function setDisplayMode(mode: DisplayMode) {
@@ -305,7 +332,7 @@
 
   async function setDisplayModeAndQuery(mode: DisplayMode) {
     setDisplayMode(mode);
-    if (points.length === 0) await loadSpreadWhenReady();
+    if (points.length === 0) await loadSpreadWhenReady({ slideWindow: true });
   }
 
   function selectPoint(index: number) {
@@ -379,6 +406,10 @@
         rate: rate.rate.trim()
       }))
       .filter((rate) => rate.from && rate.to && rate.rate);
+  }
+
+  function precisionForRange(range: { fromMs: number; toMs: number }) {
+    return range.toMs - range.fromMs <= 60 * 60 * 1000 ? 'raw' : 'bucket';
   }
 
   function currentRange(presetValue: string, start: string, end: string, anchorMs: number) {
@@ -505,7 +536,7 @@
   async function handlePresetAndQuery(value: string) {
     handlePreset(value);
     if (value !== 'custom' && selectedA && selectedB && selectedA !== selectedB) {
-      await loadSpread();
+      await loadSpread({ slideWindow: true });
     }
   }
 
@@ -781,17 +812,29 @@
     }));
   }
 
-  function freshnessFor(ms: number | null, now: number) {
-    if (ms === null) {
-      return { label: 'No ticks', detail: 'No market data in ClickHouse', className: 'stale' };
-    }
-    const ageMs = Math.max(0, now - ms);
-    const className = ageMs <= 2 * 60 * 1000 ? 'fresh' : ageMs <= 30 * 60 * 1000 ? 'lagging' : 'stale';
-    return {
-      label: `${formatDuration(ageMs)} old`,
-      detail: formatTime(ms),
-      className
-    };
+  function nextSelectedIndex(
+    data: SpreadPoint[],
+    previousTsMs: number | null,
+    wasFollowingLatest: boolean,
+    preservePoint = false
+  ) {
+    if (data.length === 0) return -1;
+    if (!preservePoint || wasFollowingLatest || previousTsMs === null) return data.length - 1;
+
+    let best = 0;
+    let distance = Number.POSITIVE_INFINITY;
+    data.forEach((point, index) => {
+      const currentDistance = Math.abs(point.tsMs - previousTsMs);
+      if (currentDistance < distance) {
+        best = index;
+        distance = currentDistance;
+      }
+    });
+    return best;
+  }
+
+  function tickCountForInstruments(instruments: Market['instruments']) {
+    return instruments.reduce((sum, instrument) => sum + instrument.tickCount, 0);
   }
 
   function formatDuration(ms: number) {
@@ -826,6 +869,14 @@
     if (sizeLabel === '-') return '-';
     if (orderCount === null || !Number.isFinite(orderCount)) return sizeLabel;
     return `${sizeLabel} · ${formatInteger(orderCount)} ord`;
+  }
+
+  function sampleLabel(meta: SpreadResponse['meta'] | undefined) {
+    if (!meta) return '-';
+    if (meta.granularity === 'raw') {
+      return `${formatInteger(meta.sourceRows)} raw ticks`;
+    }
+    return `${meta.bucketSeconds}s buckets`;
   }
 
   function formatBp(value: number | null) {
@@ -872,11 +923,6 @@
     }).format(new Date(ms));
   }
 
-  function formatLatest(ms: number | null) {
-    if (ms === null) return 'no ticks';
-    return `latest ${formatTime(ms)}`;
-  }
-
   function clamp(value: number, min: number, max: number) {
     return Math.min(max, Math.max(min, value));
   }
@@ -901,10 +947,15 @@
     </div>
     <div class="topbar-meta" aria-live="polite">
       <span>数据源: ClickHouse</span>
-      <span>{points.length > 0 ? `${formatInteger(points.length)} samples / ${spread?.meta.bucketSeconds}s` : formatLatest(marketLatestMs)}</span>
+      <span>{points.length > 0 ? `${formatInteger(points.length)} samples / ${sampleLabel(spread?.meta)}` : loadingMarkets ? '读取市场中' : '等待样本'}</span>
+      <span>{refreshingSpread ? '同步当前组合中' : autoRefresh ? `实时 ${refreshSeconds}s` : '实时已暂停'}</span>
       <span class="route-badge">{routeCode}</span>
-      <button type="button" on:click={refreshData} disabled={loadingMarkets || loadingSpread}>
-        {loadingMarkets || loadingSpread ? '刷新中' : '刷新'}
+      <button
+        type="button"
+        on:click={() => void refreshCurrentSpread()}
+        disabled={loadingMarkets || spreadBusy || currentInstruments.length < 2}
+      >
+        {spreadBusy ? '同步中' : '更新当前'}
       </button>
     </div>
   </header>
@@ -935,8 +986,6 @@
             <p class="sidebar-empty">没有可比较的交易对。</p>
           {:else}
             {#each markets as market}
-              {@const latest = latestForInstruments(market.instruments)}
-              {@const fresh = freshnessFor(latest, nowMs)}
               <button
                 type="button"
                 class:active={market.baseAsset === selectedBase}
@@ -949,7 +998,7 @@
                 </span>
                 <span class="market-meta">
                   <span>{formatInteger(market.instruments.length)} venues</span>
-                  <span class={fresh.className}>{fresh.label}</span>
+                  <span>{formatInteger(tickCountForInstruments(market.instruments))} ticks</span>
                 </span>
               </button>
             {/each}
@@ -1000,7 +1049,7 @@
       </details>
 
       <details class="sidebar-details">
-        <summary>换算率 / 刷新</summary>
+        <summary>换算率 / 实时</summary>
         <div class="rate-stack">
           {#each rates as rate, index (index)}
             <div class="rate-row">
@@ -1042,7 +1091,7 @@
               checked={autoRefresh}
               on:change={(event) => toggleAutoRefresh((event.currentTarget as HTMLInputElement).checked)}
             />
-            自动刷新
+            自动更新当前交易对
           </label>
           <label>
             <span>刷新间隔</span>
@@ -1053,6 +1102,7 @@
               disabled={!autoRefresh}
               on:change={(event) => updateRefreshSeconds(selectValue(event))}
             >
+              <option value="5">5s</option>
               <option value="15">15s</option>
               <option value="30">30s</option>
               <option value="60">60s</option>
@@ -1123,10 +1173,10 @@
         <button
           class="primary-button"
           type="button"
-          disabled={loadingSpread || loadingMarkets || currentInstruments.length < 2}
-          on:click={loadSpread}
+          disabled={spreadBusy || loadingMarkets || currentInstruments.length < 2}
+          on:click={() => void loadSpread({ slideWindow: true })}
         >
-          {loadingSpread ? '查询中' : '运行查询'}
+          {spreadBusy ? '同步中' : '运行查询'}
         </button>
       </div>
 
@@ -1152,6 +1202,10 @@
           <div>
             <span>目标报价</span>
             <strong>{spread?.meta.targetQuote ?? selectedInstrumentA?.quoteAsset ?? '-'}</strong>
+          </div>
+          <div>
+            <span>采样</span>
+            <strong>{sampleLabel(spread?.meta)}</strong>
           </div>
         </div>
 
@@ -1259,7 +1313,11 @@
         {/if}
 
         <p class="chart-caption">
-          净价差按当前换算率统一报价。虚线为零轴；曲线越过零轴上方代表该方向出现正价差窗口。
+          {#if spread?.meta.granularity === 'raw'}
+            当前短窗口使用数据库逐 tick BBO 更新计算价差；每个样本来自 A/B 任一侧的新盘口，并与另一侧最新盘口对齐。
+          {:else}
+            当前长窗口使用 bucket 聚合后的最新盘口计算价差；缩短到 1H 可切换为逐 tick 采样。
+          {/if}
         </p>
       </section>
 
@@ -1294,7 +1352,6 @@
         </div>
         <div class="venue-grid">
           {#each currentInstruments as instrument}
-            {@const instrumentFreshness = freshnessFor(instrument.latestRecvMs, nowMs)}
             <article class:selected={instrument.catalogId === selectedA || instrument.catalogId === selectedB}>
               <div>
                 <strong>{instrument.venueInstanceId}</strong>
@@ -1302,7 +1359,7 @@
               </div>
               <dl>
                 <div><dt>Quote</dt><dd>{instrument.quoteAsset}</dd></div>
-                <div><dt>Fresh</dt><dd class={instrumentFreshness.className}>{instrumentFreshness.label}</dd></div>
+                <div><dt>Latest</dt><dd>{formatTime(instrument.latestRecvMs)}</dd></div>
                 <div><dt>Ticks</dt><dd>{formatInteger(instrument.tickCount)}</dd></div>
               </dl>
               <div class="leg-actions">
@@ -1402,8 +1459,8 @@
 
       <section class="meta-card">
         <div class="meta-row">
-          <span>Freshness</span>
-          <strong class={marketFreshness.className}>{marketFreshness.label}</strong>
+          <span>Live</span>
+          <strong>{autoRefresh ? `${refreshSeconds}s` : 'Paused'}</strong>
         </div>
         <div class="meta-row">
           <span>Window</span>
@@ -2259,18 +2316,12 @@
     text-transform: uppercase;
   }
 
-  .positive,
-  .fresh {
+  .positive {
     color: var(--primary) !important;
   }
 
-  .negative,
-  .stale {
+  .negative {
     color: var(--negative) !important;
-  }
-
-  .lagging {
-    color: var(--warning) !important;
   }
 
   @media (min-width: 1024px) {
