@@ -21,8 +21,20 @@ type RawSpreadPoint = {
   tsMs: number | string;
   aBid: number | null;
   aAsk: number | null;
+  aBidSize: number | null;
+  aAskSize: number | null;
+  aBidSizeText: string | null;
+  aAskSizeText: string | null;
+  aBidOrderCount: number | string | null;
+  aAskOrderCount: number | string | null;
   bBid: number | null;
   bAsk: number | null;
+  bBidSize: number | null;
+  bAskSize: number | null;
+  bBidSizeText: string | null;
+  bAskSizeText: string | null;
+  bBidOrderCount: number | string | null;
+  bAskOrderCount: number | string | null;
   aMid: number | null;
   bMid: number | null;
   aToB: number | null;
@@ -126,8 +138,20 @@ SELECT
   toUnixTimestamp(a.bucket) * 1000 AS tsMs,
   a.bid_price * ${aRate} AS aBid,
   a.ask_price * ${aRate} AS aAsk,
+  a.bid_size AS aBidSize,
+  a.ask_size AS aAskSize,
+  a.bid_size_text AS aBidSizeText,
+  a.ask_size_text AS aAskSizeText,
+  a.bid_order_count AS aBidOrderCount,
+  a.ask_order_count AS aAskOrderCount,
   b.bid_price * ${bRate} AS bBid,
   b.ask_price * ${bRate} AS bAsk,
+  b.bid_size AS bBidSize,
+  b.ask_size AS bAskSize,
+  b.bid_size_text AS bBidSizeText,
+  b.ask_size_text AS bAskSizeText,
+  b.bid_order_count AS bBidOrderCount,
+  b.ask_order_count AS bAskOrderCount,
   a.mid * ${aRate} AS aMid,
   b.mid * ${bRate} AS bMid,
   (a.bid_price * ${aRate}) - (b.ask_price * ${bRate}) AS aToB,
@@ -141,6 +165,12 @@ FROM
     toStartOfInterval(a_ticks.recv_time, INTERVAL ${bucketSeconds} SECOND) AS bucket,
     argMax(a_ticks.bid_price, a_ticks.recv_ts_ns) AS bid_price,
     argMax(a_ticks.ask_price, a_ticks.recv_ts_ns) AS ask_price,
+    argMax(a_ticks.bid_size, a_ticks.recv_ts_ns) AS bid_size,
+    argMax(a_ticks.ask_size, a_ticks.recv_ts_ns) AS ask_size,
+    argMax(a_ticks.bid_size_text, a_ticks.recv_ts_ns) AS bid_size_text,
+    argMax(a_ticks.ask_size_text, a_ticks.recv_ts_ns) AS ask_size_text,
+    argMax(a_ticks.bid_order_count, a_ticks.recv_ts_ns) AS bid_order_count,
+    argMax(a_ticks.ask_order_count, a_ticks.recv_ts_ns) AS ask_order_count,
     argMax(a_ticks.mid, a_ticks.recv_ts_ns) AS mid
   FROM ${tickTable()} AS a_ticks
   WHERE ${whereA}
@@ -156,6 +186,12 @@ INNER JOIN
     toStartOfInterval(b_ticks.recv_time, INTERVAL ${bucketSeconds} SECOND) AS bucket,
     argMax(b_ticks.bid_price, b_ticks.recv_ts_ns) AS bid_price,
     argMax(b_ticks.ask_price, b_ticks.recv_ts_ns) AS ask_price,
+    argMax(b_ticks.bid_size, b_ticks.recv_ts_ns) AS bid_size,
+    argMax(b_ticks.ask_size, b_ticks.recv_ts_ns) AS ask_size,
+    argMax(b_ticks.bid_size_text, b_ticks.recv_ts_ns) AS bid_size_text,
+    argMax(b_ticks.ask_size_text, b_ticks.recv_ts_ns) AS ask_size_text,
+    argMax(b_ticks.bid_order_count, b_ticks.recv_ts_ns) AS bid_order_count,
+    argMax(b_ticks.ask_order_count, b_ticks.recv_ts_ns) AS ask_order_count,
     argMax(b_ticks.mid, b_ticks.recv_ts_ns) AS mid
   FROM ${tickTable()} AS b_ticks
   WHERE ${whereB}
@@ -173,8 +209,20 @@ FORMAT JSONEachRow
     tsMs: Number(row.tsMs),
     aBid: nullableNumber(row.aBid),
     aAsk: nullableNumber(row.aAsk),
+    aBidSize: nullableNumber(row.aBidSize),
+    aAskSize: nullableNumber(row.aAskSize),
+    aBidSizeText: nullableString(row.aBidSizeText),
+    aAskSizeText: nullableString(row.aAskSizeText),
+    aBidOrderCount: nullableInteger(row.aBidOrderCount),
+    aAskOrderCount: nullableInteger(row.aAskOrderCount),
     bBid: nullableNumber(row.bBid),
     bAsk: nullableNumber(row.bAsk),
+    bBidSize: nullableNumber(row.bBidSize),
+    bAskSize: nullableNumber(row.bAskSize),
+    bBidSizeText: nullableString(row.bBidSizeText),
+    bAskSizeText: nullableString(row.bAskSizeText),
+    bBidOrderCount: nullableInteger(row.bBidOrderCount),
+    bAskOrderCount: nullableInteger(row.bAskOrderCount),
     aMid: nullableNumber(row.aMid),
     bMid: nullableNumber(row.bMid),
     aToB: nullableNumber(row.aToB),
@@ -213,6 +261,17 @@ function nullableNumber(value: unknown): number | null {
   if (value === null || value === undefined) return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function nullableInteger(value: unknown): number | null {
+  const parsed = nullableNumber(value);
+  return parsed === null ? null : Math.trunc(parsed);
+}
+
+function nullableString(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  return text.length > 0 ? text : null;
 }
 
 function clamp(value: number, min: number, max: number): number {

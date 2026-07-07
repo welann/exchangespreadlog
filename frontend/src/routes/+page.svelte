@@ -821,6 +821,13 @@
     }).format(value);
   }
 
+  function formatDepthLevel(sizeText: string | null, size: number | null, orderCount: number | null) {
+    const sizeLabel = sizeText ?? formatNumber(size, 8);
+    if (sizeLabel === '-') return '-';
+    if (orderCount === null || !Number.isFinite(orderCount)) return sizeLabel;
+    return `${sizeLabel} · ${formatInteger(orderCount)} ord`;
+  }
+
   function formatBp(value: number | null) {
     if (value === null || !Number.isFinite(value)) return '-';
     return `${new Intl.NumberFormat(undefined, {
@@ -1366,6 +1373,22 @@
             <div><dt>Mid diff</dt><dd>{formatNumber(activePoint.midDiff)} {spread.meta.targetQuote}</dd></div>
             <div><dt>A book</dt><dd>{formatNumber(activePoint.aBid)} / {formatNumber(activePoint.aAsk)}</dd></div>
             <div><dt>B book</dt><dd>{formatNumber(activePoint.bBid)} / {formatNumber(activePoint.bAsk)}</dd></div>
+            <div>
+              <dt>A bid depth</dt>
+              <dd>{formatDepthLevel(activePoint.aBidSizeText, activePoint.aBidSize, activePoint.aBidOrderCount)}</dd>
+            </div>
+            <div>
+              <dt>A ask depth</dt>
+              <dd>{formatDepthLevel(activePoint.aAskSizeText, activePoint.aAskSize, activePoint.aAskOrderCount)}</dd>
+            </div>
+            <div>
+              <dt>B bid depth</dt>
+              <dd>{formatDepthLevel(activePoint.bBidSizeText, activePoint.bBidSize, activePoint.bBidOrderCount)}</dd>
+            </div>
+            <div>
+              <dt>B ask depth</dt>
+              <dd>{formatDepthLevel(activePoint.bAskSizeText, activePoint.bAskSize, activePoint.bAskOrderCount)}</dd>
+            </div>
           </dl>
           <div class="point-actions">
             <button type="button" on:click={() => jumpPoint(-1)}>Prev</button>
@@ -1373,7 +1396,7 @@
             <button type="button" on:click={jumpLatest}>Latest</button>
           </div>
         {:else}
-          <p class="sidebar-empty">在曲线上悬停或点击后，这里会显示该点的完整 bid/ask 与价差信息。</p>
+          <p class="sidebar-empty">在曲线上悬停或点击后，这里会显示该点的完整 bid/ask、深度与价差信息。</p>
         {/if}
       </section>
 
