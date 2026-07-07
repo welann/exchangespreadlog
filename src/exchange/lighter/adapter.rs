@@ -87,7 +87,7 @@ impl LighterAdapter {
         }
 
         info!(venue = %self.venue_instance_id, instruments = ?catalog.instruments(), "subscribed");
-        let mut heartbeat = time::interval(Duration::from_secs(60));
+        let mut heartbeat = time::interval(Duration::from_secs(15));
 
         loop {
             tokio::select! {

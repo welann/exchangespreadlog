@@ -4,7 +4,11 @@ pub mod lighter;
 pub mod risex;
 pub mod zero_one;
 
-use std::{collections::HashMap, future::Future};
+use std::{
+    collections::HashMap,
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use tokio::{
@@ -17,6 +21,10 @@ use crate::{
     domain::{BboTick, Fixed, InstrumentCatalog, InstrumentRef, MarketEvent},
     ingest::supervisor::Backoff,
 };
+
+const STABLE_CONNECTION_RESET_AFTER: Duration = Duration::from_secs(30);
+const TRANSIENT_WS_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const TRANSIENT_WS_RECONNECT_CAP: Duration = Duration::from_secs(5);
 
 #[async_trait]
 pub trait ExchangeAdapter: Send + Sync {
@@ -43,7 +51,7 @@ where
 pub async fn run_with_reconnect_backoff<F, Fut>(
     venue: &'static str,
     tx: Sender<MarketEvent>,
-    shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
     mut backoff: Backoff,
     mut run_once: F,
 ) -> anyhow::Result<()>
@@ -52,28 +60,89 @@ where
     Fut: Future<Output = anyhow::Result<()>> + Send,
 {
     while !*shutdown.borrow() {
+        let started_at = Instant::now();
         match run_once(tx.clone(), shutdown.clone()).await {
             Ok(()) => return Ok(()),
             Err(err) => {
-                let sleep = backoff.next_delay();
-                log_adapter_restart(venue, &err, sleep);
-                time::sleep(sleep).await;
+                let uptime = started_at.elapsed();
+                let decision = reconnect_decision(&mut backoff, &err, uptime);
+                log_adapter_restart(venue, &err, decision, uptime);
+                tokio::select! {
+                    _ = time::sleep(decision.sleep) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_ok() && *shutdown.borrow() {
+                            return Ok(());
+                        }
+                    }
+                }
             }
         }
     }
     Ok(())
 }
 
-fn log_adapter_restart(venue: &str, err: &anyhow::Error, sleep: std::time::Duration) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconnectDecision {
+    sleep: Duration,
+    kind: ReconnectKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectKind {
+    TransientWebsocketDisconnect,
+    Error,
+}
+
+fn reconnect_decision(
+    backoff: &mut Backoff,
+    err: &anyhow::Error,
+    uptime: Duration,
+) -> ReconnectDecision {
+    let was_stable_connection = uptime >= STABLE_CONNECTION_RESET_AFTER;
+    if was_stable_connection {
+        backoff.reset();
+    }
+
     if is_transient_websocket_disconnect(err) {
+        let sleep = if was_stable_connection {
+            TRANSIENT_WS_RECONNECT_DELAY
+        } else {
+            backoff.next_delay().min(TRANSIENT_WS_RECONNECT_CAP)
+        };
+        return ReconnectDecision {
+            sleep,
+            kind: ReconnectKind::TransientWebsocketDisconnect,
+        };
+    }
+
+    ReconnectDecision {
+        sleep: backoff.next_delay(),
+        kind: ReconnectKind::Error,
+    }
+}
+
+fn log_adapter_restart(
+    venue: &str,
+    err: &anyhow::Error,
+    decision: ReconnectDecision,
+    uptime: Duration,
+) {
+    if decision.kind == ReconnectKind::TransientWebsocketDisconnect {
         info!(
             venue,
             reason = %err,
-            ?sleep,
+            sleep = ?decision.sleep,
+            ?uptime,
             "adapter reconnecting after transient websocket disconnect"
         );
     } else {
-        warn!(venue, error = %err, ?sleep, "adapter restarting");
+        warn!(
+            venue,
+            error = %err,
+            sleep = ?decision.sleep,
+            ?uptime,
+            "adapter restarting"
+        );
     }
 }
 
@@ -87,7 +156,8 @@ fn is_transient_websocket_disconnect(err: &anyhow::Error) -> bool {
     }
     let text = text.to_ascii_lowercase();
 
-    text.contains("connection reset without closing handshake")
+    text.contains("without closing handshake")
+        || text.contains("connection reset without closing handshake")
         || text.contains("connection reset by peer")
         || text.contains("broken pipe")
 }
@@ -206,9 +276,15 @@ fn catalog_keys(instrument: &InstrumentCatalog) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CatalogIndex, decimal_tick, is_transient_websocket_disconnect, merge_configured_catalog,
+        CatalogIndex, ReconnectDecision, ReconnectKind, TRANSIENT_WS_RECONNECT_DELAY, decimal_tick,
+        is_transient_websocket_disconnect, merge_configured_catalog, reconnect_decision,
     };
-    use crate::domain::{BboTick, BestLevel, InstrumentCatalog, ProductType, SourceKind};
+    use std::time::Duration;
+
+    use crate::{
+        domain::{BboTick, BestLevel, InstrumentCatalog, ProductType, SourceKind},
+        ingest::supervisor::Backoff,
+    };
 
     fn catalog(id: &str, raw: &str, feed: &str, price_tick: Option<&str>) -> InstrumentCatalog {
         InstrumentCatalog::new(
@@ -271,5 +347,39 @@ mod tests {
 
         let err = anyhow::anyhow!("Ethereal L2Book gap for BTCUSD");
         assert!(!is_transient_websocket_disconnect(&err));
+    }
+
+    #[test]
+    fn reconnects_quickly_after_stable_transient_websocket_disconnect() {
+        let err =
+            anyhow::anyhow!("WebSocket protocol error: Connection reset without closing handshake");
+        let mut backoff = Backoff::new(Duration::from_secs(15), Duration::from_secs(300));
+
+        let decision = reconnect_decision(&mut backoff, &err, Duration::from_secs(120));
+
+        assert_eq!(
+            decision,
+            ReconnectDecision {
+                sleep: TRANSIENT_WS_RECONNECT_DELAY,
+                kind: ReconnectKind::TransientWebsocketDisconnect,
+            }
+        );
+    }
+
+    #[test]
+    fn caps_rapid_transient_websocket_disconnect_backoff() {
+        let err =
+            anyhow::anyhow!("WebSocket protocol error: Connection reset without closing handshake");
+        let mut backoff = Backoff::new(Duration::from_secs(15), Duration::from_secs(300));
+
+        let decision = reconnect_decision(&mut backoff, &err, Duration::from_secs(1));
+
+        assert_eq!(
+            decision,
+            ReconnectDecision {
+                sleep: Duration::from_secs(5),
+                kind: ReconnectKind::TransientWebsocketDisconnect,
+            }
+        );
     }
 }
