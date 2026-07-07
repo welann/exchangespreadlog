@@ -4,3 +4,5 @@
 config.toml
 .env
 .alma-snapshots
+__pycache__/
+*.py[cod]

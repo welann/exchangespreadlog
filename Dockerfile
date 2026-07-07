@@ -20,7 +20,7 @@ RUN useradd --create-home --uid 10001 app
 WORKDIR /app
 
 COPY --from=builder /app/target/release/exchangespreadlog /usr/local/bin/exchangespreadlog
-COPY config.example.toml /app/config.toml
+COPY config.generated.toml /app/config.toml
 
 RUN chown -R app:app /app
 
