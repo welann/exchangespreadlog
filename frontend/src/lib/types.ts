@@ -12,6 +12,8 @@ export type Instrument = {
   baseAsset: string;
   quoteAsset: string;
   status: string;
+  latestRecvMs: number | null;
+  tickCount: number;
   label: string;
 };
 

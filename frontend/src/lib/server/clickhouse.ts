@@ -1,4 +1,6 @@
 import { env } from '$env/dynamic/private';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 type ClickHouseConfig = {
   url: string;
@@ -7,6 +9,18 @@ type ClickHouseConfig = {
   catalogTable: string;
   username: string;
   password: string;
+  source: string;
+};
+
+type FileClickHouseConfig = {
+  url?: string;
+  database?: string;
+  table?: string;
+  catalogTable?: string;
+  username?: string;
+  password?: string;
+  passwordEnv?: string;
+  source: string;
 };
 
 export class ClickHouseError extends Error {
@@ -20,25 +34,71 @@ export class ClickHouseError extends Error {
 }
 
 export function clickHouseConfig(): ClickHouseConfig {
-  const url = (env.CLICKHOUSE_URL ?? 'http://localhost:8123').trim().replace(/\/+$/, '');
+  const fileConfig = readClickHouseConfigFile();
+  const passwordEnvName =
+    envValue('CLICKHOUSE_PASSWORD_ENV')?.trim() || fileConfig?.passwordEnv?.trim() || '';
+  const passwordFromNamedEnv = passwordEnvName ? envValue(passwordEnvName) : undefined;
+
+  const url = (envValue('CLICKHOUSE_URL') ?? fileConfig?.url ?? 'http://clickhouse.zeabur.internal:8123')
+    .trim()
+    .replace(/\/+$/, '');
   if (!url) {
     throw new ClickHouseError('CLICKHOUSE_URL is empty');
   }
 
   const config = {
     url,
-    database: env.CLICKHOUSE_DATABASE ?? 'default',
-    table: env.CLICKHOUSE_TABLE ?? 'bbo_ticks',
-    catalogTable: env.CLICKHOUSE_CATALOG_TABLE ?? 'instrument_catalog',
-    username: env.CLICKHOUSE_USERNAME ?? '',
-    password: env.CLICKHOUSE_PASSWORD ?? ''
+    database:
+      envValue('CLICKHOUSE_DATABASE') ??
+      envValue('CLICKHOUSE_DB') ??
+      fileConfig?.database ??
+      'default',
+    table: envValue('CLICKHOUSE_TABLE') ?? fileConfig?.table ?? 'bbo_ticks',
+    catalogTable:
+      envValue('CLICKHOUSE_CATALOG_TABLE') ?? fileConfig?.catalogTable ?? 'instrument_catalog',
+    username:
+      envValue('CLICKHOUSE_USERNAME') ??
+      envValue('CLICKHOUSE_USER') ??
+      envValue('CLICKHOUSE_HTTP_USERNAME') ??
+      envValue('CLICKHOUSE_HTTP_USER') ??
+      fileConfig?.username ??
+      '',
+    password:
+      envValue('CLICKHOUSE_PASSWORD') ??
+      envValue('CLICKHOUSE_PASS') ??
+      envValue('CLICKHOUSE_HTTP_PASSWORD') ??
+      passwordFromNamedEnv ??
+      fileConfig?.password ??
+      '',
+    source: fileConfig?.source ?? 'environment/defaults'
   };
 
   validateIdentifier('CLICKHOUSE_DATABASE', config.database);
   validateIdentifier('CLICKHOUSE_TABLE', config.table);
   validateIdentifier('CLICKHOUSE_CATALOG_TABLE', config.catalogTable);
 
+  if (config.username && !config.password && passwordEnvName) {
+    const passwordNames = [...new Set([passwordEnvName, 'CLICKHOUSE_PASSWORD'])].join(' or ');
+    throw new ClickHouseError(
+      `ClickHouse password is missing. Set ${passwordNames}; ${config.source} declares password_env="${passwordEnvName}".`,
+      500
+    );
+  }
+
   return config;
+}
+
+export function clickHouseConfigSummary() {
+  const config = clickHouseConfig();
+  return {
+    url: config.url,
+    database: config.database,
+    table: config.table,
+    catalogTable: config.catalogTable,
+    username: config.username || null,
+    hasPassword: Boolean(config.password),
+    source: config.source
+  };
 }
 
 export function tickTable(): string {
@@ -63,11 +123,17 @@ export async function queryClickHouse<T>(sql: string): Promise<T[]> {
     headers.set('authorization', `Basic ${token}`);
   }
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: sql
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: sql
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'unknown network error';
+    throw new ClickHouseError(`Cannot reach ClickHouse at ${config.url}: ${message}`, 502);
+  }
 
   const body = await response.text();
   if (!response.ok) {
@@ -108,4 +174,102 @@ function validateIdentifier(label: string, value: string): void {
 function quoteIdentifier(value: string): string {
   validateIdentifier('identifier', value);
   return `\`${value}\``;
+}
+
+function readClickHouseConfigFile(): FileClickHouseConfig | null {
+  for (const candidate of configCandidates()) {
+    if (!existsSync(candidate)) continue;
+    const raw = readFileSync(candidate, 'utf8');
+    const parsed = parseStorageClickHouse(raw);
+    if (Object.keys(parsed).length === 0) continue;
+    return {
+      ...parsed,
+      source: candidate
+    };
+  }
+  return null;
+}
+
+function configCandidates(): string[] {
+  const explicit = envValue('CLICKHOUSE_CONFIG') || envValue('EXCHANGESPREADLOG_CONFIG');
+  if (explicit) return [resolve(process.cwd(), explicit)];
+  return [
+    resolve(process.cwd(), 'config.toml'),
+    resolve(process.cwd(), '../config.toml'),
+    resolve(process.cwd(), '../../config.toml'),
+    '/app/config.toml'
+  ];
+}
+
+function parseStorageClickHouse(raw: string): Omit<FileClickHouseConfig, 'source'> {
+  const parsed: Omit<FileClickHouseConfig, 'source'> = {};
+  let section = '';
+
+  for (const line of raw.split('\n')) {
+    const trimmed = stripTomlComment(line).trim();
+    if (!trimmed) continue;
+
+    const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
+    if (sectionMatch) {
+      section = sectionMatch[1].trim();
+      continue;
+    }
+
+    if (section !== 'storage.clickhouse') continue;
+    const keyValue = trimmed.match(/^([A-Za-z0-9_]+)\s*=\s*(.+)$/);
+    if (!keyValue) continue;
+
+    const [, key, rawValue] = keyValue;
+    const value = parseTomlString(rawValue.trim());
+    if (typeof value !== 'string') continue;
+
+    if (key === 'url') parsed.url = value;
+    if (key === 'database') parsed.database = value;
+    if (key === 'table') parsed.table = value;
+    if (key === 'catalog_table') parsed.catalogTable = value;
+    if (key === 'username') parsed.username = value;
+    if (key === 'password') parsed.password = value;
+    if (key === 'password_env') parsed.passwordEnv = value;
+  }
+
+  return parsed;
+}
+
+function stripTomlComment(line: string): string {
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (char === '#' && !quoted) {
+      return line.slice(0, index);
+    }
+  }
+  return line;
+}
+
+function parseTomlString(value: string): string | null {
+  if (value.startsWith('"') && value.endsWith('"')) {
+    try {
+      return JSON.parse(value) as string;
+    } catch {
+      return value.slice(1, -1);
+    }
+  }
+  return value || null;
+}
+
+function envValue(name: string): string | undefined {
+  return env[name] ?? process.env[name];
 }

@@ -1,8 +1,9 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
 import type { QuoteRate, SpreadPoint, SpreadResponse } from '$lib/types';
 import { fetchInstruments } from '$lib/server/catalog';
-import { ClickHouseError, numericLiteral, queryClickHouse, quoteString, tickTable } from '$lib/server/clickhouse';
+import { ClickHouseError, numericLiteral, queryClickHouse, tickTable } from '$lib/server/clickhouse';
 import { resolveRates } from '$lib/server/rates';
+import { getTickSchema, tickIdentityWhere } from '$lib/server/tick-schema';
 
 const MAX_RANGE_MS = 31 * 24 * 60 * 60 * 1000;
 const TARGET_POINTS = 420;
@@ -60,14 +61,16 @@ export const POST: RequestHandler = async ({ request }) => {
       payload.rates
     );
     const bucketSeconds = parseBucketSeconds(payload.bucketSeconds, fromMs, toMs);
+    const tickSchema = await getTickSchema();
     const points = await fetchSpreadPoints({
-      catalogA,
-      catalogB,
+      instrumentA,
+      instrumentB,
       fromMs,
       toMs,
       bucketSeconds,
       aRate,
-      bRate
+      bRate,
+      tickSchema
     });
 
     const response: SpreadResponse = {
@@ -100,17 +103,20 @@ async function fetchSelectedInstruments(catalogA: string, catalogB: string) {
 }
 
 async function fetchSpreadPoints(input: {
-  catalogA: string;
-  catalogB: string;
+  instrumentA: SpreadResponse['meta']['instrumentA'];
+  instrumentB: SpreadResponse['meta']['instrumentB'];
   fromMs: number;
   toMs: number;
   bucketSeconds: number;
   aRate: number;
   bRate: number;
+  tickSchema: Awaited<ReturnType<typeof getTickSchema>>;
 }): Promise<SpreadPoint[]> {
   const aRate = numericLiteral(input.aRate);
   const bRate = numericLiteral(input.bRate);
   const bucketSeconds = Math.trunc(input.bucketSeconds);
+  const whereA = tickIdentityWhere(input.tickSchema, input.instrumentA, 'a_ticks');
+  const whereB = tickIdentityWhere(input.tickSchema, input.instrumentB, 'b_ticks');
 
   const rows = await queryClickHouse<RawSpreadPoint>(`
 WITH
@@ -132,31 +138,31 @@ SELECT
 FROM
 (
   SELECT
-    toStartOfInterval(recv_time, INTERVAL ${bucketSeconds} SECOND) AS bucket,
-    argMax(bid_price, recv_ts_ns) AS bid_price,
-    argMax(ask_price, recv_ts_ns) AS ask_price,
-    argMax(mid, recv_ts_ns) AS mid
-  FROM ${tickTable()}
-  WHERE catalog_id = ${quoteString(input.catalogA)}
-    AND recv_time >= start_time
-    AND recv_time <= end_time
-    AND bid_price IS NOT NULL
-    AND ask_price IS NOT NULL
+    toStartOfInterval(a_ticks.recv_time, INTERVAL ${bucketSeconds} SECOND) AS bucket,
+    argMax(a_ticks.bid_price, a_ticks.recv_ts_ns) AS bid_price,
+    argMax(a_ticks.ask_price, a_ticks.recv_ts_ns) AS ask_price,
+    argMax(a_ticks.mid, a_ticks.recv_ts_ns) AS mid
+  FROM ${tickTable()} AS a_ticks
+  WHERE ${whereA}
+    AND a_ticks.recv_time >= start_time
+    AND a_ticks.recv_time <= end_time
+    AND a_ticks.bid_price IS NOT NULL
+    AND a_ticks.ask_price IS NOT NULL
   GROUP BY bucket
 ) AS a
 INNER JOIN
 (
   SELECT
-    toStartOfInterval(recv_time, INTERVAL ${bucketSeconds} SECOND) AS bucket,
-    argMax(bid_price, recv_ts_ns) AS bid_price,
-    argMax(ask_price, recv_ts_ns) AS ask_price,
-    argMax(mid, recv_ts_ns) AS mid
-  FROM ${tickTable()}
-  WHERE catalog_id = ${quoteString(input.catalogB)}
-    AND recv_time >= start_time
-    AND recv_time <= end_time
-    AND bid_price IS NOT NULL
-    AND ask_price IS NOT NULL
+    toStartOfInterval(b_ticks.recv_time, INTERVAL ${bucketSeconds} SECOND) AS bucket,
+    argMax(b_ticks.bid_price, b_ticks.recv_ts_ns) AS bid_price,
+    argMax(b_ticks.ask_price, b_ticks.recv_ts_ns) AS ask_price,
+    argMax(b_ticks.mid, b_ticks.recv_ts_ns) AS mid
+  FROM ${tickTable()} AS b_ticks
+  WHERE ${whereB}
+    AND b_ticks.recv_time >= start_time
+    AND b_ticks.recv_time <= end_time
+    AND b_ticks.bid_price IS NOT NULL
+    AND b_ticks.ask_price IS NOT NULL
   GROUP BY bucket
 ) AS b ON a.bucket = b.bucket
 ORDER BY a.bucket ASC

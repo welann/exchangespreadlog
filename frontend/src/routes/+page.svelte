@@ -33,6 +33,7 @@
   let selectedPreset = '15m';
   let customStart = toDateInput(Date.now() - 60 * 60 * 1000);
   let customEnd = toDateInput(Date.now());
+  let rangeAnchorMs = Date.now();
   let rates: QuoteRate[] = structuredClone(defaultRates);
 
   let marketError = '';
@@ -45,7 +46,8 @@
 
   $: currentMarket = markets.find((market) => market.baseAsset === selectedBase);
   $: currentInstruments = currentMarket?.instruments ?? [];
-  $: selectedRange = currentRange(selectedPreset, customStart, customEnd);
+  $: marketLatestMs = latestForInstruments(currentInstruments);
+  $: selectedRange = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
   $: points = spread?.points ?? [];
   $: xBounds = computeXBounds(points, selectedRange);
   $: yBounds = computeYBounds(points);
@@ -71,6 +73,8 @@
       if (markets.length > 0) {
         selectBase(markets[0].baseAsset);
         await loadSpread();
+      } else {
+        marketError = 'No comparable markets were found. Check /api/health for ClickHouse table status.';
       }
     } catch (error) {
       marketError = error instanceof Error ? error.message : 'Failed to load markets';
@@ -85,7 +89,7 @@
       return;
     }
 
-    const range = currentRange(selectedPreset, customStart, customEnd);
+    const range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
     loadingSpread = true;
     queryError = '';
     hoverIndex = -1;
@@ -119,6 +123,12 @@
     const instruments = markets.find((market) => market.baseAsset === baseAsset)?.instruments ?? [];
     selectedA = instruments[0]?.catalogId ?? '';
     selectedB = instruments[1]?.catalogId ?? instruments[0]?.catalogId ?? '';
+    rangeAnchorMs = latestForInstruments(instruments) ?? Date.now();
+    if (selectedPreset !== 'custom') {
+      const range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
+      customStart = toDateInput(range.fromMs);
+      customEnd = toDateInput(range.toMs);
+    }
     selectedIndex = -1;
     hoverIndex = -1;
   }
@@ -194,10 +204,10 @@
       .filter((rate) => rate.from && rate.to && rate.rate);
   }
 
-  function currentRange(presetValue: string, start: string, end: string) {
+  function currentRange(presetValue: string, start: string, end: string, anchorMs: number) {
     const preset = presets.find((item) => item.value === presetValue);
     if (preset && preset.value !== 'custom') {
-      const toMs = Date.now();
+      const toMs = Number.isFinite(anchorMs) ? anchorMs : Date.now();
       return { fromMs: toMs - preset.ms, toMs };
     }
 
@@ -210,7 +220,7 @@
   function handlePreset(value: string) {
     selectedPreset = value;
     if (value !== 'custom') {
-      const range = currentRange(value, customStart, customEnd);
+      const range = currentRange(value, customStart, customEnd, rangeAnchorMs);
       customStart = toDateInput(range.fromMs);
       customEnd = toDateInput(range.toMs);
     }
@@ -338,6 +348,13 @@
     return currentInstruments.find((instrument) => instrument.catalogId === catalogId)?.label ?? '-';
   }
 
+  function latestForInstruments(instruments: Market['instruments']) {
+    const latest = instruments
+      .map((instrument) => instrument.latestRecvMs)
+      .filter((value): value is number => value !== null && Number.isFinite(value));
+    return latest.length > 0 ? Math.max(...latest) : null;
+  }
+
   function formatNumber(value: number | null, digits = 6) {
     if (value === null || !Number.isFinite(value)) return '-';
     if (Math.abs(value) >= 100) return value.toFixed(2);
@@ -367,6 +384,11 @@
     }).format(new Date(ms));
   }
 
+  function formatLatest(ms: number | null) {
+    if (ms === null) return 'no ticks';
+    return `latest ${formatTime(ms)}`;
+  }
+
   function clamp(value: number, min: number, max: number) {
     return Math.min(max, Math.max(min, value));
   }
@@ -392,6 +414,8 @@
         Loading markets
       {:else if points.length > 0}
         {points.length} samples, {spread?.meta.bucketSeconds}s buckets
+      {:else if currentMarket}
+        {formatLatest(marketLatestMs)}
       {:else}
         Waiting for query
       {/if}
@@ -411,7 +435,9 @@
         on:change={(event) => selectBase(selectValue(event))}
       >
         {#each markets as market}
-          <option value={market.baseAsset}>{market.baseAsset}</option>
+          <option value={market.baseAsset}>
+            {market.baseAsset} · {formatLatest(latestForInstruments(market.instruments))}
+          </option>
         {/each}
       </select>
     </label>
