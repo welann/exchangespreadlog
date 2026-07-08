@@ -39,13 +39,23 @@ type BaseSpreadInput = {
   tickSchema: Awaited<ReturnType<typeof getTickSchema>>;
 };
 
-type BookRowsInput = Omit<BaseSpreadInput, 'aRate' | 'bRate' | 'maxStaleMs'> & {
+type BookRowsInput = Omit<BaseSpreadInput, 'aRate' | 'bRate' | 'maxStaleMs'>;
+
+type ExactBookRowsInput = BookRowsInput & {
   maxRows: number;
+};
+
+type SampledBookRowsInput = BookRowsInput & {
+  sampleSeconds: number;
 };
 
 type BookRowsResult = {
   seedRows: RawTickRow[];
   tickRows: RawTickRow[];
+};
+
+type CountRow = {
+  sourceRows: number | string;
 };
 
 type RawTickRow = {
@@ -174,7 +184,7 @@ async function fetchSelectedInstruments(catalogA: string, catalogB: string) {
 }
 
 async function fetchRawSpreadPoints(input: BaseSpreadInput): Promise<SpreadQueryResult> {
-  const { seedRows, tickRows } = await fetchBookRows({
+  const { seedRows, tickRows } = await fetchExactBookRows({
     instrumentA: input.instrumentA,
     instrumentB: input.instrumentB,
     fromMs: input.fromMs,
@@ -192,14 +202,21 @@ async function fetchRawSpreadPoints(input: BaseSpreadInput): Promise<SpreadQuery
 async function fetchBucketedSpreadPoints(
   input: BaseSpreadInput & { bucketSeconds: number }
 ): Promise<SpreadQueryResult> {
-  const { seedRows, tickRows } = await fetchBookRows({
+  const bookInput = {
     instrumentA: input.instrumentA,
     instrumentB: input.instrumentB,
     fromMs: input.fromMs,
     toMs: input.toMs,
-    tickSchema: input.tickSchema,
-    maxRows: MAX_BUCKET_TICK_ROWS
-  });
+    tickSchema: input.tickSchema
+  };
+  const sourceRows = await countBookRows(bookInput);
+  const { seedRows, tickRows } =
+    sourceRows <= MAX_BUCKET_TICK_ROWS
+      ? await fetchExactBookRows({ ...bookInput, maxRows: MAX_BUCKET_TICK_ROWS })
+      : await fetchSampledBookRows({
+          ...bookInput,
+          sampleSeconds: sampleSecondsForBucket(input.bucketSeconds, input.fromMs, input.toMs)
+        });
 
   return {
     points: buildBucketExtremeSpreadPoints(
@@ -212,11 +229,43 @@ async function fetchBucketedSpreadPoints(
       input.bRate,
       input.maxStaleMs
     ),
-    sourceRows: tickRows.length
+    sourceRows
   };
 }
 
-async function fetchBookRows(input: BookRowsInput): Promise<BookRowsResult> {
+async function countBookRows(input: BookRowsInput): Promise<number> {
+  const whereA = tickIdentityWhere(input.tickSchema, input.instrumentA, 'a_ticks');
+  const whereB = tickIdentityWhere(input.tickSchema, input.instrumentB, 'b_ticks');
+  const [row] = await queryClickHouse<CountRow>(`
+WITH
+  fromUnixTimestamp64Milli(${numericLiteral(input.fromMs)}) AS start_time,
+  fromUnixTimestamp64Milli(${numericLiteral(input.toMs)}) AS end_time
+SELECT count() AS sourceRows
+FROM
+(
+  SELECT 1
+  FROM ${tickTable()} AS a_ticks
+  WHERE ${whereA}
+    AND a_ticks.recv_time >= start_time
+    AND a_ticks.recv_time <= end_time
+    AND a_ticks.bid_price IS NOT NULL
+    AND a_ticks.ask_price IS NOT NULL
+  UNION ALL
+  SELECT 1
+  FROM ${tickTable()} AS b_ticks
+  WHERE ${whereB}
+    AND b_ticks.recv_time >= start_time
+    AND b_ticks.recv_time <= end_time
+    AND b_ticks.bid_price IS NOT NULL
+    AND b_ticks.ask_price IS NOT NULL
+)
+FORMAT JSONEachRow
+`);
+
+  return nullableInteger(row?.sourceRows) ?? 0;
+}
+
+async function fetchExactBookRows(input: ExactBookRowsInput): Promise<BookRowsResult> {
   const whereA = tickIdentityWhere(input.tickSchema, input.instrumentA, 'a_ticks');
   const whereB = tickIdentityWhere(input.tickSchema, input.instrumentB, 'b_ticks');
   const seedWhereA = tickIdentityWhere(input.tickSchema, input.instrumentA, 'a_seed');
@@ -333,6 +382,149 @@ FORMAT JSONEachRow
   }
 
   return { seedRows, tickRows };
+}
+
+async function fetchSampledBookRows(input: SampledBookRowsInput): Promise<BookRowsResult> {
+  const seedWhereA = tickIdentityWhere(input.tickSchema, input.instrumentA, 'a_seed');
+  const seedWhereB = tickIdentityWhere(input.tickSchema, input.instrumentB, 'b_seed');
+  const whereA = tickIdentityWhere(input.tickSchema, input.instrumentA, 'a_ticks');
+  const whereB = tickIdentityWhere(input.tickSchema, input.instrumentB, 'b_ticks');
+  const sampleSeconds = Math.max(1, Math.trunc(input.sampleSeconds));
+
+  const [seedRows, tickRows] = await Promise.all([
+    queryClickHouse<RawTickRow>(`
+WITH
+  fromUnixTimestamp64Milli(${numericLiteral(input.fromMs)}) AS start_time
+SELECT *
+FROM
+(
+  SELECT
+    'a' AS side,
+    toUnixTimestamp64Milli(argMax(a_seed.recv_time, a_seed.recv_ts_ns)) AS tsMs,
+    max(a_seed.recv_ts_ns) AS tsNs,
+    argMax(a_seed.bid_price, a_seed.recv_ts_ns) AS bid,
+    argMax(a_seed.ask_price, a_seed.recv_ts_ns) AS ask,
+    argMax(a_seed.bid_size, a_seed.recv_ts_ns) AS bidSize,
+    argMax(a_seed.ask_size, a_seed.recv_ts_ns) AS askSize,
+    argMax(a_seed.bid_size_text, a_seed.recv_ts_ns) AS bidSizeText,
+    argMax(a_seed.ask_size_text, a_seed.recv_ts_ns) AS askSizeText,
+    argMax(a_seed.bid_order_count, a_seed.recv_ts_ns) AS bidOrderCount,
+    argMax(a_seed.ask_order_count, a_seed.recv_ts_ns) AS askOrderCount,
+    argMax(a_seed.mid, a_seed.recv_ts_ns) AS mid
+  FROM ${tickTable()} AS a_seed
+  WHERE ${seedWhereA}
+    AND a_seed.recv_time < start_time
+    AND a_seed.bid_price IS NOT NULL
+    AND a_seed.ask_price IS NOT NULL
+  HAVING count() > 0
+  UNION ALL
+  SELECT
+    'b' AS side,
+    toUnixTimestamp64Milli(argMax(b_seed.recv_time, b_seed.recv_ts_ns)) AS tsMs,
+    max(b_seed.recv_ts_ns) AS tsNs,
+    argMax(b_seed.bid_price, b_seed.recv_ts_ns) AS bid,
+    argMax(b_seed.ask_price, b_seed.recv_ts_ns) AS ask,
+    argMax(b_seed.bid_size, b_seed.recv_ts_ns) AS bidSize,
+    argMax(b_seed.ask_size, b_seed.recv_ts_ns) AS askSize,
+    argMax(b_seed.bid_size_text, b_seed.recv_ts_ns) AS bidSizeText,
+    argMax(b_seed.ask_size_text, b_seed.recv_ts_ns) AS askSizeText,
+    argMax(b_seed.bid_order_count, b_seed.recv_ts_ns) AS bidOrderCount,
+    argMax(b_seed.ask_order_count, b_seed.recv_ts_ns) AS askOrderCount,
+    argMax(b_seed.mid, b_seed.recv_ts_ns) AS mid
+  FROM ${tickTable()} AS b_seed
+  WHERE ${seedWhereB}
+    AND b_seed.recv_time < start_time
+    AND b_seed.bid_price IS NOT NULL
+    AND b_seed.ask_price IS NOT NULL
+  HAVING count() > 0
+)
+FORMAT JSONEachRow
+`),
+    queryClickHouse<RawTickRow>(`
+WITH
+  fromUnixTimestamp64Milli(${numericLiteral(input.fromMs)}) AS start_time,
+  fromUnixTimestamp64Milli(${numericLiteral(input.toMs)}) AS end_time
+SELECT *
+FROM
+(
+  ${sampledCandidateSelect('a', whereA, sampleSeconds)}
+  UNION ALL
+  ${sampledCandidateSelect('b', whereB, sampleSeconds)}
+)
+ORDER BY tsMs ASC, tsNs ASC, side ASC
+FORMAT JSONEachRow
+`)
+  ]);
+
+  return { seedRows, tickRows };
+}
+
+function sampledCandidateSelect(side: 'a' | 'b', where: string, sampleSeconds: number) {
+  const alias = `${side}_ticks`;
+  return `
+  SELECT
+    '${side}' AS side,
+    toUnixTimestamp64Milli(argMax(${alias}.recv_time, ${alias}.recv_ts_ns)) AS tsMs,
+    max(${alias}.recv_ts_ns) AS tsNs,
+    argMax(${alias}.bid_price, ${alias}.recv_ts_ns) AS bid,
+    argMax(${alias}.ask_price, ${alias}.recv_ts_ns) AS ask,
+    argMax(${alias}.bid_size, ${alias}.recv_ts_ns) AS bidSize,
+    argMax(${alias}.ask_size, ${alias}.recv_ts_ns) AS askSize,
+    argMax(${alias}.bid_size_text, ${alias}.recv_ts_ns) AS bidSizeText,
+    argMax(${alias}.ask_size_text, ${alias}.recv_ts_ns) AS askSizeText,
+    argMax(${alias}.bid_order_count, ${alias}.recv_ts_ns) AS bidOrderCount,
+    argMax(${alias}.ask_order_count, ${alias}.recv_ts_ns) AS askOrderCount,
+    argMax(${alias}.mid, ${alias}.recv_ts_ns) AS mid
+  FROM ${tickTable()} AS ${alias}
+  WHERE ${where}
+    AND ${alias}.recv_time >= start_time
+    AND ${alias}.recv_time <= end_time
+    AND ${alias}.bid_price IS NOT NULL
+    AND ${alias}.ask_price IS NOT NULL
+  GROUP BY toStartOfInterval(${alias}.recv_time, INTERVAL ${sampleSeconds} SECOND)
+  UNION ALL
+  SELECT
+    '${side}' AS side,
+    toUnixTimestamp64Milli(argMax(${alias}.recv_time, tuple(${alias}.bid_price, ${alias}.recv_ts_ns))) AS tsMs,
+    argMax(${alias}.recv_ts_ns, tuple(${alias}.bid_price, ${alias}.recv_ts_ns)) AS tsNs,
+    argMax(${alias}.bid_price, tuple(${alias}.bid_price, ${alias}.recv_ts_ns)) AS bid,
+    argMax(${alias}.ask_price, tuple(${alias}.bid_price, ${alias}.recv_ts_ns)) AS ask,
+    argMax(${alias}.bid_size, tuple(${alias}.bid_price, ${alias}.recv_ts_ns)) AS bidSize,
+    argMax(${alias}.ask_size, tuple(${alias}.bid_price, ${alias}.recv_ts_ns)) AS askSize,
+    argMax(${alias}.bid_size_text, tuple(${alias}.bid_price, ${alias}.recv_ts_ns)) AS bidSizeText,
+    argMax(${alias}.ask_size_text, tuple(${alias}.bid_price, ${alias}.recv_ts_ns)) AS askSizeText,
+    argMax(${alias}.bid_order_count, tuple(${alias}.bid_price, ${alias}.recv_ts_ns)) AS bidOrderCount,
+    argMax(${alias}.ask_order_count, tuple(${alias}.bid_price, ${alias}.recv_ts_ns)) AS askOrderCount,
+    argMax(${alias}.mid, tuple(${alias}.bid_price, ${alias}.recv_ts_ns)) AS mid
+  FROM ${tickTable()} AS ${alias}
+  WHERE ${where}
+    AND ${alias}.recv_time >= start_time
+    AND ${alias}.recv_time <= end_time
+    AND ${alias}.bid_price IS NOT NULL
+    AND ${alias}.ask_price IS NOT NULL
+  GROUP BY toStartOfInterval(${alias}.recv_time, INTERVAL ${sampleSeconds} SECOND)
+  UNION ALL
+  SELECT
+    '${side}' AS side,
+    toUnixTimestamp64Milli(argMin(${alias}.recv_time, tuple(${alias}.ask_price, ${alias}.recv_ts_ns))) AS tsMs,
+    argMin(${alias}.recv_ts_ns, tuple(${alias}.ask_price, ${alias}.recv_ts_ns)) AS tsNs,
+    argMin(${alias}.bid_price, tuple(${alias}.ask_price, ${alias}.recv_ts_ns)) AS bid,
+    argMin(${alias}.ask_price, tuple(${alias}.ask_price, ${alias}.recv_ts_ns)) AS ask,
+    argMin(${alias}.bid_size, tuple(${alias}.ask_price, ${alias}.recv_ts_ns)) AS bidSize,
+    argMin(${alias}.ask_size, tuple(${alias}.ask_price, ${alias}.recv_ts_ns)) AS askSize,
+    argMin(${alias}.bid_size_text, tuple(${alias}.ask_price, ${alias}.recv_ts_ns)) AS bidSizeText,
+    argMin(${alias}.ask_size_text, tuple(${alias}.ask_price, ${alias}.recv_ts_ns)) AS askSizeText,
+    argMin(${alias}.bid_order_count, tuple(${alias}.ask_price, ${alias}.recv_ts_ns)) AS bidOrderCount,
+    argMin(${alias}.ask_order_count, tuple(${alias}.ask_price, ${alias}.recv_ts_ns)) AS askOrderCount,
+    argMin(${alias}.mid, tuple(${alias}.ask_price, ${alias}.recv_ts_ns)) AS mid
+  FROM ${tickTable()} AS ${alias}
+  WHERE ${where}
+    AND ${alias}.recv_time >= start_time
+    AND ${alias}.recv_time <= end_time
+    AND ${alias}.bid_price IS NOT NULL
+    AND ${alias}.ask_price IS NOT NULL
+  GROUP BY toStartOfInterval(${alias}.recv_time, INTERVAL ${sampleSeconds} SECOND)
+`;
 }
 
 function buildEventSpreadPoints(
@@ -595,6 +787,12 @@ function parseBucketSeconds(value: unknown, fromMs: number, toMs: number): numbe
 
 function maxStaleMsForBucket(bucketSeconds: number): number {
   return clamp(Math.trunc(bucketSeconds * 1000 * 4), 30_000, 5 * 60_000);
+}
+
+function sampleSecondsForBucket(bucketSeconds: number, fromMs: number, toMs: number): number {
+  const rangeSeconds = Math.max(1, (toMs - fromMs) / 1000);
+  const minForRowCap = Math.ceil((rangeSeconds * 6) / MAX_BUCKET_TICK_ROWS);
+  return clamp(Math.max(Math.trunc(bucketSeconds), minForRowCap), 1, 3600);
 }
 
 function nullableNumber(value: unknown): number | null {
