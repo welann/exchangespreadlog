@@ -59,10 +59,10 @@ impl LighterAdapter {
 
     async fn run_once(
         &self,
-        catalog: &CatalogIndex,
         tx: Sender<MarketEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
+        let catalog = self.bootstrap_catalog().await?;
         for instrument in catalog.instruments() {
             tx.send(MarketEvent::Catalog {
                 instrument: instrument.clone(),
@@ -263,10 +263,9 @@ impl ExchangeAdapter for LighterAdapter {
         tx: Sender<MarketEvent>,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let catalog = self.bootstrap_catalog().await?;
         let backoff = Backoff::new(Duration::from_secs(15), Duration::from_secs(300));
         run_with_reconnect_backoff("lighter", tx, shutdown, backoff, |tx, shutdown| {
-            self.run_once(&catalog, tx, shutdown)
+            self.run_once(tx, shutdown)
         })
         .await
     }

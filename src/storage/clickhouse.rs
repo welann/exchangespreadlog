@@ -96,9 +96,6 @@ ORDER BY (venue_instance_id, instrument_id, catalog_id)"#
     catalog_id String,
     venue_instance_id LowCardinality(String),
     instrument_id String,
-    venue LowCardinality(String),
-    market_id String,
-    market_symbol Nullable(String),
     recv_ts_ns Int64,
     recv_time DateTime64(9, 'UTC') MATERIALIZED fromUnixTimestamp64Nano(recv_ts_ns),
     exchange_ts_ms Nullable(Int64),
@@ -137,9 +134,6 @@ ORDER BY (venue_instance_id, instrument_id, recv_time)"#
             ("catalog_id", "String"),
             ("venue_instance_id", "LowCardinality(String)"),
             ("instrument_id", "String"),
-            ("venue", "LowCardinality(String)"),
-            ("market_id", "String"),
-            ("market_symbol", "Nullable(String)"),
         ];
 
         for (name, ty) in columns {
@@ -314,11 +308,6 @@ struct BboClickHouseRow {
     catalog_id: String,
     venue_instance_id: String,
     instrument_id: String,
-    /// Compatibility fields for older ClickHouse tables created before catalog_id
-    /// became the tick identity. Newer tables skip these unknown JSONEachRow fields.
-    venue: String,
-    market_id: String,
-    market_symbol: Option<String>,
     recv_ts_ns: i64,
     exchange_ts_ms: Option<i64>,
     sequence: Option<String>,
@@ -360,9 +349,6 @@ impl BboClickHouseRow {
             catalog_id: tick.instrument.catalog_id.clone(),
             venue_instance_id: tick.instrument.venue_instance_id.clone(),
             instrument_id: tick.instrument.instrument_id.clone(),
-            venue: tick.instrument.venue_instance_id.clone(),
-            market_id: tick.instrument.instrument_id.clone(),
-            market_symbol: Some(tick.instrument.instrument_id.clone()),
             sequence: tick.sequence.map(|value| value.to_string()),
             source: source_kind_as_str(tick.source).to_string(),
             bid_price,
@@ -522,9 +508,6 @@ mod tests {
         assert_eq!(row.recv_ts_ns, 1_800_000_000_000_000_000);
         assert_eq!(row.venue_instance_id, "hyperliquid");
         assert_eq!(row.instrument_id, "BTC");
-        assert_eq!(row.venue, "hyperliquid");
-        assert_eq!(row.market_id, "BTC");
-        assert_eq!(row.market_symbol.as_deref(), Some("BTC"));
         assert_eq!(row.sequence.as_deref(), Some("42"));
         assert_eq!(row.bid_price_text.as_deref(), Some("100.1"));
         assert_eq!(row.ask_size_text.as_deref(), Some("1.5"));

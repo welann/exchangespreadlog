@@ -48,9 +48,9 @@ impl EtherealBooks {
             return ApplyResult::Tick(build_tick(recv_ts_ns, instrument, book));
         }
 
-        let current_ts_ms = book
-            .timestamp_ms
-            .expect("missing Ethereal book timestamp initializes as snapshot");
+        let Some(current_ts_ms) = book.timestamp_ms else {
+            return ApplyResult::Skipped;
+        };
 
         if update.exchange_ts_ms <= current_ts_ms {
             return ApplyResult::Skipped;

@@ -179,10 +179,10 @@ impl CatalogIndex {
         let mut refs_by_feed_key = HashMap::new();
         for instrument in &instruments {
             let instrument_ref = instrument.instrument_ref();
-            refs_by_feed_key.insert(instrument.instrument_id.clone(), instrument_ref.clone());
-            refs_by_feed_key.insert(instrument.raw_symbol.clone(), instrument_ref.clone());
-            if let Some(feed_symbol) = &instrument.feed_symbol {
-                refs_by_feed_key.insert(feed_symbol.clone(), instrument_ref);
+            for key in catalog_keys(instrument) {
+                refs_by_feed_key
+                    .entry(key)
+                    .or_insert_with(|| instrument_ref.clone());
             }
         }
 
