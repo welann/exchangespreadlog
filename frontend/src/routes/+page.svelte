@@ -118,6 +118,7 @@
   $: points = spread?.points ?? [];
   $: xBounds = computeXBounds(points, selectedRange);
   $: yBounds = computeYBounds(points, displayMode, showAToB, showBToA);
+  $: averageSpreadValue = computeVisibleSpreadAverage(points, displayMode, showAToB, showBToA);
   $: bestPath = displayMode === 'best' ? bestLinePath(points, xBounds, yBounds) : '';
   $: aPath = displayMode === 'both' && showAToB ? linePath(points, 'aToB', xBounds, yBounds) : '';
   $: bPath = displayMode === 'both' && showBToA ? linePath(points, 'bToA', xBounds, yBounds) : '';
@@ -679,7 +680,34 @@
     includeAToB: boolean,
     includeBToA: boolean
   ) {
-    const values = data
+    const values = visibleSpreadValues(data, mode, includeAToB, includeBToA);
+
+    if (values.length === 0) return { min: -1, max: 1 };
+    const min = Math.min(0, ...values);
+    const max = Math.max(0, ...values);
+    if (Math.abs(max - min) < Number.EPSILON) return { min: -1, max: 1 };
+    const padding = Math.max((max - min) * 0.12, 0.0001);
+    return { min: min - padding, max: max + padding };
+  }
+
+  function computeVisibleSpreadAverage(
+    data: SpreadPoint[],
+    mode: DisplayMode,
+    includeAToB: boolean,
+    includeBToA: boolean
+  ) {
+    const values = visibleSpreadValues(data, mode, includeAToB, includeBToA);
+    if (values.length === 0) return null;
+    return values.reduce((sum, value) => sum + value, 0) / values.length;
+  }
+
+  function visibleSpreadValues(
+    data: SpreadPoint[],
+    mode: DisplayMode,
+    includeAToB: boolean,
+    includeBToA: boolean
+  ) {
+    return data
       .flatMap((point) =>
         mode === 'best'
           ? [bestSpreadValue(point)]
@@ -689,13 +717,6 @@
             ]
       )
       .filter((value): value is number => value !== null && Number.isFinite(value));
-
-    if (values.length === 0) return { min: -1, max: 1 };
-    const min = Math.min(0, ...values);
-    const max = Math.max(0, ...values);
-    if (Math.abs(max - min) < Number.EPSILON) return { min: -1, max: 1 };
-    const padding = Math.max((max - min) * 0.12, 0.0001);
-    return { min: min - padding, max: max + padding };
   }
 
   function linePath(
@@ -1525,6 +1546,23 @@
               />
             {/each}
             <line class="zero-line" x1={CHART.left} x2={CHART.width - CHART.right} y1={zeroY} y2={zeroY} />
+            {#if averageSpreadValue !== null}
+              {@const avgY = yScale(averageSpreadValue, yBounds)}
+              <line
+                class="average-line"
+                x1={CHART.left}
+                x2={CHART.width - CHART.right}
+                y1={avgY}
+                y2={avgY}
+              />
+              <text
+                class="average-label"
+                x={CHART.width - CHART.right - 8}
+                y={clamp(avgY - 7, CHART.top + 14, CHART.height - CHART.bottom - 6)}
+              >
+                AVG {formatNumber(averageSpreadValue)}
+              </text>
+            {/if}
             {#if displayMode === 'best'}
               <path class="spread-line best" d={bestPath} />
             {:else}
@@ -2520,6 +2558,24 @@
     stroke: rgba(255, 255, 255, 0.32);
     stroke-dasharray: 8 8;
     stroke-width: 1.1;
+  }
+
+  .average-line {
+    stroke: rgba(233, 235, 239, 0.58);
+    stroke-dasharray: 4 7;
+    stroke-width: 1.2;
+  }
+
+  .average-label {
+    fill: var(--foreground);
+    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 12px;
+    font-weight: 650;
+    paint-order: stroke;
+    stroke: var(--background);
+    stroke-linejoin: round;
+    stroke-width: 4px;
+    text-anchor: end;
   }
 
   .spread-line {
