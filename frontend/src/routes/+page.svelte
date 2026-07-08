@@ -26,6 +26,13 @@
     { from: 'USDT', to: 'USD', rate: '1' }
   ];
 
+  const averageScopeOptions = [
+    { label: '全量', value: 'all' },
+    { label: '最大', value: 'top' },
+    { label: '最小', value: 'bottom' }
+  ] satisfies Array<{ label: string; value: AverageScope }>;
+  const averagePercentPresets = [10, 80];
+
   type QueryState = {
     baseAsset?: string;
     catalogA?: string;
@@ -44,8 +51,21 @@
   };
 
   type DisplayMode = 'best' | 'both';
+  type AverageScope = 'all' | 'top' | 'bottom';
   type SelectionMode = 'market' | 'venue';
   type Instrument = Market['instruments'][number];
+  type AverageLine = {
+    id: 'best' | 'aToB' | 'bToA';
+    label: string;
+    value: number;
+    tone: 'best' | 'a' | 'b';
+    sampleCount: number;
+    totalCount: number;
+  };
+  type PositionedAverageLine = AverageLine & {
+    y: number;
+    labelY: number;
+  };
   type VenueOption = {
     venue: string;
     markets: number;
@@ -92,6 +112,8 @@
   let showAToB = true;
   let showBToA = true;
   let displayMode: DisplayMode = 'both';
+  let averageScope: AverageScope = 'all';
+  let averagePercent = '10';
   let autoRefresh = true;
   let refreshSeconds = 15;
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -118,7 +140,17 @@
   $: points = spread?.points ?? [];
   $: xBounds = computeXBounds(points, selectedRange);
   $: yBounds = computeYBounds(points, displayMode, showAToB, showBToA);
-  $: averageSpreadValue = computeVisibleSpreadAverage(points, displayMode, showAToB, showBToA);
+  $: averagePercentValue = parseAveragePercent(averagePercent);
+  $: averageLines = computeAverageLines(
+    points,
+    displayMode,
+    showAToB,
+    showBToA,
+    averageScope,
+    averagePercentValue
+  );
+  $: positionedAverageLines = positionAverageLines(averageLines, yBounds);
+  $: averageScopeSummary = averageScopeLabel(averageScope, averagePercentValue);
   $: bestPath = displayMode === 'best' ? bestLinePath(points, xBounds, yBounds) : '';
   $: aPath = displayMode === 'both' && showAToB ? linePath(points, 'aToB', xBounds, yBounds) : '';
   $: bPath = displayMode === 'both' && showBToA ? linePath(points, 'bToA', xBounds, yBounds) : '';
@@ -690,15 +722,27 @@
     return { min: min - padding, max: max + padding };
   }
 
-  function computeVisibleSpreadAverage(
+  function computeAverageLines(
     data: SpreadPoint[],
     mode: DisplayMode,
     includeAToB: boolean,
-    includeBToA: boolean
-  ) {
-    const values = visibleSpreadValues(data, mode, includeAToB, includeBToA);
-    if (values.length === 0) return null;
-    return values.reduce((sum, value) => sum + value, 0) / values.length;
+    includeBToA: boolean,
+    scope: AverageScope,
+    percent: number
+  ): AverageLine[] {
+    return averageSeries(data, mode, includeAToB, includeBToA)
+      .map((series) => {
+        const { values: seriesValues, ...line } = series;
+        const values = averageSubset(seriesValues, scope, percent);
+        if (values.length === 0) return null;
+        return {
+          ...line,
+          value: values.reduce((sum, value) => sum + value, 0) / values.length,
+          sampleCount: values.length,
+          totalCount: seriesValues.length
+        };
+      })
+      .filter((line): line is AverageLine => line !== null);
   }
 
   function visibleSpreadValues(
@@ -717,6 +761,87 @@
             ]
       )
       .filter((value): value is number => value !== null && Number.isFinite(value));
+  }
+
+  function averageSeries(
+    data: SpreadPoint[],
+    mode: DisplayMode,
+    includeAToB: boolean,
+    includeBToA: boolean
+  ): Array<Omit<AverageLine, 'value' | 'sampleCount' | 'totalCount'> & { values: number[] }> {
+    if (mode === 'best') {
+      return [
+        {
+          id: 'best',
+          label: 'Best AVG',
+          tone: 'best',
+          values: data
+            .map((point) => bestSpreadValue(point))
+            .filter((value): value is number => value !== null && Number.isFinite(value))
+        }
+      ];
+    }
+
+    const series: Array<Omit<AverageLine, 'value' | 'sampleCount' | 'totalCount'> & { values: number[] }> = [];
+    if (includeAToB) {
+      series.push({
+        id: 'aToB',
+        label: 'A-B AVG',
+        tone: 'a',
+        values: data.map((point) => point.aToB).filter((value): value is number => value !== null && Number.isFinite(value))
+      });
+    }
+    if (includeBToA) {
+      series.push({
+        id: 'bToA',
+        label: 'B-A AVG',
+        tone: 'b',
+        values: data.map((point) => point.bToA).filter((value): value is number => value !== null && Number.isFinite(value))
+      });
+    }
+    return series;
+  }
+
+  function averageSubset(values: number[], scope: AverageScope, percent: number) {
+    if (scope === 'all') return values;
+    const sorted = [...values].sort((left, right) => left - right);
+    const count = clamp(Math.ceil(sorted.length * (percent / 100)), 1, sorted.length);
+    return scope === 'top' ? sorted.slice(-count) : sorted.slice(0, count);
+  }
+
+  function positionAverageLines(
+    lines: AverageLine[],
+    y: { min: number; max: number }
+  ): PositionedAverageLine[] {
+    const minLabelY = CHART.top + 14;
+    const maxLabelY = CHART.height - CHART.bottom - 6;
+    const gap = 15;
+    const positioned = lines
+      .map((line) => {
+        const lineY = yScale(line.value, y);
+        return {
+          ...line,
+          y: lineY,
+          labelY: clamp(lineY - 7, minLabelY, maxLabelY)
+        };
+      })
+      .sort((left, right) => left.labelY - right.labelY);
+
+    for (let index = 1; index < positioned.length; index += 1) {
+      positioned[index].labelY = Math.max(positioned[index].labelY, positioned[index - 1].labelY + gap);
+    }
+
+    for (let index = positioned.length - 1; index >= 0; index -= 1) {
+      positioned[index].labelY = Math.min(positioned[index].labelY, maxLabelY);
+      if (index > 0) {
+        positioned[index - 1].labelY = Math.min(positioned[index - 1].labelY, positioned[index].labelY - gap);
+      }
+    }
+
+    return positioned.map((line) => ({
+      ...line,
+      labelY: clamp(line.labelY, minLabelY, maxLabelY)
+    }));
   }
 
   function linePath(
@@ -877,6 +1002,35 @@
 
   function presetLabel(value: string) {
     return presets.find((preset) => preset.value === value)?.label ?? value;
+  }
+
+  function setAverageScope(scope: AverageScope) {
+    averageScope = scope;
+  }
+
+  function updateAveragePercent(value: string) {
+    averagePercent = value;
+  }
+
+  function setAveragePercentPreset(value: number) {
+    averagePercent = String(value);
+    if (averageScope === 'all') averageScope = 'top';
+  }
+
+  function parseAveragePercent(value: string) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? clamp(parsed, 1, 100) : 10;
+  }
+
+  function averageScopeLabel(scope: AverageScope, percent: number) {
+    if (scope === 'all') return '全量平均';
+    return `${scope === 'top' ? '最大' : '最小'} ${formatPercentNumber(percent)}% 平均`;
+  }
+
+  function formatPercentNumber(value: number) {
+    return new Intl.NumberFormat(undefined, {
+      maximumFractionDigits: Number.isInteger(value) ? 0 : 1
+    }).format(value);
   }
 
   function opportunityForPoint(point: SpreadPoint | null): Opportunity | null {
@@ -1455,6 +1609,17 @@
           </button>
         </div>
 
+        <button
+          class="primary-button"
+          type="button"
+          disabled={spreadBusy || loadingMarkets || currentInstruments.length < 2}
+          on:click={() => void loadSpread({ slideWindow: true })}
+        >
+          {spreadBusy ? '同步中' : '运行查询'}
+        </button>
+      </div>
+
+      <div class="chart-options">
         {#if displayMode === 'both'}
           <div class="series-pills" aria-label="双边方向">
             <button type="button" class:active={showAToB} aria-pressed={showAToB} on:click={() => void toggleSeriesAndQuery('aToB')}>
@@ -1466,14 +1631,47 @@
           </div>
         {/if}
 
-        <button
-          class="primary-button"
-          type="button"
-          disabled={spreadBusy || loadingMarkets || currentInstruments.length < 2}
-          on:click={() => void loadSpread({ slideWindow: true })}
-        >
-          {spreadBusy ? '同步中' : '运行查询'}
-        </button>
+        <div class="average-control" aria-label="平均线口径">
+          <span>平均线</span>
+          <div class="segmented compact" aria-label="平均线取样范围">
+            {#each averageScopeOptions as option}
+              <button
+                type="button"
+                class:active={averageScope === option.value}
+                aria-pressed={averageScope === option.value}
+                on:click={() => setAverageScope(option.value)}
+              >
+                {option.label}
+              </button>
+            {/each}
+          </div>
+          <label class:disabled={averageScope === 'all'}>
+            <input
+              type="number"
+              min="1"
+              max="100"
+              step="1"
+              inputmode="decimal"
+              aria-label="平均线百分比"
+              value={averagePercent}
+              disabled={averageScope === 'all'}
+              on:input={(event) => updateAveragePercent(inputValue(event))}
+            />
+            <span>%</span>
+          </label>
+          <div class="percent-presets" aria-label="平均线百分比快捷值">
+            {#each averagePercentPresets as percent}
+              <button
+                type="button"
+                class:active={averageScope !== 'all' && Math.abs(averagePercentValue - percent) < 0.001}
+                aria-pressed={averageScope !== 'all' && Math.abs(averagePercentValue - percent) < 0.001}
+                on:click={() => setAveragePercentPreset(percent)}
+              >
+                {percent}%
+              </button>
+            {/each}
+          </div>
+        </div>
       </div>
 
       {#if selectedPreset === 'custom'}
@@ -1502,6 +1700,10 @@
           <div>
             <span>采样</span>
             <strong>{sampleLabel(spread?.meta)}</strong>
+          </div>
+          <div>
+            <span>平均线</span>
+            <strong>{averageScopeSummary}</strong>
           </div>
         </div>
 
@@ -1546,23 +1748,22 @@
               />
             {/each}
             <line class="zero-line" x1={CHART.left} x2={CHART.width - CHART.right} y1={zeroY} y2={zeroY} />
-            {#if averageSpreadValue !== null}
-              {@const avgY = yScale(averageSpreadValue, yBounds)}
+            {#each positionedAverageLines as line}
               <line
-                class="average-line"
+                class={`average-line ${line.tone}`}
                 x1={CHART.left}
                 x2={CHART.width - CHART.right}
-                y1={avgY}
-                y2={avgY}
+                y1={line.y}
+                y2={line.y}
               />
               <text
-                class="average-label"
+                class={`average-label ${line.tone}`}
                 x={CHART.width - CHART.right - 8}
-                y={clamp(avgY - 7, CHART.top + 14, CHART.height - CHART.bottom - 6)}
+                y={line.labelY}
               >
-                AVG {formatNumber(averageSpreadValue)}
+                {line.label} {formatNumber(line.value)}
               </text>
-            {/if}
+            {/each}
             {#if displayMode === 'best'}
               <path class="spread-line best" d={bestPath} />
             {:else}
@@ -2390,6 +2591,7 @@
 
   .pair-header,
   .control-strip,
+  .chart-options,
   .custom-range,
   .chart-shell,
   .tape-panel,
@@ -2487,6 +2689,62 @@
     margin-left: auto;
   }
 
+  .chart-options {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    background: rgba(17, 19, 22, 0.32);
+  }
+
+  .average-control {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+  }
+
+  .average-control > span {
+    color: var(--muted-foreground);
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .segmented.compact button,
+  .percent-presets button {
+    min-height: 32px;
+    padding-inline: 9px;
+    font-size: 0.78rem;
+  }
+
+  .average-control label {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--muted-foreground);
+    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 0.78rem;
+  }
+
+  .average-control label.disabled {
+    opacity: 0.5;
+  }
+
+  .average-control input {
+    width: 72px;
+    min-height: 32px;
+    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    text-align: right;
+  }
+
+  .percent-presets {
+    display: inline-flex;
+    gap: 4px;
+  }
+
   .custom-range {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 260px));
@@ -2566,6 +2824,14 @@
     stroke-width: 1.2;
   }
 
+  .average-line.a {
+    stroke: var(--primary);
+  }
+
+  .average-line.b {
+    stroke: var(--warning);
+  }
+
   .average-label {
     fill: var(--foreground);
     font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
@@ -2576,6 +2842,14 @@
     stroke-linejoin: round;
     stroke-width: 4px;
     text-anchor: end;
+  }
+
+  .average-label.a {
+    fill: var(--primary);
+  }
+
+  .average-label.b {
+    fill: var(--warning);
   }
 
   .spread-line {
@@ -2870,8 +3144,10 @@
     }
 
     .control-strip,
+    .chart-options,
     .segmented,
-    .series-pills {
+    .series-pills,
+    .average-control {
       width: 100%;
     }
 
@@ -2885,6 +3161,26 @@
     .segmented button,
     .series-pills button {
       white-space: nowrap;
+    }
+
+    .chart-options {
+      align-items: stretch;
+    }
+
+    .average-control {
+      margin-left: 0;
+    }
+
+    .average-control > span {
+      width: 100%;
+    }
+
+    .percent-presets {
+      flex: 1;
+    }
+
+    .percent-presets button {
+      flex: 1;
     }
 
     .custom-range,
