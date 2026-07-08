@@ -7,7 +7,6 @@ import { getTickSchema, tickIdentityWhere } from '$lib/server/tick-schema';
 
 const MAX_RANGE_MS = 31 * 24 * 60 * 60 * 1000;
 const TARGET_POINTS = 420;
-const RAW_AUTO_MAX_RANGE_MS = 60 * 60 * 1000;
 const RAW_EXPLICIT_MAX_RANGE_MS = 6 * 60 * 60 * 1000;
 const MAX_RAW_TICK_ROWS = 100_000;
 
@@ -526,7 +525,7 @@ function resolveGranularity(value: unknown, fromMs: number, toMs: number): Sprea
     return 'raw';
   }
   if (value === 'bucket') return 'bucket';
-  return rangeMs <= RAW_AUTO_MAX_RANGE_MS ? 'raw' : 'bucket';
+  return 'bucket';
 }
 
 function parseBucketSeconds(value: unknown, fromMs: number, toMs: number): number {

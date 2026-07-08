@@ -199,7 +199,7 @@
           catalogB,
           fromMs: range.fromMs,
           toMs: range.toMs,
-          precision: precisionForRange(range),
+          ...spreadQueryOptions(range),
           rates: cleanRates(rates)
         })
       });
@@ -408,8 +408,11 @@
       .filter((rate) => rate.from && rate.to && rate.rate);
   }
 
-  function precisionForRange(range: { fromMs: number; toMs: number }) {
-    return range.toMs - range.fromMs <= 60 * 60 * 1000 ? 'raw' : 'bucket';
+  function spreadQueryOptions(range: { fromMs: number; toMs: number }) {
+    if (range.toMs - range.fromMs <= 60 * 60 * 1000) {
+      return { precision: 'bucket', bucketSeconds: 15 };
+    }
+    return { precision: 'bucket' };
   }
 
   function currentRange(presetValue: string, start: string, end: string, anchorMs: number) {
@@ -1316,7 +1319,7 @@
           {#if spread?.meta.granularity === 'raw'}
             当前短窗口使用数据库逐 tick BBO 更新计算价差；每个样本来自 A/B 任一侧的新盘口，并与另一侧最新盘口对齐。
           {:else}
-            当前长窗口使用 bucket 聚合后的最新盘口计算价差；缩短到 1H 可切换为逐 tick 采样。
+            当前使用 bucket 聚合后的最新盘口计算价差；1H 与 Custom 不超过 1H 固定为 15s bucket，长窗口会自动放大粒度。
           {/if}
         </p>
       </section>
