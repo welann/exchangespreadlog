@@ -1576,37 +1576,43 @@
         </div>
       </div>
 
-      <div class="control-strip">
-        <div class="segmented" aria-label="时间范围">
-          {#each presets as preset}
-            <button
-              type="button"
-              class:active={selectedPreset === preset.value}
-              aria-pressed={selectedPreset === preset.value}
-              on:click={() => void handlePresetAndQuery(preset.value)}
-            >
-              {preset.label}
-            </button>
-          {/each}
+      <div class="control-strip trading-toolbar query-toolbar">
+        <div class="toolbar-cluster range-cluster">
+          <span class="toolbar-label">时间</span>
+          <div class="segmented preset-tabs" aria-label="时间范围">
+            {#each presets as preset}
+              <button
+                type="button"
+                class:active={selectedPreset === preset.value}
+                aria-pressed={selectedPreset === preset.value}
+                on:click={() => void handlePresetAndQuery(preset.value)}
+              >
+                {preset.label}
+              </button>
+            {/each}
+          </div>
         </div>
 
-        <div class="segmented display-mode" aria-label="曲线显示方式">
-          <button
-            type="button"
-            class:active={displayMode === 'best'}
-            aria-pressed={displayMode === 'best'}
-            on:click={() => void setDisplayModeAndQuery('best')}
-          >
-            单边最大价差
-          </button>
-          <button
-            type="button"
-            class:active={displayMode === 'both'}
-            aria-pressed={displayMode === 'both'}
-            on:click={() => void setDisplayModeAndQuery('both')}
-          >
-            双边价差
-          </button>
+        <div class="toolbar-cluster mode-cluster">
+          <span class="toolbar-label">视图</span>
+          <div class="segmented display-mode" aria-label="曲线显示方式">
+            <button
+              type="button"
+              class:active={displayMode === 'best'}
+              aria-pressed={displayMode === 'best'}
+              on:click={() => void setDisplayModeAndQuery('best')}
+            >
+              单边最大
+            </button>
+            <button
+              type="button"
+              class:active={displayMode === 'both'}
+              aria-pressed={displayMode === 'both'}
+              on:click={() => void setDisplayModeAndQuery('both')}
+            >
+              双边价差
+            </button>
+          </div>
         </div>
 
         <button
@@ -1615,24 +1621,27 @@
           disabled={spreadBusy || loadingMarkets || currentInstruments.length < 2}
           on:click={() => void loadSpread({ slideWindow: true })}
         >
-          {spreadBusy ? '同步中' : '运行查询'}
+          {spreadBusy ? '同步中' : '查询'}
         </button>
       </div>
 
-      <div class="chart-options">
+      <div class="chart-options trading-toolbar tools-toolbar">
         {#if displayMode === 'both'}
-          <div class="series-pills" aria-label="双边方向">
-            <button type="button" class:active={showAToB} aria-pressed={showAToB} on:click={() => void toggleSeriesAndQuery('aToB')}>
-              A bid - B ask
-            </button>
-            <button type="button" class:active={showBToA} aria-pressed={showBToA} on:click={() => void toggleSeriesAndQuery('bToA')}>
-              B bid - A ask
-            </button>
+          <div class="toolbar-cluster series-cluster">
+            <span class="toolbar-label">方向</span>
+            <div class="series-pills" aria-label="双边方向">
+              <button type="button" class:active={showAToB} aria-pressed={showAToB} on:click={() => void toggleSeriesAndQuery('aToB')}>
+                A bid - B ask
+              </button>
+              <button type="button" class:active={showBToA} aria-pressed={showBToA} on:click={() => void toggleSeriesAndQuery('bToA')}>
+                B bid - A ask
+              </button>
+            </div>
           </div>
         {/if}
 
-        <div class="average-control" aria-label="平均线口径">
-          <span>平均线</span>
+        <div class="toolbar-cluster average-control" aria-label="平均线口径">
+          <span class="toolbar-label">平均线</span>
           <div class="segmented compact" aria-label="平均线取样范围">
             {#each averageScopeOptions as option}
               <button
@@ -1645,7 +1654,7 @@
               </button>
             {/each}
           </div>
-          <label class:disabled={averageScope === 'all'}>
+          <label class="percent-input" class:disabled={averageScope === 'all'}>
             <input
               type="number"
               min="1"
@@ -2657,9 +2666,55 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .control-strip {
-    flex-wrap: wrap;
+  .trading-toolbar {
+    display: flex;
+    align-items: center;
     gap: 10px;
+  }
+
+  .control-strip {
+    justify-content: space-between;
+    padding-block: 12px;
+  }
+
+  .query-toolbar {
+    display: grid;
+    grid-template-columns: minmax(320px, 1fr) auto auto;
+  }
+
+  .toolbar-cluster {
+    display: inline-flex;
+    min-width: 0;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .toolbar-label {
+    flex: 0 0 auto;
+    color: var(--muted-foreground);
+    font-size: 0.72rem;
+    font-weight: 750;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .range-cluster {
+    min-width: 0;
+  }
+
+  .range-cluster .preset-tabs {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .mode-cluster {
+    justify-content: flex-end;
+  }
+
+  .query-toolbar .primary-button {
+    min-height: 34px;
+    min-width: 78px;
+    justify-self: end;
   }
 
   .segmented,
@@ -2673,11 +2728,15 @@
 
   .segmented button,
   .series-pills button {
-    min-height: 36px;
+    min-height: 34px;
     border: 0;
     border-right: 1px solid var(--border);
     border-radius: 0;
     background: transparent;
+    padding-inline: 12px;
+    font-size: 0.86rem;
+    line-height: 1;
+    white-space: nowrap;
   }
 
   .segmented button:last-child,
@@ -2685,64 +2744,77 @@
     border-right: 0;
   }
 
-  .display-mode {
-    margin-left: auto;
-  }
-
   .chart-options {
-    display: flex;
-    align-items: center;
     justify-content: space-between;
-    gap: 12px;
+    min-height: 52px;
+    padding-block: 10px;
     background: rgba(17, 19, 22, 0.32);
   }
 
   .average-control {
-    display: flex;
     flex-wrap: wrap;
-    align-items: center;
     gap: 8px;
     margin-left: auto;
   }
 
-  .average-control > span {
-    color: var(--muted-foreground);
-    font-size: 0.78rem;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-  }
-
   .segmented.compact button,
   .percent-presets button {
-    min-height: 32px;
-    padding-inline: 9px;
-    font-size: 0.78rem;
+    min-height: 30px;
+    padding-inline: 8px;
+    font-size: 0.76rem;
   }
 
-  .average-control label {
+  .percent-input {
     display: inline-flex;
     align-items: center;
     gap: 5px;
+    min-height: 30px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0 8px;
     color: var(--muted-foreground);
+    background: var(--card);
     font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
     font-size: 0.78rem;
   }
 
-  .average-control label.disabled {
+  .percent-input.disabled {
     opacity: 0.5;
   }
 
-  .average-control input {
-    width: 72px;
-    min-height: 32px;
+  .percent-input input {
+    width: 52px;
+    min-height: 0;
+    border: 0;
+    padding: 0;
+    color: var(--foreground);
+    background: transparent;
     font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
     text-align: right;
   }
 
+  .percent-input input:disabled {
+    color: var(--muted-foreground);
+  }
+
   .percent-presets {
     display: inline-flex;
-    gap: 4px;
+    overflow: hidden;
+    gap: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--card);
+  }
+
+  .percent-presets button {
+    border: 0;
+    border-right: 1px solid var(--border);
+    border-radius: 0;
+    background: transparent;
+  }
+
+  .percent-presets button:last-child {
+    border-right: 0;
   }
 
   .custom-range {
@@ -3121,7 +3193,20 @@
       grid-template-columns: repeat(3, minmax(0, 1fr));
     }
 
-    .display-mode {
+    .query-toolbar {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .mode-cluster {
+      justify-content: flex-start;
+    }
+
+    .chart-options {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
+    .average-control {
       margin-left: 0;
     }
   }
@@ -3145,9 +3230,23 @@
 
     .control-strip,
     .chart-options,
+    .toolbar-cluster,
     .segmented,
     .series-pills,
     .average-control {
+      width: 100%;
+    }
+
+    .query-toolbar {
+      grid-template-columns: 1fr;
+    }
+
+    .toolbar-cluster {
+      flex-wrap: wrap;
+      align-items: stretch;
+    }
+
+    .toolbar-label {
       width: 100%;
     }
 
@@ -3165,14 +3264,6 @@
 
     .chart-options {
       align-items: stretch;
-    }
-
-    .average-control {
-      margin-left: 0;
-    }
-
-    .average-control > span {
-      width: 100%;
     }
 
     .percent-presets {
