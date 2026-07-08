@@ -44,6 +44,21 @@
   };
 
   type DisplayMode = 'best' | 'both';
+  type SelectionMode = 'market' | 'venue';
+  type Instrument = Market['instruments'][number];
+  type VenueOption = {
+    venue: string;
+    markets: number;
+    instruments: number;
+    tickCount: number;
+  };
+  type VenuePairMarket = {
+    market: Market;
+    instrumentA: Instrument;
+    instrumentB: Instrument;
+    quoteLabel: string;
+    tickCount: number;
+  };
   type LoadSpreadOptions = {
     preservePoint?: boolean;
     silent?: boolean;
@@ -65,6 +80,9 @@
   let selectedBase = '';
   let selectedA = '';
   let selectedB = '';
+  let selectionMode: SelectionMode = 'market';
+  let selectedVenueA = '';
+  let selectedVenueB = '';
   let selectedPreset = '24h';
   let customStart = toDateInput(Date.now() - 60 * 60 * 1000);
   let customEnd = toDateInput(Date.now());
@@ -90,6 +108,8 @@
 
   $: currentMarket = markets.find((market) => market.baseAsset === selectedBase);
   $: currentInstruments = currentMarket?.instruments ?? [];
+  $: venueOptions = buildVenueOptions(markets);
+  $: venuePairMarkets = commonMarketsForVenues(markets, selectedVenueA, selectedVenueB);
   $: totalTicks = tickCountForInstruments(currentInstruments);
   $: selectedInstrumentA = currentInstruments.find((instrument) => instrument.catalogId === selectedA) ?? null;
   $: selectedInstrumentB = currentInstruments.find((instrument) => instrument.catalogId === selectedB) ?? null;
@@ -148,6 +168,7 @@
       markets = body.markets ?? [];
       if (markets.length > 0) {
         applySelectionState(state);
+        syncVenueSelectionFromSelectedLegs();
         await loadSpread({ slideWindow: true });
       } else {
         marketError = 'No comparable markets were found. Check /api/health for ClickHouse table status.';
@@ -226,6 +247,7 @@
 
   async function selectBase(baseAsset: string) {
     applySelectionState({ ...captureQueryState(), baseAsset });
+    syncVenueSelectionFromSelectedLegs();
     await loadSpreadWhenReady({ slideWindow: true });
   }
 
@@ -236,6 +258,7 @@
     }
     selectedIndex = -1;
     hoverIndex = -1;
+    syncVenueSelectionFromSelectedLegs();
   }
 
   function selectLegB(catalogId: string) {
@@ -245,6 +268,7 @@
     }
     selectedIndex = -1;
     hoverIndex = -1;
+    syncVenueSelectionFromSelectedLegs();
   }
 
   function swapLegs() {
@@ -254,6 +278,7 @@
     selectedB = previousA;
     selectedIndex = -1;
     hoverIndex = -1;
+    syncVenueSelectionFromSelectedLegs();
   }
 
   async function selectLegAAndQuery(catalogId: string) {
@@ -268,6 +293,45 @@
 
   async function swapLegsAndQuery() {
     swapLegs();
+    await loadSpreadWhenReady({ slideWindow: true });
+  }
+
+  function setSelectionMode(mode: SelectionMode) {
+    selectionMode = mode;
+    if (mode === 'venue') {
+      syncVenueSelectionFromSelectedLegs();
+    }
+  }
+
+  function selectVenueA(venue: string) {
+    selectedVenueA = venue;
+    if (selectedVenueA === selectedVenueB) {
+      selectedVenueB = venueOptions.find((option) => option.venue !== venue)?.venue ?? '';
+    }
+  }
+
+  function selectVenueB(venue: string) {
+    selectedVenueB = venue;
+    if (selectedVenueA === selectedVenueB) {
+      selectedVenueA = venueOptions.find((option) => option.venue !== venue)?.venue ?? '';
+    }
+  }
+
+  function swapVenues() {
+    if (!selectedVenueA || !selectedVenueB) return;
+    const previousA = selectedVenueA;
+    selectedVenueA = selectedVenueB;
+    selectedVenueB = previousA;
+  }
+
+  async function openVenuePairMarket(option: VenuePairMarket) {
+    selectedBase = option.market.baseAsset;
+    selectedA = option.instrumentA.catalogId;
+    selectedB = option.instrumentB.catalogId;
+    selectedIndex = -1;
+    hoverIndex = -1;
+    rangeAnchorMs = latestForInstruments(option.market.instruments) ?? Date.now();
+    syncVenueSelectionFromSelectedLegs();
     await loadSpreadWhenReady({ slideWindow: true });
   }
 
@@ -692,6 +756,84 @@
     return currentInstruments.find((instrument) => instrument.catalogId === catalogId)?.label ?? '-';
   }
 
+  function buildVenueOptions(inputMarkets: Market[]): VenueOption[] {
+    const byVenue = new Map<string, { markets: Set<string>; instruments: number; tickCount: number }>();
+    inputMarkets.forEach((market) => {
+      market.instruments.forEach((instrument) => {
+        const venue = instrument.venueInstanceId || 'unknown';
+        const current = byVenue.get(venue) ?? { markets: new Set<string>(), instruments: 0, tickCount: 0 };
+        current.markets.add(market.baseAsset);
+        current.instruments += 1;
+        current.tickCount += instrument.tickCount;
+        byVenue.set(venue, current);
+      });
+    });
+
+    return [...byVenue.entries()]
+      .map(([venue, stats]) => ({
+        venue,
+        markets: stats.markets.size,
+        instruments: stats.instruments,
+        tickCount: stats.tickCount
+      }))
+      .sort((left, right) => left.venue.localeCompare(right.venue));
+  }
+
+  function commonMarketsForVenues(inputMarkets: Market[], venueA: string, venueB: string): VenuePairMarket[] {
+    if (!venueA || !venueB || venueA === venueB) return [];
+
+    return inputMarkets
+      .map((market) => {
+        const instrumentA = bestInstrumentForVenue(market.instruments, venueA);
+        const instrumentB = bestInstrumentForVenue(market.instruments, venueB);
+        if (!instrumentA || !instrumentB) return null;
+        return {
+          market,
+          instrumentA,
+          instrumentB,
+          quoteLabel: quoteLabelForInstruments([instrumentA, instrumentB]),
+          tickCount: instrumentA.tickCount + instrumentB.tickCount
+        };
+      })
+      .filter((value): value is VenuePairMarket => value !== null)
+      .sort((left, right) => left.market.baseAsset.localeCompare(right.market.baseAsset));
+  }
+
+  function bestInstrumentForVenue(instruments: Instrument[], venue: string): Instrument | null {
+    return (
+      instruments
+        .filter((instrument) => instrument.venueInstanceId === venue)
+        .sort(
+          (left, right) =>
+            right.tickCount - left.tickCount ||
+            (right.latestRecvMs ?? 0) - (left.latestRecvMs ?? 0) ||
+            left.label.localeCompare(right.label)
+        )[0] ?? null
+    );
+  }
+
+  function quoteLabelForInstruments(instruments: Instrument[]) {
+    const quotes = [...new Set(instruments.map((instrument) => instrument.quoteAsset).filter(Boolean))];
+    return quotes.length > 0 ? quotes.join('+') : 'QUOTE';
+  }
+
+  function syncVenueSelectionFromSelectedLegs() {
+    const options = buildVenueOptions(markets);
+    const instruments = markets.find((market) => market.baseAsset === selectedBase)?.instruments ?? [];
+    const instrumentA = instruments.find((instrument) => instrument.catalogId === selectedA) ?? null;
+    const instrumentB = instruments.find((instrument) => instrument.catalogId === selectedB) ?? null;
+
+    if (instrumentA) selectedVenueA = instrumentA.venueInstanceId;
+    if (instrumentB) selectedVenueB = instrumentB.venueInstanceId;
+
+    if (!options.some((option) => option.venue === selectedVenueA)) {
+      selectedVenueA = options[0]?.venue ?? '';
+    }
+    if (!options.some((option) => option.venue === selectedVenueB) || selectedVenueA === selectedVenueB) {
+      selectedVenueB = options.find((option) => option.venue !== selectedVenueA)?.venue ?? '';
+    }
+  }
+
   function latestForInstruments(instruments: Market['instruments']) {
     const latest = instruments
       .map((instrument) => instrument.latestRecvMs)
@@ -976,101 +1118,209 @@
 
   <div class="desk-layout">
     <aside class="market-sidebar" aria-label="监控交易对">
-      <section class="sidebar-block">
+      <section class="sidebar-block mode-block">
         <div class="sidebar-heading">
-          <span>监控交易对</span>
-          <strong>{formatInteger(markets.length)}</strong>
+          <span>选择方式</span>
+          <strong>{selectionMode === 'market' ? '交易对' : '交易所'}</strong>
         </div>
-
-        <div class="market-list">
-          {#if loadingMarkets && markets.length === 0}
-            <p class="sidebar-empty">正在读取 ClickHouse 市场目录。</p>
-          {:else if markets.length === 0}
-            <p class="sidebar-empty">没有可比较的交易对。</p>
-          {:else}
-            {#each markets as market}
-              <button
-                type="button"
-                class:active={market.baseAsset === selectedBase}
-                aria-pressed={market.baseAsset === selectedBase}
-                on:click={() => void selectBase(market.baseAsset)}
-              >
-                <span class="market-main">
-                  <strong>{marketPairLabel(market)}</strong>
-                  <em>{marketVenueLabel(market)}</em>
-                </span>
-                <span class="market-meta">
-                  <span>{formatInteger(market.instruments.length)} venues</span>
-                  <span>{formatInteger(tickCountForInstruments(market.instruments))} ticks</span>
-                </span>
-              </button>
-            {/each}
-          {/if}
+        <div class="mode-switch" aria-label="选择列表维度">
+          <button
+            type="button"
+            class:active={selectionMode === 'market'}
+            aria-pressed={selectionMode === 'market'}
+            on:click={() => setSelectionMode('market')}
+          >
+            按交易对
+          </button>
+          <button
+            type="button"
+            class:active={selectionMode === 'venue'}
+            aria-pressed={selectionMode === 'venue'}
+            on:click={() => setSelectionMode('venue')}
+          >
+            按交易所
+          </button>
         </div>
       </section>
 
-      <details class="sidebar-details" open>
-        <summary>交易所组合</summary>
-        <div class="leg-picker">
-          <div class="selected-legs" aria-label="当前 A/B 组合">
-            <div>
-              <span>A</span>
-              <strong>{selectedLabel(selectedA)}</strong>
-            </div>
-            <button
-              class="swap-button"
-              type="button"
-              disabled={!selectedA || !selectedB || selectedA === selectedB}
-              on:click={() => void swapLegsAndQuery()}
-            >
-              交换
-            </button>
-            <div>
-              <span>B</span>
-              <strong>{selectedLabel(selectedB)}</strong>
-            </div>
+      {#if selectionMode === 'market'}
+        <section class="sidebar-block">
+          <div class="sidebar-heading">
+            <span>监控交易对</span>
+            <strong>{formatInteger(markets.length)}</strong>
           </div>
 
-          <div class="leg-choice-list" aria-label="选择交易所腿">
-            {#if currentInstruments.length < 2}
-              <p class="sidebar-empty">当前交易对没有足够的交易所可比较。</p>
+          <div class="market-list">
+            {#if loadingMarkets && markets.length === 0}
+              <p class="sidebar-empty">正在读取 ClickHouse 市场目录。</p>
+            {:else if markets.length === 0}
+              <p class="sidebar-empty">没有可比较的交易对。</p>
             {:else}
-              {#each currentInstruments as instrument}
-                <article
-                  class:selected={instrument.catalogId === selectedA || instrument.catalogId === selectedB}
-                  class:a-selected={instrument.catalogId === selectedA}
-                  class:b-selected={instrument.catalogId === selectedB}
+              {#each markets as market}
+                <button
+                  type="button"
+                  class:active={market.baseAsset === selectedBase}
+                  aria-pressed={market.baseAsset === selectedBase}
+                  on:click={() => void selectBase(market.baseAsset)}
                 >
-                  <div class="leg-choice-main">
-                    <strong>{instrument.venueInstanceId}</strong>
-                    <span>{instrument.rawSymbol}/{instrument.quoteAsset}</span>
-                  </div>
-                  <div class="leg-choice-actions">
-                    <button
-                      type="button"
-                      class:active={instrument.catalogId === selectedA}
-                      disabled={instrument.catalogId === selectedB}
-                      aria-pressed={instrument.catalogId === selectedA}
-                      on:click={() => void selectLegAAndQuery(instrument.catalogId)}
-                    >
-                      A
-                    </button>
-                    <button
-                      type="button"
-                      class:active={instrument.catalogId === selectedB}
-                      disabled={instrument.catalogId === selectedA}
-                      aria-pressed={instrument.catalogId === selectedB}
-                      on:click={() => void selectLegBAndQuery(instrument.catalogId)}
-                    >
-                      B
-                    </button>
-                  </div>
-                </article>
+                  <span class="market-main">
+                    <strong>{marketPairLabel(market)}</strong>
+                    <em>{marketVenueLabel(market)}</em>
+                  </span>
+                  <span class="market-meta">
+                    <span>{formatInteger(market.instruments.length)} venues</span>
+                    <span>{formatInteger(tickCountForInstruments(market.instruments))} ticks</span>
+                  </span>
+                </button>
               {/each}
             {/if}
           </div>
-        </div>
-      </details>
+        </section>
+
+        <details class="sidebar-details" open>
+          <summary>交易所组合</summary>
+          <div class="leg-picker">
+            <div class="selected-legs" aria-label="当前 A/B 组合">
+              <div>
+                <span>A</span>
+                <strong>{selectedLabel(selectedA)}</strong>
+              </div>
+              <button
+                class="swap-button"
+                type="button"
+                disabled={!selectedA || !selectedB || selectedA === selectedB}
+                on:click={() => void swapLegsAndQuery()}
+              >
+                交换
+              </button>
+              <div>
+                <span>B</span>
+                <strong>{selectedLabel(selectedB)}</strong>
+              </div>
+            </div>
+
+            <div class="leg-choice-list" aria-label="选择交易所腿">
+              {#if currentInstruments.length < 2}
+                <p class="sidebar-empty">当前交易对没有足够的交易所可比较。</p>
+              {:else}
+                {#each currentInstruments as instrument}
+                  <article
+                    class:selected={instrument.catalogId === selectedA || instrument.catalogId === selectedB}
+                    class:a-selected={instrument.catalogId === selectedA}
+                    class:b-selected={instrument.catalogId === selectedB}
+                  >
+                    <div class="leg-choice-main">
+                      <strong>{instrument.venueInstanceId}</strong>
+                      <span>{instrument.rawSymbol}/{instrument.quoteAsset}</span>
+                    </div>
+                    <div class="leg-choice-actions">
+                      <button
+                        type="button"
+                        class:active={instrument.catalogId === selectedA}
+                        disabled={instrument.catalogId === selectedB}
+                        aria-pressed={instrument.catalogId === selectedA}
+                        on:click={() => void selectLegAAndQuery(instrument.catalogId)}
+                      >
+                        A
+                      </button>
+                      <button
+                        type="button"
+                        class:active={instrument.catalogId === selectedB}
+                        disabled={instrument.catalogId === selectedA}
+                        aria-pressed={instrument.catalogId === selectedB}
+                        on:click={() => void selectLegBAndQuery(instrument.catalogId)}
+                      >
+                        B
+                      </button>
+                    </div>
+                  </article>
+                {/each}
+              {/if}
+            </div>
+          </div>
+        </details>
+      {:else}
+        <section class="sidebar-block">
+          <div class="sidebar-heading">
+            <span>交易所对</span>
+            <strong>{formatInteger(venueOptions.length)}</strong>
+          </div>
+
+          <div class="venue-selector">
+            <label>
+              <span>Exchange A</span>
+              <select
+                name="venue-a"
+                value={selectedVenueA}
+                disabled={venueOptions.length < 2}
+                on:change={(event) => selectVenueA(selectValue(event))}
+              >
+                {#each venueOptions as option}
+                  <option value={option.venue}>{option.venue}</option>
+                {/each}
+              </select>
+            </label>
+
+            <button
+              class="swap-button"
+              type="button"
+              disabled={!selectedVenueA || !selectedVenueB || selectedVenueA === selectedVenueB}
+              on:click={swapVenues}
+            >
+              交换交易所
+            </button>
+
+            <label>
+              <span>Exchange B</span>
+              <select
+                name="venue-b"
+                value={selectedVenueB}
+                disabled={venueOptions.length < 2}
+                on:change={(event) => selectVenueB(selectValue(event))}
+              >
+                {#each venueOptions as option}
+                  <option value={option.venue}>{option.venue}</option>
+                {/each}
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section class="sidebar-block">
+          <div class="sidebar-heading">
+            <span>共同交易对</span>
+            <strong>{formatInteger(venuePairMarkets.length)}</strong>
+          </div>
+
+          <div class="exchange-market-list">
+            {#if loadingMarkets && markets.length === 0}
+              <p class="sidebar-empty">正在读取 ClickHouse 市场目录。</p>
+            {:else if !selectedVenueA || !selectedVenueB || selectedVenueA === selectedVenueB}
+              <p class="sidebar-empty">请选择两个不同的交易所。</p>
+            {:else if venuePairMarkets.length === 0}
+              <p class="sidebar-empty">这两个交易所当前没有共同交易对。</p>
+            {:else}
+              {#each venuePairMarkets as option}
+                <button
+                  type="button"
+                  class:active={selectedBase === option.market.baseAsset && selectedA === option.instrumentA.catalogId && selectedB === option.instrumentB.catalogId}
+                  aria-pressed={selectedBase === option.market.baseAsset && selectedA === option.instrumentA.catalogId && selectedB === option.instrumentB.catalogId}
+                  on:click={() => void openVenuePairMarket(option)}
+                >
+                  <span class="market-main">
+                    <strong>{option.market.baseAsset}/{option.quoteLabel}</strong>
+                    <em>{formatInteger(option.market.instruments.length)} venues</em>
+                  </span>
+                  <span class="market-meta">
+                    <span>{option.instrumentA.rawSymbol} vs {option.instrumentB.rawSymbol}</span>
+                    <span>{formatInteger(option.tickCount)} ticks</span>
+                  </span>
+                </button>
+              {/each}
+            {/if}
+          </div>
+        </section>
+      {/if}
 
       <details class="sidebar-details">
         <summary>换算率 / 实时</summary>
@@ -1134,6 +1384,7 @@
           </label>
         </div>
       </details>
+
     </aside>
 
     <section class="main-panel" aria-label="价差曲线">
@@ -1752,7 +2003,40 @@
     gap: 4px;
   }
 
-  .market-list button {
+  .mode-switch {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--card);
+  }
+
+  .mode-switch button {
+    min-height: 34px;
+    border: 0;
+    border-right: 1px solid var(--border);
+    border-radius: 0;
+    background: transparent;
+    font-size: 0.82rem;
+  }
+
+  .mode-switch button:last-child {
+    border-right: 0;
+  }
+
+  .mode-switch button.active {
+    color: var(--primary-foreground);
+    background: var(--primary);
+  }
+
+  .exchange-market-list {
+    display: grid;
+    gap: 4px;
+  }
+
+  .market-list button,
+  .exchange-market-list button {
     display: grid;
     gap: 9px;
     width: 100%;
@@ -1767,7 +2051,9 @@
   }
 
   .market-list button:hover,
-  .market-list button.active {
+  .market-list button.active,
+  .exchange-market-list button:hover,
+  .exchange-market-list button.active {
     border-color: var(--border);
     border-left-color: var(--primary);
     background: var(--muted);
@@ -1841,10 +2127,15 @@
   }
 
   .leg-picker,
+  .venue-selector,
   .rate-stack {
     display: grid;
     gap: 10px;
     padding-bottom: 14px;
+  }
+
+  .venue-selector label {
+    min-width: 0;
   }
 
   .selected-legs {
