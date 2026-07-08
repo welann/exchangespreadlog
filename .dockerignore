@@ -7,4 +7,7 @@ docs/
 .DS_Store
 .env
 config.toml
+config.generated.toml
 *.log
+__pycache__/
+*.py[cod]
