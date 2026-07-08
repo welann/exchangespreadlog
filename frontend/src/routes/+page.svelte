@@ -1010,44 +1010,65 @@
       </section>
 
       <details class="sidebar-details" open>
-        <summary>查询参数</summary>
-        <div class="form-stack">
-          <label>
-            <span>Leg A</span>
-            <select
-              name="leg-a"
-              value={selectedA}
-              disabled={currentInstruments.length < 2}
-              on:change={(event) => void selectLegAAndQuery(selectValue(event))}
+        <summary>交易所组合</summary>
+        <div class="leg-picker">
+          <div class="selected-legs" aria-label="当前 A/B 组合">
+            <div>
+              <span>A</span>
+              <strong>{selectedLabel(selectedA)}</strong>
+            </div>
+            <button
+              class="swap-button"
+              type="button"
+              disabled={!selectedA || !selectedB || selectedA === selectedB}
+              on:click={() => void swapLegsAndQuery()}
             >
-              {#each currentInstruments as instrument}
-                <option value={instrument.catalogId}>{instrument.label}</option>
-              {/each}
-            </select>
-          </label>
+              交换
+            </button>
+            <div>
+              <span>B</span>
+              <strong>{selectedLabel(selectedB)}</strong>
+            </div>
+          </div>
 
-          <button
-            class="secondary-button"
-            type="button"
-            disabled={!selectedA || !selectedB || selectedA === selectedB}
-            on:click={() => void swapLegsAndQuery()}
-          >
-            交换 A/B
-          </button>
-
-          <label>
-            <span>Leg B</span>
-            <select
-              name="leg-b"
-              value={selectedB}
-              disabled={currentInstruments.length < 2}
-              on:change={(event) => void selectLegBAndQuery(selectValue(event))}
-            >
+          <div class="leg-choice-list" aria-label="选择交易所腿">
+            {#if currentInstruments.length < 2}
+              <p class="sidebar-empty">当前交易对没有足够的交易所可比较。</p>
+            {:else}
               {#each currentInstruments as instrument}
-                <option value={instrument.catalogId}>{instrument.label}</option>
+                <article
+                  class:selected={instrument.catalogId === selectedA || instrument.catalogId === selectedB}
+                  class:a-selected={instrument.catalogId === selectedA}
+                  class:b-selected={instrument.catalogId === selectedB}
+                >
+                  <div class="leg-choice-main">
+                    <strong>{instrument.venueInstanceId}</strong>
+                    <span>{instrument.rawSymbol}/{instrument.quoteAsset}</span>
+                  </div>
+                  <div class="leg-choice-actions">
+                    <button
+                      type="button"
+                      class:active={instrument.catalogId === selectedA}
+                      disabled={instrument.catalogId === selectedB}
+                      aria-pressed={instrument.catalogId === selectedA}
+                      on:click={() => void selectLegAAndQuery(instrument.catalogId)}
+                    >
+                      A
+                    </button>
+                    <button
+                      type="button"
+                      class:active={instrument.catalogId === selectedB}
+                      disabled={instrument.catalogId === selectedA}
+                      aria-pressed={instrument.catalogId === selectedB}
+                      on:click={() => void selectLegBAndQuery(instrument.catalogId)}
+                    >
+                      B
+                    </button>
+                  </div>
+                </article>
               {/each}
-            </select>
-          </label>
+            {/if}
+          </div>
         </div>
       </details>
 
@@ -1101,7 +1122,7 @@
             <select
               name="refresh-interval"
               aria-label="Auto refresh interval"
-              value={refreshSeconds}
+              value={String(refreshSeconds)}
               disabled={!autoRefresh}
               on:change={(event) => updateRefreshSeconds(selectValue(event))}
             >
@@ -1365,9 +1386,14 @@
                 <div><dt>Latest</dt><dd>{formatTime(instrument.latestRecvMs)}</dd></div>
                 <div><dt>Ticks</dt><dd>{formatInteger(instrument.tickCount)}</dd></div>
               </dl>
-              <div class="leg-actions">
-                <button type="button" class:active={instrument.catalogId === selectedA} on:click={() => void selectLegAAndQuery(instrument.catalogId)}>A</button>
-                <button type="button" class:active={instrument.catalogId === selectedB} on:click={() => void selectLegBAndQuery(instrument.catalogId)}>B</button>
+              <div class="venue-role">
+                {#if instrument.catalogId === selectedA}
+                  <span>A leg</span>
+                {:else if instrument.catalogId === selectedB}
+                  <span>B leg</span>
+                {:else}
+                  <span>Available</span>
+                {/if}
               </div>
             </article>
           {/each}
@@ -1562,8 +1588,7 @@
   .control-strip,
   .series-pills,
   .detail-actions,
-  .point-actions,
-  .leg-actions {
+  .point-actions {
     display: flex;
     align-items: center;
   }
@@ -1815,11 +1840,113 @@
     font-weight: 600;
   }
 
-  .form-stack,
+  .leg-picker,
   .rate-stack {
     display: grid;
     gap: 10px;
     padding-bottom: 14px;
+  }
+
+  .selected-legs {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 54px minmax(0, 1fr);
+    gap: 8px;
+    align-items: stretch;
+  }
+
+  .selected-legs div {
+    display: grid;
+    min-width: 0;
+    align-content: center;
+    gap: 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 8px;
+    background: rgba(255, 255, 255, 0.025);
+  }
+
+  .selected-legs span {
+    color: var(--muted-foreground);
+    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+  }
+
+  .selected-legs strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.78rem;
+    font-weight: 600;
+  }
+
+  .swap-button {
+    min-height: 100%;
+    padding: 0 8px;
+    font-size: 0.78rem;
+  }
+
+  .leg-choice-list {
+    display: grid;
+    gap: 6px;
+  }
+
+  .leg-choice-list article {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 74px;
+    gap: 8px;
+    align-items: center;
+    border: 1px solid var(--border);
+    border-left: 2px solid transparent;
+    border-radius: var(--radius);
+    padding: 8px;
+    background: var(--card);
+  }
+
+  .leg-choice-list article.a-selected {
+    border-left-color: var(--primary);
+  }
+
+  .leg-choice-list article.b-selected {
+    border-left-color: var(--warning);
+  }
+
+  .leg-choice-main {
+    display: grid;
+    min-width: 0;
+    gap: 3px;
+  }
+
+  .leg-choice-main strong,
+  .leg-choice-main span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .leg-choice-main strong {
+    font-size: 0.86rem;
+    font-weight: 650;
+  }
+
+  .leg-choice-main span {
+    color: var(--muted-foreground);
+    font-size: 0.72rem;
+  }
+
+  .leg-choice-actions {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 5px;
+  }
+
+  .leg-choice-actions button {
+    min-height: 30px;
+    padding: 0;
+    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
   }
 
   label {
@@ -1884,10 +2011,6 @@
     outline-color: rgba(48, 214, 151, 0.45);
   }
 
-  .secondary-button {
-    width: 100%;
-  }
-
   .primary-button,
   .segmented button.active {
     color: var(--primary-foreground);
@@ -1897,23 +2020,27 @@
 
   .rate-row {
     display: grid;
-    grid-template-columns: 1fr 1fr 1fr 36px;
+    grid-template-columns: minmax(4.4rem, 1fr) minmax(3.8rem, 1fr) minmax(3rem, 0.75fr) 32px;
     gap: 6px;
+  }
+
+  .rate-row input {
+    padding-inline: 8px;
+    font-size: 0.86rem;
   }
 
   .rate-row button {
     padding: 0;
+    min-width: 0;
   }
 
   .detail-actions,
-  .point-actions,
-  .leg-actions {
+  .point-actions {
     gap: 8px;
   }
 
   .detail-actions button,
-  .point-actions button,
-  .leg-actions button {
+  .point-actions button {
     flex: 1;
   }
 
@@ -2223,6 +2350,26 @@
     font-size: 0.8rem;
   }
 
+  .venue-role {
+    display: flex;
+    justify-content: flex-end;
+  }
+
+  .venue-role span {
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 4px 8px;
+    color: var(--muted-foreground);
+    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 0.7rem;
+  }
+
+  .venue-grid article.selected .venue-role span {
+    border-color: rgba(48, 214, 151, 0.45);
+    color: var(--primary);
+    background: rgba(48, 214, 151, 0.08);
+  }
+
   .venue-grid dl,
   .point-ledger,
   .stat-list {
@@ -2334,8 +2481,8 @@
     }
 
     .market-sidebar {
-      width: 16rem;
-      flex: 0 0 16rem;
+      width: 18rem;
+      flex: 0 0 18rem;
       border-right: 1px solid var(--border);
       border-bottom: 0;
     }
