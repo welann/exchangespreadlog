@@ -139,10 +139,10 @@
           : 'WAIT';
   $: spreadStatus = latestOpportunity
     ? latestOpportunity.tone === 'positive'
-      ? 'Actionable on latest joined sample'
+      ? 'Actionable on latest state sample'
       : latestOpportunity.tone === 'negative'
-        ? 'No positive cross on latest sample'
-        : 'Flat at latest joined sample'
+        ? 'No positive cross on latest state sample'
+        : 'Flat at latest state sample'
     : marketError
       ? 'ClickHouse connection is not ready'
       : 'Waiting for comparable samples';
@@ -1021,7 +1021,7 @@
     if (meta.granularity === 'raw') {
       return `${formatInteger(meta.sourceRows)} raw ticks`;
     }
-    return `${meta.bucketSeconds}s buckets`;
+    return `${meta.bucketSeconds}s extrema`;
   }
 
   function formatBp(value: number | null) {
@@ -1491,7 +1491,7 @@
         {#if loadingSpread}
           <div class="empty-state">正在查询 ClickHouse。</div>
         {:else if points.length === 0}
-          <div class="empty-state">当前组合没有 joined BBO 样本。请调整交易所腿或时间范围。</div>
+          <div class="empty-state">当前组合没有可比较的盘口状态样本。请调整交易所腿或时间范围。</div>
         {:else}
           <svg
             class="spread-chart"
@@ -1591,7 +1591,7 @@
           {#if spread?.meta.granularity === 'raw'}
             当前短窗口使用数据库逐 tick BBO 更新计算价差；每个样本来自 A/B 任一侧的新盘口，并与另一侧最新盘口对齐。
           {:else}
-            当前使用 bucket 聚合后的最新盘口计算价差；1H 与 Custom 不超过 1H 固定为 15s bucket，长窗口会自动放大粒度。
+            当前先按事件流维护 A/B 最新盘口，再在每个 bucket 内选择可交易价差最极端的真实状态；盘口超过 {formatMaybeDuration(spread?.meta.maxStaleMs ?? null)} 未更新的状态会被跳过。
           {/if}
         </p>
       </section>

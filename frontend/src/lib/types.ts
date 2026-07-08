@@ -56,6 +56,7 @@ export type SpreadResponse = {
     bucketSeconds: number;
     granularity: 'raw' | 'bucket';
     sourceRows: number;
+    maxStaleMs: number;
     targetQuote: string;
     aRate: number;
     bRate: number;
