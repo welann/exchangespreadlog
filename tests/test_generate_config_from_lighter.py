@@ -162,6 +162,51 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
         self.assertEqual(instruments[0].instrument_id, "BTCUSD")
         self.assertEqual(instruments[0].feed_symbol, "BTCUSD")
 
+    def test_fetch_perpl_instruments_uses_context_market_ids_and_ticks(self):
+        original = generator.get_json
+        generator.get_json = lambda _url: {
+            "markets": [
+                {
+                    "id": 1,
+                    "symbol": "",
+                    "name": "BTC",
+                    "size_units": "BTC",
+                    "config": {
+                        "is_open": True,
+                        "price_decimals": 1,
+                        "size_decimals": 5,
+                    },
+                },
+                {
+                    "id": 20,
+                    "symbol": "ETH",
+                    "name": "ETH",
+                    "size_units": "ETH",
+                    "config": {
+                        "is_open": False,
+                        "price_decimals": 2,
+                        "size_decimals": 3,
+                    },
+                },
+            ]
+        }
+        try:
+            instruments = generator.fetch_perpl_instruments(
+                [
+                    generator.LighterMarket("1", "BTC", "BTC", Decimal("100")),
+                    generator.LighterMarket("0", "ETH", "ETH", Decimal("50")),
+                ]
+            )
+        finally:
+            generator.get_json = original
+
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(instruments[0].instrument_id, "1")
+        self.assertEqual(instruments[0].feed_symbol, "1")
+        self.assertEqual(instruments[0].base_asset, "BTC")
+        self.assertEqual(instruments[0].price_tick, "0.1")
+        self.assertEqual(instruments[0].size_tick, "0.00001")
+
 
 if __name__ == "__main__":
     unittest.main()

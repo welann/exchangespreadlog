@@ -32,6 +32,11 @@ from = "USDT"
 to = "USD"
 rate = "1"
 
+[[quote_rates]]
+from = "AUSD"
+to = "USD"
+rate = "1"
+
 [[venues]]
 venue_instance_id = "hyperliquid"
 adapter = "hyperliquid"
@@ -208,4 +213,46 @@ raw_symbol = "SOL-USD"
 feed_symbol = "SOLUSD"
 product_type = "perp"
 base_asset = "SOL"
+status = "active"
+
+[[venues]]
+venue_instance_id = "perpl"
+adapter = "perpl"
+enabled = true
+url = "wss://app.perpl.xyz/ws/v1/market-data"
+channel = "order-book"
+catalog_source = "exchange"
+metadata_url = "https://app.perpl.xyz/api/v1/pub/context"
+default_quote_asset = "AUSD"
+default_settle_asset = "AUSD"
+default_margin_asset = "AUSD"
+
+[[venues.instruments]]
+instrument_id = "1"
+raw_symbol = "BTC"
+feed_symbol = "1"
+product_type = "perp"
+base_asset = "BTC"
+price_tick = "0.1"
+size_tick = "0.00001"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "20"
+raw_symbol = "ETH"
+feed_symbol = "20"
+product_type = "perp"
+base_asset = "ETH"
+price_tick = "0.01"
+size_tick = "0.001"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "31"
+raw_symbol = "SOL"
+feed_symbol = "31"
+product_type = "perp"
+base_asset = "SOL"
+price_tick = "0.001"
+size_tick = "0.001"
 status = "active"

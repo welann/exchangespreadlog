@@ -26,6 +26,7 @@ HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 RISEX_MARKETS_URL = "https://api.rise.trade/v1/markets"
 ZERO_ONE_INFO_URL = "https://zo-mainnet.n1.xyz/info"
 ETHEREAL_PRODUCTS_URL = "https://api.ethereal.trade/v1/product"
+PERPL_CONTEXT_URL = "https://app.perpl.xyz/api/v1/pub/context"
 
 USER_AGENT = "exchangespreadlog-config-generator/0.1"
 DETAIL_DELAY_SECONDS = 0.2
@@ -38,6 +39,8 @@ class Instrument:
     feed_symbol: str
     base_asset: str
     status: str = "active"
+    price_tick: Optional[str] = None
+    size_tick: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,8 @@ def instrument(
     feed_symbol: object,
     base_asset: object,
     status: str = "active",
+    price_tick: Optional[str] = None,
+    size_tick: Optional[str] = None,
 ) -> Instrument:
     return Instrument(
         instrument_id=str(instrument_id),
@@ -122,6 +127,8 @@ def instrument(
         feed_symbol=str(feed_symbol),
         base_asset=normalize_base(base_asset),
         status=status,
+        price_tick=price_tick,
+        size_tick=size_tick,
     )
 
 
@@ -334,6 +341,37 @@ def fetch_ethereal_instruments(top_markets: list[LighterMarket]) -> list[Instrum
     return select_in_top_order(by_base, top_markets)
 
 
+def fetch_perpl_instruments(top_markets: list[LighterMarket]) -> list[Instrument]:
+    data = get_json(PERPL_CONTEXT_URL)
+    if not isinstance(data, dict) or not isinstance(data.get("markets"), list):
+        raise RuntimeError("Perpl context payload is missing markets")
+
+    by_base: dict[str, Instrument] = {}
+    for market in data["markets"]:
+        if not isinstance(market, dict):
+            continue
+        config = market.get("config") if isinstance(market.get("config"), dict) else {}
+        if not config.get("is_open", False):
+            continue
+        market_id = market.get("id")
+        raw_symbol = market.get("size_units") or market.get("symbol") or market.get("name")
+        base = market.get("symbol") or market.get("name") or raw_symbol
+        if market_id is None or not raw_symbol or not base:
+            continue
+        by_base.setdefault(
+            normalize_base(base),
+            instrument(
+                market_id,
+                raw_symbol,
+                market_id,
+                base,
+                price_tick=decimal_tick(config.get("price_decimals")),
+                size_tick=decimal_tick(config.get("size_decimals")),
+            ),
+        )
+    return select_in_top_order(by_base, top_markets)
+
+
 def lighter_instruments(top_markets: list[LighterMarket]) -> list[Instrument]:
     return [
         instrument(market.market_id, market.symbol, market.market_id, market.base_asset)
@@ -401,7 +439,28 @@ def build_venues(top_markets: list[LighterMarket]) -> list[Venue]:
             default_margin_asset="USD",
             instruments=fetch_ethereal_instruments(top_markets),
         ),
+        Venue(
+            venue_instance_id="perpl",
+            adapter="perpl",
+            url="wss://app.perpl.xyz/ws/v1/market-data",
+            channel="order-book",
+            catalog_source="exchange",
+            metadata_url=PERPL_CONTEXT_URL,
+            default_quote_asset="AUSD",
+            default_settle_asset="AUSD",
+            default_margin_asset="AUSD",
+            instruments=fetch_perpl_instruments(top_markets),
+        ),
     ]
+
+
+def decimal_tick(decimals: object) -> Optional[str]:
+    if decimals is None:
+        return None
+    decimals = int(decimals)
+    if decimals <= 0:
+        return "1"
+    return "0." + ("0" * (decimals - 1)) + "1"
 
 
 def toml_string(value: object) -> str:
@@ -452,6 +511,11 @@ def render_config(top_markets: list[LighterMarket], venues: list[Venue]) -> str:
         'to = "USD"',
         'rate = "1"',
         "",
+        "[[quote_rates]]",
+        'from = "AUSD"',
+        'to = "USD"',
+        'rate = "1"',
+        "",
     ]
 
     for venue in venues:
@@ -487,6 +551,16 @@ def render_config(top_markets: list[LighterMarket], venues: list[Venue]) -> str:
                     toml_key_value("feed_symbol", inst.feed_symbol),
                     'product_type = "perp"',
                     toml_key_value("base_asset", inst.base_asset),
+                    *(
+                        [toml_key_value("price_tick", inst.price_tick)]
+                        if inst.price_tick
+                        else []
+                    ),
+                    *(
+                        [toml_key_value("size_tick", inst.size_tick)]
+                        if inst.size_tick
+                        else []
+                    ),
                     toml_key_value("status", inst.status),
                     "",
                 ]

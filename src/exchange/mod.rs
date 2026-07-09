@@ -1,6 +1,7 @@
 pub mod ethereal;
 pub mod hyperliquid;
 pub mod lighter;
+pub mod perpl;
 pub mod risex;
 pub mod zero_one;
 

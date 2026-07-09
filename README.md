@@ -9,8 +9,9 @@ Currently supported venues:
 - `risex`
 - `01`
 - `ethereal`
+- `perpl`
 
-By default, Hyperliquid, Lighter, RiseX, 01, and Ethereal are enabled in `config.example.toml`.
+By default, Hyperliquid, Lighter, RiseX, 01, Ethereal, and Perpl are enabled in `config.example.toml`.
 
 ## Project Structure
 
@@ -29,6 +30,7 @@ By default, Hyperliquid, Lighter, RiseX, 01, and Ethereal are enabled in `config
     |   |-- ethereal/
     |   |-- hyperliquid/
     |   |-- lighter/
+    |   |-- perpl/
     |   |-- risex/
     |   `-- zero_one/
     |-- ingest/             # WebSocket connection, retry/backoff, time helpers

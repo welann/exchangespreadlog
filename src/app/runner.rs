@@ -9,7 +9,8 @@ use crate::{
     domain::MarketEvent,
     exchange::{
         ExchangeAdapter, ethereal::EtherealAdapter, hyperliquid::HyperliquidAdapter,
-        lighter::LighterAdapter, risex::RisexAdapter, zero_one::ZeroOneAdapter,
+        lighter::LighterAdapter, perpl::adapter::PerplAdapter, risex::RisexAdapter,
+        zero_one::ZeroOneAdapter,
     },
     pipeline::fanout,
     state::new_shared_state,
@@ -143,6 +144,7 @@ fn build_adapter(config: &VenueConfig) -> anyhow::Result<Box<dyn ExchangeAdapter
         "rise" | "risex" => Ok(Box::new(RisexAdapter::from_config(config))),
         "01" | "zero_one" | "zeroone" => Ok(Box::new(ZeroOneAdapter::from_config(config))),
         "ethereal" => Ok(Box::new(EtherealAdapter::from_config(config))),
+        "perpl" => Ok(Box::new(PerplAdapter::from_config(config))),
         other => Err(anyhow!("unsupported venue: {other}")),
     }
 }
