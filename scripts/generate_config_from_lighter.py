@@ -27,6 +27,7 @@ RISEX_MARKETS_URL = "https://api.rise.trade/v1/markets"
 ZERO_ONE_INFO_URL = "https://zo-mainnet.n1.xyz/info"
 ETHEREAL_PRODUCTS_URL = "https://api.ethereal.trade/v1/product"
 PERPL_CONTEXT_URL = "https://app.perpl.xyz/api/v1/pub/context"
+ONDO_MARKETS_URL = "https://api.ondoperps.xyz/v1/markets"
 
 USER_AGENT = "exchangespreadlog-config-generator/0.1"
 DETAIL_DELAY_SECONDS = 0.2
@@ -372,6 +373,36 @@ def fetch_perpl_instruments(top_markets: list[LighterMarket]) -> list[Instrument
     return select_in_top_order(by_base, top_markets)
 
 
+def fetch_ondo_instruments(top_markets: list[LighterMarket]) -> list[Instrument]:
+    data = get_json(ONDO_MARKETS_URL)
+    perps = data.get("result", {}).get("perps") if isinstance(data, dict) else None
+    trading_pairs = perps.get("tradingPairs") if isinstance(perps, dict) else None
+    if not isinstance(trading_pairs, list):
+        raise RuntimeError("Ondo markets payload is missing result.perps.tradingPairs")
+
+    by_base: dict[str, Instrument] = {}
+    for market in trading_pairs:
+        if not isinstance(market, dict) or market.get("disabled") is True:
+            continue
+        market_symbol = market.get("market")
+        pair = market.get("pair") if isinstance(market.get("pair"), dict) else {}
+        base = pair.get("base") or market_symbol
+        if not market_symbol or not base:
+            continue
+        by_base.setdefault(
+            normalize_base(base),
+            instrument(
+                market_symbol,
+                market.get("displayName") or market_symbol,
+                market_symbol,
+                base,
+                price_tick=market.get("quoteIncrement"),
+                size_tick=market.get("baseIncrement"),
+            ),
+        )
+    return select_in_top_order(by_base, top_markets)
+
+
 def lighter_instruments(top_markets: list[LighterMarket]) -> list[Instrument]:
     return [
         instrument(market.market_id, market.symbol, market.market_id, market.base_asset)
@@ -450,6 +481,18 @@ def build_venues(top_markets: list[LighterMarket]) -> list[Venue]:
             default_settle_asset="AUSD",
             default_margin_asset="AUSD",
             instruments=fetch_perpl_instruments(top_markets),
+        ),
+        Venue(
+            venue_instance_id="ondo",
+            adapter="ondo",
+            url="wss://api.ondoperps.xyz/ws",
+            channel="topOfBooksPerps",
+            catalog_source="exchange",
+            metadata_url=ONDO_MARKETS_URL,
+            default_quote_asset="USD",
+            default_settle_asset="USD",
+            default_margin_asset="USD",
+            instruments=fetch_ondo_instruments(top_markets),
         ),
     ]
 

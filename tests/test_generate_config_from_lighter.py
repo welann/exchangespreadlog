@@ -207,6 +207,49 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
         self.assertEqual(instruments[0].price_tick, "0.1")
         self.assertEqual(instruments[0].size_tick, "0.00001")
 
+    def test_fetch_ondo_instruments_uses_markets_payload_and_skips_disabled(self):
+        original = generator.get_json
+        generator.get_json = lambda _url: {
+            "success": True,
+            "result": {
+                "perps": {
+                    "tradingPairs": [
+                        {
+                            "market": "BTC-USD.P",
+                            "displayName": "BTCUSD",
+                            "pair": {"base": "BTC", "quote": "USD"},
+                            "baseIncrement": "0.0001",
+                            "quoteIncrement": "0.01",
+                        },
+                        {
+                            "market": "SOL-USD.P",
+                            "displayName": "SOLUSD",
+                            "pair": {"base": "SOL", "quote": "USD"},
+                            "baseIncrement": "0.01",
+                            "quoteIncrement": "0.01",
+                            "disabled": True,
+                        },
+                    ]
+                }
+            },
+        }
+        try:
+            instruments = generator.fetch_ondo_instruments(
+                [
+                    generator.LighterMarket("1", "BTC", "BTC", Decimal("100")),
+                    generator.LighterMarket("2", "SOL", "SOL", Decimal("50")),
+                ]
+            )
+        finally:
+            generator.get_json = original
+
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(instruments[0].instrument_id, "BTC-USD.P")
+        self.assertEqual(instruments[0].feed_symbol, "BTC-USD.P")
+        self.assertEqual(instruments[0].base_asset, "BTC")
+        self.assertEqual(instruments[0].price_tick, "0.01")
+        self.assertEqual(instruments[0].size_tick, "0.0001")
+
 
 if __name__ == "__main__":
     unittest.main()

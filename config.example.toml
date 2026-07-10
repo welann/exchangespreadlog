@@ -256,3 +256,35 @@ base_asset = "SOL"
 price_tick = "0.001"
 size_tick = "0.001"
 status = "active"
+
+[[venues]]
+venue_instance_id = "ondo"
+adapter = "ondo"
+enabled = true
+url = "wss://api.ondoperps.xyz/ws"
+channel = "topOfBooksPerps"
+catalog_source = "exchange"
+metadata_url = "https://api.ondoperps.xyz/v1/markets"
+default_quote_asset = "USD"
+default_settle_asset = "USD"
+default_margin_asset = "USD"
+
+[[venues.instruments]]
+instrument_id = "BTC-USD.P"
+raw_symbol = "BTCUSD"
+feed_symbol = "BTC-USD.P"
+product_type = "perp"
+base_asset = "BTC"
+price_tick = "0.01"
+size_tick = "0.0001"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "ETH-USD.P"
+raw_symbol = "ETHUSD"
+feed_symbol = "ETH-USD.P"
+product_type = "perp"
+base_asset = "ETH"
+price_tick = "0.01"
+size_tick = "0.001"
+status = "active"

@@ -258,6 +258,19 @@ impl Default for Config {
                     default_margin_asset: "AUSD".to_string(),
                     instruments: default_perpl_instruments(),
                 },
+                VenueConfig {
+                    venue_instance_id: "ondo".to_string(),
+                    adapter: "ondo".to_string(),
+                    enabled: true,
+                    url: Some("wss://api.ondoperps.xyz/ws".to_string()),
+                    channel: Some("topOfBooksPerps".to_string()),
+                    catalog_source: CatalogSource::Exchange,
+                    metadata_url: Some("https://api.ondoperps.xyz/v1/markets".to_string()),
+                    default_quote_asset: "USD".to_string(),
+                    default_settle_asset: "USD".to_string(),
+                    default_margin_asset: "USD".to_string(),
+                    instruments: default_ondo_instruments(),
+                },
             ],
         }
     }
@@ -512,6 +525,27 @@ fn default_perpl_instruments() -> Vec<InstrumentConfig> {
     ]
 }
 
+fn default_ondo_instruments() -> Vec<InstrumentConfig> {
+    vec![
+        instrument_with_ticks(
+            "BTC-USD.P",
+            "BTCUSD",
+            Some("BTC-USD.P"),
+            "BTC",
+            "0.01",
+            "0.0001",
+        ),
+        instrument_with_ticks(
+            "ETH-USD.P",
+            "ETHUSD",
+            Some("ETH-USD.P"),
+            "ETH",
+            "0.01",
+            "0.001",
+        ),
+    ]
+}
+
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
@@ -545,7 +579,7 @@ mod tests {
         );
         assert_eq!(config.quote_rates.len(), 3);
         assert_eq!(config.quote_rates[2].from, "AUSD");
-        assert_eq!(config.venues.len(), 6);
+        assert_eq!(config.venues.len(), 7);
         assert_eq!(config.venues[0].venue_instance_id, "hyperliquid");
         assert_eq!(config.venues[0].adapter, "hyperliquid");
         assert_eq!(config.venues[0].channel.as_deref(), Some("bbo"));
@@ -615,6 +649,30 @@ mod tests {
         assert_eq!(
             config.venues[5].catalog()[0].size_tick.unwrap().to_string(),
             "0.00001"
+        );
+        assert_eq!(config.venues[6].venue_instance_id, "ondo");
+        assert_eq!(
+            config.venues[6].url.as_deref(),
+            Some("wss://api.ondoperps.xyz/ws")
+        );
+        assert_eq!(config.venues[6].channel.as_deref(), Some("topOfBooksPerps"));
+        assert_eq!(config.venues[6].catalog_source, CatalogSource::Exchange);
+        assert_eq!(
+            config.venues[6].metadata_url.as_deref(),
+            Some("https://api.ondoperps.xyz/v1/markets")
+        );
+        assert_eq!(config.venues[6].catalog()[0].feed_key(), "BTC-USD.P");
+        assert_eq!(config.venues[6].catalog()[0].quote_asset, "USD");
+        assert_eq!(
+            config.venues[6].catalog()[0]
+                .price_tick
+                .unwrap()
+                .to_string(),
+            "0.01"
+        );
+        assert_eq!(
+            config.venues[6].catalog()[0].size_tick.unwrap().to_string(),
+            "0.0001"
         );
     }
 
