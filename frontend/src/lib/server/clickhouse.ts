@@ -1,6 +1,7 @@
 import { env } from '$env/dynamic/private';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { Agent, type Dispatcher, fetch as undiciFetch } from 'undici';
 
 type ClickHouseConfig = {
   url: string;
@@ -9,6 +10,7 @@ type ClickHouseConfig = {
   catalogTable: string;
   username: string;
   password: string;
+  acceptInvalidCerts: boolean;
   source: string;
 };
 
@@ -20,12 +22,15 @@ type FileClickHouseConfig = {
   username?: string;
   password?: string;
   passwordEnv?: string;
+  acceptInvalidCerts?: boolean;
   source: string;
 };
 
 type ClickHouseQueryOptions = {
   maxThreads?: number;
 };
+
+let insecureDispatcher: Dispatcher | null = null;
 
 export class ClickHouseError extends Error {
   constructor(
@@ -74,6 +79,13 @@ export function clickHouseConfig(): ClickHouseConfig {
       passwordFromNamedEnv ??
       fileConfig?.password ??
       '',
+    acceptInvalidCerts:
+      parseBooleanSetting(
+        'CLICKHOUSE_ACCEPT_INVALID_CERTS',
+        envValue('CLICKHOUSE_ACCEPT_INVALID_CERTS')
+      ) ??
+      fileConfig?.acceptInvalidCerts ??
+      false,
     source: fileConfig?.source ?? 'environment/defaults'
   };
 
@@ -101,6 +113,7 @@ export function clickHouseConfigSummary() {
     catalogTable: config.catalogTable,
     username: config.username || null,
     hasPassword: Boolean(config.password),
+    acceptInvalidCerts: config.acceptInvalidCerts,
     source: config.source
   };
 }
@@ -124,21 +137,27 @@ export async function queryClickHouse<T>(
     url.searchParams.set('max_threads', String(options.maxThreads));
   }
 
-  const headers = new Headers({
+  const headers: Record<string, string> = {
     'content-type': 'text/plain; charset=utf-8'
-  });
+  };
 
   if (config.username) {
     const token = Buffer.from(`${config.username}:${config.password}`).toString('base64');
-    headers.set('authorization', `Basic ${token}`);
+    headers.authorization = `Basic ${token}`;
   }
 
-  let response: Response;
+  let response: Awaited<ReturnType<typeof undiciFetch>>;
   try {
-    response = await fetch(url, {
+    let dispatcher: Dispatcher | undefined;
+    if (config.acceptInvalidCerts) {
+      insecureDispatcher ??= new Agent({ connect: { rejectUnauthorized: false } });
+      dispatcher = insecureDispatcher;
+    }
+    response = await undiciFetch(url, {
       method: 'POST',
       headers,
-      body: sql
+      body: sql,
+      dispatcher
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'unknown network error';
@@ -230,6 +249,12 @@ function parseStorageClickHouse(raw: string): Omit<FileClickHouseConfig, 'source
     if (!keyValue) continue;
 
     const [, key, rawValue] = keyValue;
+    if (key === 'accept_invalid_certs') {
+      const value = parseTomlBoolean(rawValue.trim());
+      if (value !== null) parsed.acceptInvalidCerts = value;
+      continue;
+    }
+
     const value = parseTomlString(rawValue.trim());
     if (typeof value !== 'string') continue;
 
@@ -278,6 +303,20 @@ function parseTomlString(value: string): string | null {
     }
   }
   return value || null;
+}
+
+function parseTomlBoolean(value: string): boolean | null {
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return null;
+}
+
+function parseBooleanSetting(label: string, value: string | undefined): boolean | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  throw new ClickHouseError(`${label} must be true or false`, 500);
 }
 
 function envValue(name: string): string | undefined {

@@ -7,16 +7,17 @@ channel_capacity = 4096
 stale_after_ms = 5000
 
 [storage]
-mode = "jsonl"
+mode = "clickhouse"
 jsonl_dir = "data/bbo"
 
 [storage.clickhouse]
-url = "https://obdata.zeabur.app/"
+url = "https://manyexchanges.zeabur.app/"
 database = "zeabur"
 table = "bbo_ticks"
 catalog_table = "instrument_catalog"
 username = "zeabur"
 password_env = "CLICKHOUSE_PASSWORD"
+accept_invalid_certs = true
 create_table = true
 batch_size = 100
 
@@ -68,11 +69,11 @@ base_asset = "ETH"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "LIT"
-raw_symbol = "LIT"
-feed_symbol = "LIT"
+instrument_id = "SOL"
+raw_symbol = "SOL"
+feed_symbol = "SOL"
 product_type = "perp"
-base_asset = "LIT"
+base_asset = "SOL"
 status = "active"
 
 [[venues.instruments]]
@@ -84,19 +85,19 @@ base_asset = "HYPE"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "SOL"
-raw_symbol = "SOL"
-feed_symbol = "SOL"
+instrument_id = "LIT"
+raw_symbol = "LIT"
+feed_symbol = "LIT"
 product_type = "perp"
-base_asset = "SOL"
+base_asset = "LIT"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "xyz:SNDK"
-raw_symbol = "xyz:SNDK"
-feed_symbol = "xyz:SNDK"
+instrument_id = "ZEC"
+raw_symbol = "ZEC"
+feed_symbol = "ZEC"
 product_type = "perp"
-base_asset = "SNDK"
+base_asset = "ZEC"
 status = "active"
 
 [[venues.instruments]]
@@ -105,6 +106,14 @@ raw_symbol = "xyz:MU"
 feed_symbol = "xyz:MU"
 product_type = "perp"
 base_asset = "MU"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "xyz:SNDK"
+raw_symbol = "xyz:SNDK"
+feed_symbol = "xyz:SNDK"
+product_type = "perp"
+base_asset = "SNDK"
 status = "active"
 
 [[venues.instruments]]
@@ -124,35 +133,43 @@ base_asset = "BRENTOIL"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "BNB"
-raw_symbol = "BNB"
-feed_symbol = "BNB"
+instrument_id = "XRP"
+raw_symbol = "XRP"
+feed_symbol = "XRP"
 product_type = "perp"
-base_asset = "BNB"
+base_asset = "XRP"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "xyz:NVDA"
-raw_symbol = "xyz:NVDA"
-feed_symbol = "xyz:NVDA"
+instrument_id = "xyz:META"
+raw_symbol = "xyz:META"
+feed_symbol = "xyz:META"
 product_type = "perp"
-base_asset = "NVDA"
+base_asset = "META"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "ZEC"
-raw_symbol = "ZEC"
-feed_symbol = "ZEC"
+instrument_id = "xyz:HOOD"
+raw_symbol = "xyz:HOOD"
+feed_symbol = "xyz:HOOD"
 product_type = "perp"
-base_asset = "ZEC"
+base_asset = "HOOD"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "xyz:INTC"
-raw_symbol = "xyz:INTC"
-feed_symbol = "xyz:INTC"
+instrument_id = "GRAM"
+raw_symbol = "GRAM"
+feed_symbol = "GRAM"
 product_type = "perp"
-base_asset = "INTC"
+base_asset = "GRAM"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "xyz:CRCL"
+raw_symbol = "xyz:CRCL"
+feed_symbol = "xyz:CRCL"
+product_type = "perp"
+base_asset = "CRCL"
 status = "active"
 
 [[venues]]
@@ -184,19 +201,11 @@ base_asset = "ETH"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "120"
-raw_symbol = "LIT"
-feed_symbol = "120"
+instrument_id = "2"
+raw_symbol = "SOL"
+feed_symbol = "2"
 product_type = "perp"
-base_asset = "LIT"
-status = "active"
-
-[[venues.instruments]]
-instrument_id = "92"
-raw_symbol = "XAU"
-feed_symbol = "92"
-product_type = "perp"
-base_asset = "XAU"
+base_asset = "SOL"
 status = "active"
 
 [[venues.instruments]]
@@ -208,27 +217,27 @@ base_asset = "HYPE"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "2"
-raw_symbol = "SOL"
-feed_symbol = "2"
+instrument_id = "92"
+raw_symbol = "XAU"
+feed_symbol = "92"
 product_type = "perp"
-base_asset = "SOL"
+base_asset = "XAU"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "145"
-raw_symbol = "WTI"
-feed_symbol = "145"
+instrument_id = "120"
+raw_symbol = "LIT"
+feed_symbol = "120"
 product_type = "perp"
-base_asset = "WTI"
+base_asset = "LIT"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "139"
-raw_symbol = "SNDK"
-feed_symbol = "139"
+instrument_id = "90"
+raw_symbol = "ZEC"
+feed_symbol = "90"
 product_type = "perp"
-base_asset = "SNDK"
+base_asset = "ZEC"
 status = "active"
 
 [[venues.instruments]]
@@ -248,43 +257,27 @@ base_asset = "SKHYNIX"
 status = "active"
 
 [[venues.instruments]]
+instrument_id = "145"
+raw_symbol = "WTI"
+feed_symbol = "145"
+product_type = "perp"
+base_asset = "WTI"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "139"
+raw_symbol = "SNDK"
+feed_symbol = "139"
+product_type = "perp"
+base_asset = "SNDK"
+status = "active"
+
+[[venues.instruments]]
 instrument_id = "194"
 raw_symbol = "SPCX"
 feed_symbol = "194"
 product_type = "perp"
 base_asset = "SPCX"
-status = "active"
-
-[[venues.instruments]]
-instrument_id = "159"
-raw_symbol = "BRENTOIL"
-feed_symbol = "159"
-product_type = "perp"
-base_asset = "BRENTOIL"
-status = "active"
-
-[[venues.instruments]]
-instrument_id = "197"
-raw_symbol = "SOXL"
-feed_symbol = "197"
-product_type = "perp"
-base_asset = "SOXL"
-status = "active"
-
-[[venues.instruments]]
-instrument_id = "25"
-raw_symbol = "BNB"
-feed_symbol = "25"
-product_type = "perp"
-base_asset = "BNB"
-status = "active"
-
-[[venues.instruments]]
-instrument_id = "110"
-raw_symbol = "NVDA"
-feed_symbol = "110"
-product_type = "perp"
-base_asset = "NVDA"
 status = "active"
 
 [[venues.instruments]]
@@ -296,35 +289,59 @@ base_asset = "XAG"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "90"
-raw_symbol = "ZEC"
-feed_symbol = "90"
+instrument_id = "159"
+raw_symbol = "BRENTOIL"
+feed_symbol = "159"
 product_type = "perp"
-base_asset = "ZEC"
+base_asset = "BRENTOIL"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "129"
-raw_symbol = "QQQ"
-feed_symbol = "129"
+instrument_id = "7"
+raw_symbol = "XRP"
+feed_symbol = "7"
 product_type = "perp"
-base_asset = "QQQ"
+base_asset = "XRP"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "181"
-raw_symbol = "US100"
-feed_symbol = "181"
+instrument_id = "117"
+raw_symbol = "META"
+feed_symbol = "117"
 product_type = "perp"
-base_asset = "US100"
+base_asset = "META"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "137"
-raw_symbol = "INTC"
-feed_symbol = "137"
+instrument_id = "108"
+raw_symbol = "HOOD"
+feed_symbol = "108"
 product_type = "perp"
-base_asset = "INTC"
+base_asset = "HOOD"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "197"
+raw_symbol = "SOXL"
+feed_symbol = "197"
+product_type = "perp"
+base_asset = "SOXL"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "12"
+raw_symbol = "GRAM"
+feed_symbol = "12"
+product_type = "perp"
+base_asset = "GRAM"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "121"
+raw_symbol = "CRCL"
+feed_symbol = "121"
+product_type = "perp"
+base_asset = "CRCL"
 status = "active"
 
 [[venues]]
@@ -355,11 +372,11 @@ base_asset = "ETH"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "12"
-raw_symbol = "LIT/USDC"
-feed_symbol = "12"
+instrument_id = "4"
+raw_symbol = "SOL/USDC"
+feed_symbol = "4"
 product_type = "perp"
-base_asset = "LIT"
+base_asset = "SOL"
 status = "active"
 
 [[venues.instruments]]
@@ -371,19 +388,11 @@ base_asset = "HYPE"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "4"
-raw_symbol = "SOL/USDC"
-feed_symbol = "4"
+instrument_id = "12"
+raw_symbol = "LIT/USDC"
+feed_symbol = "12"
 product_type = "perp"
-base_asset = "SOL"
-status = "active"
-
-[[venues.instruments]]
-instrument_id = "3"
-raw_symbol = "BNB/USDC"
-feed_symbol = "3"
-product_type = "perp"
-base_asset = "BNB"
+base_asset = "LIT"
 status = "active"
 
 [[venues.instruments]]
@@ -392,6 +401,14 @@ raw_symbol = "ZEC/USDC"
 feed_symbol = "8"
 product_type = "perp"
 base_asset = "ZEC"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "6"
+raw_symbol = "XRP/USDC"
+feed_symbol = "6"
+product_type = "perp"
+base_asset = "XRP"
 status = "active"
 
 [[venues]]
@@ -422,11 +439,11 @@ base_asset = "ETH"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "23"
-raw_symbol = "LITUSD"
-feed_symbol = "LITUSD"
+instrument_id = "2"
+raw_symbol = "SOLUSD"
+feed_symbol = "SOLUSD"
 product_type = "perp"
-base_asset = "LIT"
+base_asset = "SOL"
 status = "active"
 
 [[venues.instruments]]
@@ -438,11 +455,11 @@ base_asset = "HYPE"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "2"
-raw_symbol = "SOLUSD"
-feed_symbol = "SOLUSD"
+instrument_id = "23"
+raw_symbol = "LITUSD"
+feed_symbol = "LITUSD"
 product_type = "perp"
-base_asset = "SOL"
+base_asset = "LIT"
 status = "active"
 
 [[venues.instruments]]
@@ -451,6 +468,14 @@ raw_symbol = "ZECUSD"
 feed_symbol = "ZECUSD"
 product_type = "perp"
 base_asset = "ZEC"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "6"
+raw_symbol = "XRPUSD"
+feed_symbol = "XRPUSD"
+product_type = "perp"
+base_asset = "XRP"
 status = "active"
 
 [[venues]]
@@ -482,11 +507,11 @@ base_asset = "ETH"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "LITUSD"
-raw_symbol = "LIT-USD"
-feed_symbol = "LITUSD"
+instrument_id = "SOLUSD"
+raw_symbol = "SOL-USD"
+feed_symbol = "SOLUSD"
 product_type = "perp"
-base_asset = "LIT"
+base_asset = "SOL"
 status = "active"
 
 [[venues.instruments]]
@@ -498,11 +523,11 @@ base_asset = "HYPE"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "SOLUSD"
-raw_symbol = "SOL-USD"
-feed_symbol = "SOLUSD"
+instrument_id = "LITUSD"
+raw_symbol = "LIT-USD"
+feed_symbol = "LITUSD"
 product_type = "perp"
-base_asset = "SOL"
+base_asset = "LIT"
 status = "active"
 
 [[venues.instruments]]
@@ -511,6 +536,14 @@ raw_symbol = "ZEC-USD"
 feed_symbol = "ZECUSD"
 product_type = "perp"
 base_asset = "ZEC"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "XRPUSD"
+raw_symbol = "XRP-USD"
+feed_symbol = "XRPUSD"
+product_type = "perp"
+base_asset = "XRP"
 status = "active"
 
 [[venues]]
@@ -546,16 +579,6 @@ size_tick = "0.001"
 status = "active"
 
 [[venues.instruments]]
-instrument_id = "40"
-raw_symbol = "HYPE"
-feed_symbol = "40"
-product_type = "perp"
-base_asset = "HYPE"
-price_tick = "0.0001"
-size_tick = "0.01"
-status = "active"
-
-[[venues.instruments]]
 instrument_id = "31"
 raw_symbol = "SOL"
 feed_symbol = "31"
@@ -563,6 +586,16 @@ product_type = "perp"
 base_asset = "SOL"
 price_tick = "0.001"
 size_tick = "0.001"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "40"
+raw_symbol = "HYPE"
+feed_symbol = "40"
+product_type = "perp"
+base_asset = "HYPE"
+price_tick = "0.0001"
+size_tick = "0.01"
 status = "active"
 
 [[venues.instruments]]
@@ -575,5 +608,117 @@ price_tick = "0.01"
 size_tick = "0.0001"
 status = "active"
 
+[[venues]]
+venue_instance_id = "ondo"
+adapter = "ondo"
+enabled = true
+url = "wss://api.ondoperps.xyz/ws"
+channel = "topOfBooksPerps"
+catalog_source = "exchange"
+metadata_url = "https://api.ondoperps.xyz/v1/markets"
+default_quote_asset = "USD"
+default_settle_asset = "USD"
+default_margin_asset = "USD"
+
+[[venues.instruments]]
+instrument_id = "BTC-USD.P"
+raw_symbol = "BTCUSD"
+feed_symbol = "BTC-USD.P"
+product_type = "perp"
+base_asset = "BTC"
+price_tick = "0.01"
+size_tick = "0.0001"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "ETH-USD.P"
+raw_symbol = "ETHUSD"
+feed_symbol = "ETH-USD.P"
+product_type = "perp"
+base_asset = "ETH"
+price_tick = "0.01"
+size_tick = "0.001"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "XAU-USD.P"
+raw_symbol = "XAUUSD"
+feed_symbol = "XAU-USD.P"
+product_type = "perp"
+base_asset = "XAU"
+price_tick = "0.01"
+size_tick = "0.001"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "MU-USD.P"
+raw_symbol = "MUUSD"
+feed_symbol = "MU-USD.P"
+product_type = "perp"
+base_asset = "MU"
+price_tick = "0.01"
+size_tick = "0.01"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "WTI-USD.P"
+raw_symbol = "WTIUSD"
+feed_symbol = "WTI-USD.P"
+product_type = "perp"
+base_asset = "WTI"
+price_tick = "0.01"
+size_tick = "0.01"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "SPCX-USD.P"
+raw_symbol = "SPCXUSD"
+feed_symbol = "SPCX-USD.P"
+product_type = "perp"
+base_asset = "SPCX"
+price_tick = "0.01"
+size_tick = "0.01"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "XAG-USD.P"
+raw_symbol = "XAGUSD"
+feed_symbol = "XAG-USD.P"
+product_type = "perp"
+base_asset = "XAG"
+price_tick = "0.01"
+size_tick = "0.01"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "META-USD.P"
+raw_symbol = "METAUSD"
+feed_symbol = "META-USD.P"
+product_type = "perp"
+base_asset = "META"
+price_tick = "0.01"
+size_tick = "0.01"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "HOOD-USD.P"
+raw_symbol = "HOODUSD"
+feed_symbol = "HOOD-USD.P"
+product_type = "perp"
+base_asset = "HOOD"
+price_tick = "0.01"
+size_tick = "0.01"
+status = "active"
+
+[[venues.instruments]]
+instrument_id = "CRCL-USD.P"
+raw_symbol = "CRCLUSD"
+feed_symbol = "CRCL-USD.P"
+product_type = "perp"
+base_asset = "CRCL"
+price_tick = "0.01"
+size_tick = "0.1"
+status = "active"
+
 # Selected Lighter markets:
-# BTC:1:674876105.87776, ETH:0:171705864.475813, LIT:120:49283582.227465004, XAU:92:46577718.101387, HYPE:24:37811975.381916, SOL:2:27454686.716285, WTI:145:15408370.26784, SNDK:139:10265549.58947, MU:164:9499809.510561, SKHYNIX:161:5949381.535574, SPCX:194:4906582.675834, BRENTOIL:159:4645663.245911, SOXL:197:4459803.635261, BNB:25:3904726.562411, NVDA:110:3873082.670373, XAG:93:3652474.308292, ZEC:90:3630662.718545, QQQ:129:2679588.604488, US100:181:2535079.188446, INTC:137:1846731.914463
+# BTC:1:524743078.304353, ETH:0:225081864.32414, SOL:2:69868133.838985, HYPE:24:36524649.954915, XAU:92:31914480.678058, LIT:120:19050560.011396, ZEC:90:12608853.932336, MU:164:12277342.045136, SKHYNIX:161:9652794.242036, WTI:145:7817084.638602, SNDK:139:7120811.305562, SPCX:194:5758193.800927, XAG:93:5332793.439867, BRENTOIL:159:4760031.054007, XRP:7:4482715.923269, META:117:4164930.038319, HOOD:108:3826639.086304, SOXL:197:3563822.0605200003, GRAM:12:3448735.096681, CRCL:121:3117032.940015

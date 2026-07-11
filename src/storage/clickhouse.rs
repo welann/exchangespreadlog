@@ -39,8 +39,16 @@ impl ClickHouseSink {
             warn!("ClickHouse batch_size is 0; using 1 because every tick must be flushed");
         }
 
+        if config.accept_invalid_certs {
+            warn!("ClickHouse TLS certificate validation is disabled");
+        }
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(config.accept_invalid_certs)
+            .build()
+            .context("build ClickHouse HTTP client")?;
+
         let sink = Self {
-            client: reqwest::Client::new(),
+            client,
             url,
             database,
             table,
@@ -52,12 +60,26 @@ impl ClickHouseSink {
         };
 
         if config.create_table {
+            sink.ensure_database()
+                .await
+                .context("initialize ClickHouse database")?;
             sink.ensure_table()
                 .await
                 .context("initialize ClickHouse table")?;
         }
 
         Ok(sink)
+    }
+
+    async fn ensure_database(&self) -> anyhow::Result<()> {
+        self.execute_sql_request(
+            format!(
+                "CREATE DATABASE IF NOT EXISTS {}",
+                quote_identifier(&self.database)
+            ),
+            Some("default"),
+        )
+        .await
     }
 
     async fn ensure_table(&self) -> anyhow::Result<()> {
@@ -126,7 +148,8 @@ ORDER BY (venue_instance_id, instrument_id, recv_time)
 TTL toDateTime(recv_time, 'UTC') + INTERVAL 31 DAY DELETE"#
         );
         self.execute_sql(tick_sql).await?;
-        self.ensure_tick_identity_columns().await
+        self.ensure_tick_identity_columns().await?;
+        self.ensure_query_projections().await
     }
 
     async fn ensure_tick_identity_columns(&self) -> anyhow::Result<()> {
@@ -146,6 +169,22 @@ TTL toDateTime(recv_time, 'UTC') + INTERVAL 31 DAY DELETE"#
         }
 
         Ok(())
+    }
+
+    async fn ensure_query_projections(&self) -> anyhow::Result<()> {
+        let table = quote_identifier(&self.table);
+        self.execute_sql(format!(
+            r#"ALTER TABLE {table} ADD PROJECTION IF NOT EXISTS instrument_tick_stats
+(
+    SELECT
+        venue_instance_id,
+        instrument_id,
+        max(recv_time) AS latest_recv_time,
+        count() AS tick_count
+    GROUP BY venue_instance_id, instrument_id
+)"#
+        ))
+        .await
     }
 
     async fn insert_tick_rows(&self, rows: &[BboClickHouseRow]) -> anyhow::Result<()> {
@@ -175,12 +214,19 @@ TTL toDateTime(recv_time, 'UTC') + INTERVAL 31 DAY DELETE"#
     }
 
     async fn execute_sql(&self, sql: String) -> anyhow::Result<()> {
+        self.execute_sql_request(sql, Some(&self.database)).await
+    }
+
+    async fn execute_sql_request(&self, sql: String, database: Option<&str>) -> anyhow::Result<()> {
         let mut request = self
             .client
             .post(&self.url)
-            .query(&[("database", self.database.as_str())])
             .header("Content-Type", "text/plain; charset=utf-8")
             .body(sql);
+
+        if let Some(database) = database {
+            request = request.query(&[("database", database)]);
+        }
 
         if !self.username.is_empty() {
             request = request.basic_auth(&self.username, self.password.as_deref());

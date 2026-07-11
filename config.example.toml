@@ -5,16 +5,17 @@ channel_capacity = 4096
 stale_after_ms = 5000
 
 [storage]
-mode = "jsonl"
+mode = "clickhouse"
 jsonl_dir = "data/bbo"
 
 [storage.clickhouse]
-url = "https://obdata.zeabur.app/"
+url = "https://manyexchanges.zeabur.app/"
 database = "zeabur"
 table = "bbo_ticks"
 catalog_table = "instrument_catalog"
 username = "zeabur"
 password_env = "CLICKHOUSE_PASSWORD"
+accept_invalid_certs = true
 create_table = true
 batch_size = 100
 

@@ -58,6 +58,7 @@ pub struct ClickHouseConfig {
     pub username: String,
     pub password: Option<String>,
     pub password_env: Option<String>,
+    pub accept_invalid_certs: bool,
     pub create_table: bool,
     pub batch_size: usize,
 }
@@ -358,13 +359,14 @@ impl Default for ClickHouseConfig {
     fn default() -> Self {
         Self {
             enabled: None,
-            url: "https://obdata.zeabur.app/".to_string(),
+            url: "https://manyexchanges.zeabur.app/".to_string(),
             database: "zeabur".to_string(),
             table: "bbo_ticks".to_string(),
             catalog_table: "instrument_catalog".to_string(),
             username: "zeabur".to_string(),
             password: None,
             password_env: Some("CLICKHOUSE_PASSWORD".to_string()),
+            accept_invalid_certs: false,
             create_table: true,
             batch_size: 100,
         }
@@ -571,7 +573,11 @@ mod tests {
         assert_eq!(config.storage.mode, Some(StorageMode::Jsonl));
         assert_eq!(config.storage.effective_mode(), StorageMode::Jsonl);
         assert_eq!(config.storage.clickhouse.enabled, None);
-        assert_eq!(config.storage.clickhouse.url, "https://obdata.zeabur.app/");
+        assert_eq!(
+            config.storage.clickhouse.url,
+            "https://manyexchanges.zeabur.app/"
+        );
+        assert!(!config.storage.clickhouse.accept_invalid_certs);
         assert_eq!(config.storage.clickhouse.table, "bbo_ticks");
         assert_eq!(
             config.storage.clickhouse.catalog_table,

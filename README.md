@@ -92,11 +92,12 @@ Important config sections:
 - `storage.mode`: storage target. Supported values are `none`, `jsonl`, `clickhouse`, and `both`.
 - `storage.jsonl_dir`: base output directory, default `data/bbo`.
 - `storage.clickhouse.url`: ClickHouse HTTP endpoint.
-- `storage.clickhouse.database`: ClickHouse database name.
+- `storage.clickhouse.database`: ClickHouse database name. The collector creates it when `create_table = true`.
 - `storage.clickhouse.table`: raw BBO tick table name. The collector creates it when `create_table = true`.
 - `storage.clickhouse.catalog_table`: instrument catalog table name.
 - `storage.clickhouse.username`: ClickHouse HTTP username.
 - `storage.clickhouse.password_env`: environment variable holding the ClickHouse password.
+- `storage.clickhouse.accept_invalid_certs`: explicitly allow a self-signed ClickHouse TLS certificate. Keep this disabled for endpoints with a valid certificate.
 - `storage.clickhouse.batch_size`: number of rows buffered before each HTTP insert.
 - `tui.enabled`: enable or disable the terminal UI.
 - `tui.refresh_ms`: terminal UI refresh interval.
@@ -112,12 +113,13 @@ mode = "clickhouse"
 jsonl_dir = "data/bbo"
 
 [storage.clickhouse]
-url = "https://obdata.zeabur.app/"
+url = "https://manyexchanges.zeabur.app/"
 database = "zeabur"
 table = "bbo_ticks"
 catalog_table = "instrument_catalog"
 username = "zeabur"
 password_env = "CLICKHOUSE_PASSWORD"
+accept_invalid_certs = true
 create_table = true
 batch_size = 100
 ```

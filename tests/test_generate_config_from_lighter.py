@@ -127,6 +127,9 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
 
         rendered = generator.render_config(top_markets, venues)
 
+        self.assertIn('mode = "clickhouse"', rendered)
+        self.assertIn('url = "https://manyexchanges.zeabur.app/"', rendered)
+        self.assertIn("accept_invalid_certs = true", rendered)
         self.assertIn('venue_instance_id = "lighter"', rendered)
         self.assertIn('metadata_url = "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks"', rendered)
         self.assertIn('instrument_id = "1"', rendered)

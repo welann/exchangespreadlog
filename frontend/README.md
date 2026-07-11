@@ -31,6 +31,7 @@ Supported environment variables:
 - `CLICKHOUSE_CATALOG_TABLE`
 - `CLICKHOUSE_USERNAME` or `CLICKHOUSE_USER`
 - `CLICKHOUSE_PASSWORD` or `CLICKHOUSE_PASS`
+- `CLICKHOUSE_ACCEPT_INVALID_CERTS` (only for explicitly trusted self-signed endpoints)
 
 Quote conversion rates are configured in the web page under **Quote conversion**. They are stored in browser localStorage and sent with each spread query, so changing rates does not require restarting the server.
 
@@ -49,12 +50,13 @@ If `/api/health` does not include `apiVersion` and `tickSchema`, the deployed fr
 ```bash
 docker build -t exchangespreadlog-frontend ./frontend
 docker run --rm -p 3000:3000 \
-  -e CLICKHOUSE_URL=https://obdata.zeabur.app/ \
+  -e CLICKHOUSE_URL=https://manyexchanges.zeabur.app/ \
   -e CLICKHOUSE_DATABASE=zeabur \
   -e CLICKHOUSE_TABLE=bbo_ticks \
   -e CLICKHOUSE_CATALOG_TABLE=instrument_catalog \
   -e CLICKHOUSE_USERNAME=zeabur \
   -e CLICKHOUSE_PASSWORD=your-clickhouse-password \
+  -e CLICKHOUSE_ACCEPT_INVALID_CERTS=true \
   exchangespreadlog-frontend
 ```
 
