@@ -11,6 +11,7 @@ type ClickHouseConfig = {
   username: string;
   password: string;
   acceptInvalidCerts: boolean;
+  redirectedLegacyUrl: boolean;
   source: string;
 };
 
@@ -30,6 +31,9 @@ type ClickHouseQueryOptions = {
   maxThreads?: number;
 };
 
+const DEFAULT_CLICKHOUSE_URL = 'https://manyexchanges.zeabur.app';
+const RETIRED_CLICKHOUSE_URL = 'https://obdata.zeabur.app';
+
 let insecureDispatcher: Dispatcher | null = null;
 
 export class ClickHouseError extends Error {
@@ -48,9 +52,10 @@ export function clickHouseConfig(): ClickHouseConfig {
     envValue('CLICKHOUSE_PASSWORD_ENV')?.trim() || fileConfig?.passwordEnv?.trim() || '';
   const passwordFromNamedEnv = passwordEnvName ? envValue(passwordEnvName) : undefined;
 
-  const url = (envValue('CLICKHOUSE_URL') ?? fileConfig?.url ?? 'http://clickhouse.zeabur.internal:8123')
+  const requestedUrl = (envValue('CLICKHOUSE_URL') ?? fileConfig?.url ?? DEFAULT_CLICKHOUSE_URL)
     .trim()
     .replace(/\/+$/, '');
+  const url = requestedUrl === RETIRED_CLICKHOUSE_URL ? DEFAULT_CLICKHOUSE_URL : requestedUrl;
   if (!url) {
     throw new ClickHouseError('CLICKHOUSE_URL is empty');
   }
@@ -85,7 +90,8 @@ export function clickHouseConfig(): ClickHouseConfig {
         envValue('CLICKHOUSE_ACCEPT_INVALID_CERTS')
       ) ??
       fileConfig?.acceptInvalidCerts ??
-      false,
+      url === DEFAULT_CLICKHOUSE_URL,
+    redirectedLegacyUrl: requestedUrl === RETIRED_CLICKHOUSE_URL,
     source: fileConfig?.source ?? 'environment/defaults'
   };
 
@@ -114,6 +120,7 @@ export function clickHouseConfigSummary() {
     username: config.username || null,
     hasPassword: Boolean(config.password),
     acceptInvalidCerts: config.acceptInvalidCerts,
+    redirectedLegacyUrl: config.redirectedLegacyUrl,
     source: config.source
   };
 }

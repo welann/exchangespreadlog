@@ -33,6 +33,8 @@ Supported environment variables:
 - `CLICKHOUSE_PASSWORD` or `CLICKHOUSE_PASS`
 - `CLICKHOUSE_ACCEPT_INVALID_CERTS` (only for explicitly trusted self-signed endpoints)
 
+The retired `https://obdata.zeabur.app/` endpoint is automatically redirected to `https://manyexchanges.zeabur.app/`. Update the deployed `CLICKHOUSE_PASSWORD` secret to the new service password as part of the same migration.
+
 Quote conversion rates are configured in the web page under **Quote conversion**. They are stored in browser localStorage and sent with each spread query, so changing rates does not require restarting the server.
 
 For deployment diagnostics, open `/api/health`. It returns the effective ClickHouse URL/database/table, whether a password was provided, row counts, latest tick time, detected tick schema, usable tick rows, and an `apiVersion`. It never returns the password.
