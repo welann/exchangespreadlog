@@ -15,15 +15,37 @@ type RawInstrument = {
 };
 
 export async function fetchInstruments(catalogIds?: string[]): Promise<Instrument[]> {
+  return queryInstruments(catalogIds, true);
+}
+
+export async function fetchInstrumentMetadata(catalogIds: string[]): Promise<Instrument[]> {
+  return queryInstruments(catalogIds, false);
+}
+
+async function queryInstruments(
+  catalogIds: string[] | undefined,
+  includeTickStats: boolean
+): Promise<Instrument[]> {
   if (catalogIds?.length === 0) return [];
 
-  const tickSchema = await getTickSchema();
-  assertSupportedTickSchema(tickSchema);
-  const stats = tickStatsSql(tickSchema);
+  const stats = includeTickStats
+    ? await getTickSchema().then((tickSchema) => {
+        assertSupportedTickSchema(tickSchema);
+        return tickStatsSql(tickSchema);
+      })
+    : {
+        joinsSql: '',
+        latestRecvMsSql: 'NULL',
+        tickCountSql: '0'
+      };
   const catalogFilter =
     catalogIds && catalogIds.length > 0
       ? `latest.catalog_id IN (${catalogIds.map(quoteString).join(', ')})`
       : "latest.status = 'active'";
+  const catalogSourceFilter =
+    catalogIds && catalogIds.length > 0
+      ? `WHERE catalog_id IN (${catalogIds.map(quoteString).join(', ')})`
+      : '';
 
   const rows = await queryClickHouse<RawInstrument>(`
 SELECT
@@ -47,6 +69,7 @@ FROM
     argMax(quote_asset, inserted_time) AS quote_asset,
     argMax(status, inserted_time) AS status
   FROM ${catalogTable()}
+  ${catalogSourceFilter}
   GROUP BY catalog_id
 ) AS latest
 ${stats.joinsSql}
@@ -103,7 +126,26 @@ function tickStatsSql(schema: Awaited<ReturnType<typeof getTickSchema>>) {
   const latestCandidates: string[] = [];
   const countCandidates: string[] = [];
 
-  if (schema.hasCatalogId) {
+  if (schema.hasStorageIdentity) {
+    joins.push(`
+LEFT JOIN
+(
+  SELECT
+    ticks.venue_instance_id AS venue_instance_id,
+    ticks.instrument_id AS instrument_id,
+    max(ticks.recv_time) AS latest_recv_time,
+    count() AS tick_count
+  FROM ${tickTable()} AS ticks
+  WHERE ticks.venue_instance_id != '' AND ticks.instrument_id != ''
+  GROUP BY ticks.venue_instance_id, ticks.instrument_id
+) AS storage_tick_stats
+  ON latest.venue_instance_id = storage_tick_stats.venue_instance_id
+ AND latest.instrument_id = storage_tick_stats.instrument_id`);
+    latestCandidates.push('storage_tick_stats.latest_recv_time');
+    countCandidates.push('ifNull(storage_tick_stats.tick_count, 0)');
+  }
+
+  if (!schema.hasStorageIdentity && schema.hasCatalogId) {
     joins.push(`
 LEFT JOIN
 (
@@ -119,7 +161,7 @@ LEFT JOIN
     countCandidates.push('ifNull(catalog_tick_stats.tick_count, 0)');
   }
 
-  if (schema.hasLegacyVenueMarket) {
+  if (!schema.hasStorageIdentity && schema.hasLegacyVenueMarket) {
     const legacyWhere = schema.hasCatalogId
       ? "ticks.catalog_id = '' AND ticks.venue != '' AND ticks.market_id != ''"
       : "ticks.venue != '' AND ticks.market_id != ''";

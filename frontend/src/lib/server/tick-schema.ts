@@ -9,6 +9,7 @@ type DescribeRow = {
 export type TickSchema = {
   hasCatalogId: boolean;
   hasLegacyVenueMarket: boolean;
+  hasStorageIdentity: boolean;
   mode: 'catalog_id' | 'legacy_venue_market' | 'hybrid' | 'unsupported';
 };
 
@@ -21,6 +22,8 @@ export function getTickSchema(): Promise<TickSchema> {
     const columns = new Set(rows.map((row) => row.name));
     const hasCatalogId = columns.has('catalog_id');
     const hasLegacyVenueMarket = columns.has('venue') && columns.has('market_id');
+    const hasStorageIdentity =
+      columns.has('venue_instance_id') && columns.has('instrument_id');
     const mode =
       hasCatalogId && hasLegacyVenueMarket
         ? 'hybrid'
@@ -30,7 +33,7 @@ export function getTickSchema(): Promise<TickSchema> {
             ? 'legacy_venue_market'
             : 'unsupported';
 
-    return { hasCatalogId, hasLegacyVenueMarket, mode };
+    return { hasCatalogId, hasLegacyVenueMarket, hasStorageIdentity, mode };
   });
 
   return cachedTickSchema;
@@ -52,6 +55,11 @@ export function tickIdentityWhere(
 ): string {
   assertSupportedTickSchema(schema);
   const prefix = `${alias}.`;
+
+  if (schema.hasStorageIdentity) {
+    return `${prefix}venue_instance_id = ${quoteString(instrument.venueInstanceId)} AND ${prefix}instrument_id = ${quoteString(instrument.instrumentId)}`;
+  }
+
   const predicates = [];
 
   if (schema.hasCatalogId) {
@@ -71,6 +79,11 @@ export function tickIdentityWhere(
 export function usableTickWhere(schema: TickSchema, alias = ''): string {
   assertSupportedTickSchema(schema);
   const prefix = alias ? `${alias}.` : '';
+
+  if (schema.hasStorageIdentity) {
+    return `${prefix}venue_instance_id != '' AND ${prefix}instrument_id != ''`;
+  }
+
   const predicates = [];
   if (schema.hasCatalogId) predicates.push(`${prefix}catalog_id != ''`);
   if (schema.hasLegacyVenueMarket) {

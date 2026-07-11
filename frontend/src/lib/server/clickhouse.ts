@@ -23,6 +23,10 @@ type FileClickHouseConfig = {
   source: string;
 };
 
+type ClickHouseQueryOptions = {
+  maxThreads?: number;
+};
+
 export class ClickHouseError extends Error {
   constructor(
     message: string,
@@ -109,10 +113,16 @@ export function catalogTable(): string {
   return quoteIdentifier(clickHouseConfig().catalogTable);
 }
 
-export async function queryClickHouse<T>(sql: string): Promise<T[]> {
+export async function queryClickHouse<T>(
+  sql: string,
+  options: ClickHouseQueryOptions = {}
+): Promise<T[]> {
   const config = clickHouseConfig();
   const url = new URL(config.url);
   url.searchParams.set('database', config.database);
+  if (options.maxThreads !== undefined) {
+    url.searchParams.set('max_threads', String(options.maxThreads));
+  }
 
   const headers = new Headers({
     'content-type': 'text/plain; charset=utf-8'
