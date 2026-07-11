@@ -122,7 +122,8 @@ ORDER BY (venue_instance_id, instrument_id, catalog_id)"#
 )
 ENGINE = MergeTree
 PARTITION BY toDate(recv_time)
-ORDER BY (venue_instance_id, instrument_id, recv_time)"#
+ORDER BY (venue_instance_id, instrument_id, recv_time)
+TTL toDateTime(recv_time, 'UTC') + INTERVAL 31 DAY DELETE"#
         );
         self.execute_sql(tick_sql).await?;
         self.ensure_tick_identity_columns().await
