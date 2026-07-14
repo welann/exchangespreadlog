@@ -27,6 +27,8 @@ use super::{
     parser::{self, ParsedMessage},
 };
 
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
 #[derive(Debug, Clone)]
 pub struct PerplAdapter {
     venue_instance_id: String,
@@ -118,7 +120,7 @@ impl PerplAdapter {
 
         let mut sid_targets = HashMap::<u64, SidTarget>::new();
         let mut books = PerplBooks::default();
-        let mut heartbeat = time::interval(Duration::from_secs(30));
+        let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
 
         loop {
             tokio::select! {

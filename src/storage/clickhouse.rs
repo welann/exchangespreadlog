@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -10,6 +12,9 @@ use crate::{
     domain::{BboTick, BestLevel, Fixed, InstrumentCatalog, SourceKind},
     storage::BboSink,
 };
+
+const CLICKHOUSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CLICKHOUSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct ClickHouseSink {
     client: reqwest::Client,
@@ -44,6 +49,8 @@ impl ClickHouseSink {
         }
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(config.accept_invalid_certs)
+            .connect_timeout(CLICKHOUSE_CONNECT_TIMEOUT)
+            .timeout(CLICKHOUSE_REQUEST_TIMEOUT)
             .build()
             .context("build ClickHouse HTTP client")?;
 

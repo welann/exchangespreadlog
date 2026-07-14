@@ -162,6 +162,8 @@ fn is_transient_websocket_disconnect(err: &anyhow::Error) -> bool {
         || text.contains("connection reset without closing handshake")
         || text.contains("connection reset by peer")
         || text.contains("broken pipe")
+        || text.contains("reason: \"expired\"")
+        || text.contains("reason: \"ping timeout\"")
 }
 
 #[derive(Debug, Clone)]
@@ -349,6 +351,19 @@ mod tests {
 
         let err = anyhow::anyhow!("Ethereal L2Book gap for BTCUSD");
         assert!(!is_transient_websocket_disconnect(&err));
+    }
+
+    #[test]
+    fn classifies_exchange_close_reasons_as_transient_disconnects() {
+        let err = anyhow::anyhow!(
+            "Hyperliquid websocket closed: Some(CloseFrame {{ code: Normal, reason: \"Expired\" }})"
+        );
+        assert!(is_transient_websocket_disconnect(&err));
+
+        let err = anyhow::anyhow!(
+            "Perpl websocket closed: Some(CloseFrame {{ code: Policy, reason: \"ping timeout\" }})"
+        );
+        assert!(is_transient_websocket_disconnect(&err));
     }
 
     #[test]
