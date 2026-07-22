@@ -76,6 +76,15 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
         self.assertEqual(top[0].market_id, "1")
         self.assertEqual(top[0].volume, Decimal("100"))
 
+    def test_fetch_top_lighter_markets_rejects_an_empty_market_set(self):
+        original = generator.fetch_lighter_details
+        generator.fetch_lighter_details = lambda: []
+        try:
+            with self.assertRaisesRegex(RuntimeError, "no active Lighter perp markets"):
+                generator.fetch_top_lighter_markets(20)
+        finally:
+            generator.fetch_lighter_details = original
+
     def test_fetch_hyperliquid_instruments_includes_hip3_fallback(self):
         original = generator.post_json
         generator.post_json = lambda _url, payload: [
@@ -125,9 +134,20 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
             )
         ]
 
-        rendered = generator.render_config(top_markets, venues)
+        rendered = generator.render_config(
+            top_markets,
+            venues,
+            market_limit=30,
+            daily_at_utc="12:30",
+            generator_script="tools/refresh.py",
+        )
 
         self.assertIn('mode = "clickhouse"', rendered)
+        self.assertIn("[subscription_refresh]", rendered)
+        self.assertIn("enabled = true", rendered)
+        self.assertIn('daily_at_utc = "12:30"', rendered)
+        self.assertIn('generator_script = "tools/refresh.py"', rendered)
+        self.assertIn("market_limit = 30", rendered)
         self.assertIn('url = "https://manyexchanges.zeabur.app/"', rendered)
         self.assertIn("accept_invalid_certs = true", rendered)
         self.assertIn('venue_instance_id = "lighter"', rendered)
@@ -164,6 +184,39 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
         self.assertEqual(len(instruments), 1)
         self.assertEqual(instruments[0].instrument_id, "BTCUSD")
         self.assertEqual(instruments[0].feed_symbol, "BTCUSD")
+
+    def test_fetch_risex_instruments_accepts_current_active_market_payload(self):
+        original = generator.get_json
+        generator.get_json = lambda _url: {
+            "data": {
+                "markets": [
+                    {
+                        "market_id": "1",
+                        "config": {"name": "BTC/USDC", "unlocked": True},
+                        "quote_volume_24h": "1000",
+                        "post_only": False,
+                        "active": True,
+                    },
+                    {
+                        "market_id": "2",
+                        "config": {"name": "ETH/USDC", "unlocked": True},
+                        "quote_volume_24h": "500",
+                        "post_only": False,
+                        "active": False,
+                    },
+                ]
+            }
+        }
+        try:
+            instruments = generator.fetch_risex_instruments(
+                [generator.LighterMarket("1", "BTC", "BTC", Decimal("100"))]
+            )
+        finally:
+            generator.get_json = original
+
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(instruments[0].instrument_id, "1")
+        self.assertEqual(instruments[0].base_asset, "BTC")
 
     def test_fetch_perpl_instruments_uses_context_market_ids_and_ticks(self):
         original = generator.get_json

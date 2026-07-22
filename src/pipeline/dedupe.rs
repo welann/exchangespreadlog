@@ -18,6 +18,11 @@ impl DedupeFilter {
             }
         }
     }
+
+    pub fn reset_venue(&mut self, venue_instance_id: &str) {
+        self.last_by_market
+            .retain(|_, tick| tick.instrument.venue_instance_id != venue_instance_id);
+    }
 }
 
 fn same_observable_bbo(lhs: &BboTick, rhs: &BboTick) -> bool {
@@ -92,5 +97,17 @@ mod tests {
         assert!(filter.should_emit(&tick(Some(1), "1")));
         assert!(filter.should_emit(&tick(Some(2), "1")));
         assert!(filter.should_emit(&tick(Some(2), "1.1")));
+    }
+
+    #[test]
+    fn reset_venue_allows_the_same_tick_after_resubscription() {
+        let mut filter = DedupeFilter::default();
+        let first = tick(Some(1), "1");
+        assert!(filter.should_emit(&first));
+        assert!(!filter.should_emit(&first));
+
+        filter.reset_venue("lighter");
+
+        assert!(filter.should_emit(&first));
     }
 }

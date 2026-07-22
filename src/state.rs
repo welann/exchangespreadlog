@@ -47,6 +47,13 @@ impl BboStore {
         self.ticks.insert(tick.instrument.catalog_id.clone(), tick);
     }
 
+    pub fn reset_venue(&mut self, venue_instance_id: &str) {
+        self.catalogs
+            .retain(|_, catalog| catalog.venue_instance_id != venue_instance_id);
+        self.ticks
+            .retain(|_, tick| tick.instrument.venue_instance_id != venue_instance_id);
+    }
+
     pub fn snapshot(&self) -> BboSnapshot {
         let mut ticks = self.ticks.values().cloned().collect::<Vec<_>>();
         ticks.sort_by(|lhs, rhs| {
@@ -198,5 +205,26 @@ mod tests {
         let snapshot = store.snapshot();
         assert_eq!(snapshot.markets, vec!["BTC".to_string()]);
         assert_eq!(snapshot.rows_for_market("BTC").len(), 2);
+    }
+
+    #[test]
+    fn reset_venue_removes_only_that_venues_catalogs_and_ticks() {
+        let mut store = BboStore::new(QuoteRateBook::default());
+        let lighter = catalog("lighter", "1", "BTC", "BTC", "USDC");
+        let hyperliquid = catalog("hyperliquid", "BTC", "BTC", "BTC", "USDC");
+        for instrument in [&lighter, &hyperliquid] {
+            store.update_catalog(instrument.clone());
+            store.update_tick(tick(instrument));
+        }
+
+        store.reset_venue("lighter");
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.ticks.len(), 1);
+        assert_eq!(snapshot.catalogs.len(), 1);
+        assert_eq!(
+            snapshot.ticks[0].instrument.venue_instance_id,
+            "hyperliquid"
+        );
     }
 }

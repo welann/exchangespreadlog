@@ -50,7 +50,10 @@ async fn main() -> Result<()> {
     if let Some(storage) = args.storage {
         config.storage.mode = Some(storage);
     }
-    AppRunner::new(config).run().await
+    AppRunner::new(config)
+        .with_config_path(args.config)
+        .run()
+        .await
 }
 
 fn install_crypto_provider() {

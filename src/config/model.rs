@@ -12,10 +12,20 @@ use crate::domain::{
 pub struct Config {
     pub mode: String,
     pub pipeline: PipelineConfig,
+    pub subscription_refresh: SubscriptionRefreshConfig,
     pub storage: StorageConfig,
     pub tui: TuiConfig,
     pub quote_rates: Vec<QuoteRateConfig>,
     pub venues: Vec<VenueConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubscriptionRefreshConfig {
+    pub enabled: bool,
+    pub daily_at_utc: String,
+    pub generator_script: String,
+    pub market_limit: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +80,7 @@ pub struct TuiConfig {
     pub refresh_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VenueConfig {
     pub venue_instance_id: String,
@@ -96,7 +106,7 @@ pub enum CatalogSource {
     Exchange,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstrumentConfig {
     pub instrument_id: String,
     pub raw_symbol: String,
@@ -132,10 +142,14 @@ pub struct QuoteRateConfig {
 }
 
 impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)?;
+        Ok(toml::from_str(&raw)?)
+    }
+
     pub fn load_or_default(path: &Path) -> Result<Self> {
         if path.exists() {
-            let raw = fs::read_to_string(path)?;
-            Ok(toml::from_str(&raw)?)
+            Self::load(path)
         } else {
             Ok(Self::default())
         }
@@ -159,6 +173,7 @@ impl Default for Config {
         Self {
             mode: "bbo".to_string(),
             pipeline: PipelineConfig::default(),
+            subscription_refresh: SubscriptionRefreshConfig::default(),
             storage: StorageConfig::default(),
             tui: TuiConfig::default(),
             quote_rates: vec![
@@ -273,6 +288,17 @@ impl Default for Config {
                     instruments: default_ondo_instruments(),
                 },
             ],
+        }
+    }
+}
+
+impl Default for SubscriptionRefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            daily_at_utc: "00:05".to_string(),
+            generator_script: "scripts/generate_config_from_lighter.py".to_string(),
+            market_limit: 20,
         }
     }
 }
@@ -568,6 +594,9 @@ mod tests {
         let config: Config = toml::from_str(&toml).unwrap();
 
         assert_eq!(config.mode, "bbo");
+        assert!(!config.subscription_refresh.enabled);
+        assert_eq!(config.subscription_refresh.daily_at_utc, "00:05");
+        assert_eq!(config.subscription_refresh.market_limit, 20);
         assert!(config.tui.enabled);
         assert_eq!(config.tui.refresh_ms, 250);
         assert_eq!(config.storage.mode, Some(StorageMode::Jsonl));
@@ -685,6 +714,7 @@ mod tests {
     #[test]
     fn config_example_uses_lighter_mainnet_market_ids() {
         let config: Config = toml::from_str(include_str!("../../config.example.toml")).unwrap();
+        assert!(!config.subscription_refresh.enabled);
         let lighter = config
             .venues
             .iter()
@@ -765,5 +795,27 @@ size_unit = "contracts"
         let catalog = config.venues[0].catalog();
         assert_eq!(catalog[0].price_convention, PriceConvention::QuotePerBase);
         assert_eq!(catalog[0].size_unit, SizeUnit::Contracts);
+    }
+
+    #[test]
+    fn parses_daily_subscription_refresh_settings() {
+        let config: Config = toml::from_str(
+            r#"
+[subscription_refresh]
+enabled = true
+daily_at_utc = "00:05"
+generator_script = "scripts/generate_config_from_lighter.py"
+market_limit = 30
+"#,
+        )
+        .unwrap();
+
+        assert!(config.subscription_refresh.enabled);
+        assert_eq!(config.subscription_refresh.daily_at_utc, "00:05");
+        assert_eq!(
+            config.subscription_refresh.generator_script,
+            "scripts/generate_config_from_lighter.py"
+        );
+        assert_eq!(config.subscription_refresh.market_limit, 30);
     }
 }

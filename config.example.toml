@@ -4,6 +4,12 @@ mode = "bbo"
 channel_capacity = 4096
 stale_after_ms = 5000
 
+[subscription_refresh]
+enabled = false
+daily_at_utc = "00:05"
+generator_script = "scripts/generate_config_from_lighter.py"
+market_limit = 20
+
 [storage]
 mode = "clickhouse"
 jsonl_dir = "data/bbo"

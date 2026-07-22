@@ -71,4 +71,5 @@ impl BboTick {
 pub enum MarketEvent {
     Catalog { instrument: InstrumentCatalog },
     Tick { tick: BboTick },
+    VenueReset { venue_instance_id: String },
 }
