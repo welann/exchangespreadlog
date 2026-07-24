@@ -14,12 +14,52 @@ type RawInstrument = {
   tickCount: number | string | null;
 };
 
+const INSTRUMENT_CACHE_TTL_MS = 30_000;
+const MAX_METADATA_CACHE_ENTRIES = 512;
+
+let cachedInstruments: { expiresAt: number; value: Instrument[] } | null = null;
+let instrumentsInFlight: Promise<Instrument[]> | null = null;
+const metadataByCatalogId = new Map<string, Instrument>();
+
 export async function fetchInstruments(catalogIds?: string[]): Promise<Instrument[]> {
-  return queryInstruments(catalogIds, true);
+  if (catalogIds) return queryInstruments(catalogIds, true);
+  if (cachedInstruments && cachedInstruments.expiresAt > Date.now()) {
+    return cachedInstruments.value;
+  }
+  if (instrumentsInFlight) return instrumentsInFlight;
+
+  instrumentsInFlight = queryInstruments(undefined, true)
+    .then((instruments) => {
+      rememberInstrumentMetadata(instruments);
+      cachedInstruments = {
+        expiresAt: Date.now() + INSTRUMENT_CACHE_TTL_MS,
+        value: instruments
+      };
+      return instruments;
+    })
+    .finally(() => {
+      instrumentsInFlight = null;
+    });
+  return instrumentsInFlight;
 }
 
 export async function fetchInstrumentMetadata(catalogIds: string[]): Promise<Instrument[]> {
-  return queryInstruments(catalogIds, false);
+  const uniqueIds = [...new Set(catalogIds)];
+  const cached = uniqueIds
+    .map((catalogId) => metadataByCatalogId.get(catalogId))
+    .filter((instrument): instrument is Instrument => instrument !== undefined);
+  const cachedIds = new Set(cached.map((instrument) => instrument.catalogId));
+  const missingIds = uniqueIds.filter((catalogId) => !cachedIds.has(catalogId));
+  if (missingIds.length === 0) return cached;
+
+  const fetched = await queryInstruments(missingIds, false);
+  rememberInstrumentMetadata(fetched);
+  const byCatalogId = new Map(
+    [...cached, ...fetched].map((instrument) => [instrument.catalogId, instrument])
+  );
+  return uniqueIds
+    .map((catalogId) => byCatalogId.get(catalogId))
+    .filter((instrument): instrument is Instrument => instrument !== undefined);
 }
 
 async function queryInstruments(
@@ -42,10 +82,10 @@ async function queryInstruments(
     catalogIds && catalogIds.length > 0
       ? `latest.catalog_id IN (${catalogIds.map(quoteString).join(', ')})`
       : "latest.status = 'active'";
-  const catalogSourceFilter =
+  const latestCatalogSql =
     catalogIds && catalogIds.length > 0
-      ? `WHERE catalog_id IN (${catalogIds.map(quoteString).join(', ')})`
-      : '';
+      ? selectedCatalogSql(catalogIds)
+      : latestStorageIdentityCatalogSql();
 
   const rows = await queryClickHouse<RawInstrument>(`
 SELECT
@@ -60,17 +100,7 @@ SELECT
   ${stats.tickCountSql} AS tickCount
 FROM
 (
-  SELECT
-    catalog_id,
-    argMax(venue_instance_id, inserted_time) AS venue_instance_id,
-    argMax(instrument_id, inserted_time) AS instrument_id,
-    argMax(raw_symbol, inserted_time) AS raw_symbol,
-    argMax(base_asset, inserted_time) AS base_asset,
-    argMax(quote_asset, inserted_time) AS quote_asset,
-    argMax(status, inserted_time) AS status
-  FROM ${catalogTable()}
-  ${catalogSourceFilter}
-  GROUP BY catalog_id
+  ${latestCatalogSql}
 ) AS latest
 ${stats.joinsSql}
 WHERE ${catalogFilter}
@@ -83,7 +113,21 @@ FORMAT JSONEachRow
 
 export function groupMarkets(instruments: Instrument[]): Market[] {
   const markets = new Map<string, Instrument[]>();
+  const uniqueInstruments = new Map<string, Instrument>();
   for (const instrument of instruments) {
+    if (instrument.latestRecvMs === null || instrument.tickCount <= 0) continue;
+    const key = `${instrument.venueInstanceId}\u0000${instrument.instrumentId}`;
+    const current = uniqueInstruments.get(key);
+    if (
+      !current ||
+      (instrument.latestRecvMs ?? 0) > (current.latestRecvMs ?? 0) ||
+      instrument.tickCount > current.tickCount
+    ) {
+      uniqueInstruments.set(key, instrument);
+    }
+  }
+
+  for (const instrument of uniqueInstruments.values()) {
     const rows = markets.get(instrument.baseAsset) ?? [];
     rows.push(instrument);
     markets.set(instrument.baseAsset, rows);
@@ -96,6 +140,47 @@ export function groupMarkets(instruments: Instrument[]): Market[] {
     }))
     .filter((market) => market.instruments.length >= 2)
     .sort((a, b) => a.baseAsset.localeCompare(b.baseAsset));
+}
+
+function selectedCatalogSql(catalogIds: string[]): string {
+  return `
+  SELECT
+    catalog_id,
+    argMax(venue_instance_id, inserted_time) AS venue_instance_id,
+    argMax(instrument_id, inserted_time) AS instrument_id,
+    argMax(raw_symbol, inserted_time) AS raw_symbol,
+    argMax(base_asset, inserted_time) AS base_asset,
+    argMax(quote_asset, inserted_time) AS quote_asset,
+    argMax(status, inserted_time) AS status
+  FROM ${catalogTable()}
+  WHERE catalog_id IN (${catalogIds.map(quoteString).join(', ')})
+  GROUP BY catalog_id`;
+}
+
+function latestStorageIdentityCatalogSql(): string {
+  return `
+  SELECT
+    argMax(catalog_id, inserted_time) AS catalog_id,
+    venue_instance_id,
+    instrument_id,
+    argMax(raw_symbol, inserted_time) AS raw_symbol,
+    argMax(base_asset, inserted_time) AS base_asset,
+    argMax(quote_asset, inserted_time) AS quote_asset,
+    argMax(status, inserted_time) AS status
+  FROM ${catalogTable()}
+  GROUP BY venue_instance_id, instrument_id`;
+}
+
+function rememberInstrumentMetadata(instruments: Instrument[]): void {
+  for (const instrument of instruments) {
+    metadataByCatalogId.delete(instrument.catalogId);
+    metadataByCatalogId.set(instrument.catalogId, instrument);
+  }
+  while (metadataByCatalogId.size > MAX_METADATA_CACHE_ENTRIES) {
+    const oldest = metadataByCatalogId.keys().next().value;
+    if (typeof oldest !== 'string') break;
+    metadataByCatalogId.delete(oldest);
+  }
 }
 
 function toInstrument(row: RawInstrument): Instrument {

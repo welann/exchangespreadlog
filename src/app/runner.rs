@@ -227,6 +227,7 @@ impl AdapterManager {
             info!("subscription refresh found no changes");
             return Ok(());
         }
+        let retired_instruments = self.plan.retired_instruments(&next);
 
         // Build every replacement first so one invalid venue cannot partially update the plan.
         let prepared = prepare_adapters(diff.upserted.iter())?;
@@ -241,6 +242,14 @@ impl AdapterManager {
 
         for venue_id in &reset_ids {
             self.stop(venue_id).await;
+        }
+        for instrument in &retired_instruments {
+            self.tx
+                .send(MarketEvent::Catalog {
+                    instrument: instrument.clone(),
+                })
+                .await
+                .context("retire removed instrument before applying subscription refresh")?;
         }
         for venue_id in &reset_ids {
             self.tx
@@ -257,6 +266,7 @@ impl AdapterManager {
         info!(
             removed = ?diff.removed,
             restarted = ?diff.upserted.iter().map(|venue| &venue.venue_instance_id).collect::<Vec<_>>(),
+            retired_instruments = retired_instruments.len(),
             "subscription plan updated"
         );
         self.plan = next;

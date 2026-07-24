@@ -1,5 +1,8 @@
 use std::time::Duration;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveTime, TimeZone, Utc};
@@ -10,7 +13,10 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-use crate::config::{Config, SubscriptionRefreshConfig, VenueConfig};
+use crate::{
+    config::{Config, SubscriptionRefreshConfig, VenueConfig},
+    domain::InstrumentCatalog,
+};
 
 fn next_refresh_delay(now: DateTime<Utc>, daily_at_utc: &str) -> Result<Duration> {
     let time = NaiveTime::parse_from_str(daily_at_utc, "%H:%M")?;
@@ -207,6 +213,31 @@ impl SubscriptionPlan {
         Ok(())
     }
 
+    pub fn retired_instruments(&self, next: &Self) -> Vec<InstrumentCatalog> {
+        self.venues
+            .iter()
+            .flat_map(|(venue_id, venue)| {
+                let next_ids = next
+                    .venues
+                    .get(venue_id)
+                    .map(|next_venue| {
+                        next_venue
+                            .instruments
+                            .iter()
+                            .map(|instrument| instrument.instrument_id.as_str())
+                            .collect::<HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+
+                venue
+                    .catalog()
+                    .into_iter()
+                    .filter(move |instrument| !next_ids.contains(instrument.instrument_id.as_str()))
+                    .map(|instrument| instrument.with_status("inactive"))
+            })
+            .collect()
+    }
+
     pub fn venues(&self) -> impl Iterator<Item = &VenueConfig> {
         self.venues.values()
     }
@@ -270,6 +301,28 @@ mod tests {
         let error = current.validate_replacement(&empty).unwrap_err();
 
         assert!(error.to_string().contains("empty subscription plan"));
+    }
+
+    #[test]
+    fn removed_instruments_are_retired_in_the_catalog() {
+        let config = Config::default();
+        let current = SubscriptionPlan::from_venues(&config.venues[..2]).unwrap();
+        let removed_id = config.venues[1]
+            .instruments
+            .last()
+            .unwrap()
+            .instrument_id
+            .clone();
+        let mut next_venues = config.venues[..2].to_vec();
+        next_venues[1].instruments.pop();
+        let next = SubscriptionPlan::from_venues(&next_venues).unwrap();
+
+        let retired = current.retired_instruments(&next);
+
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].venue_instance_id, "lighter");
+        assert_eq!(retired[0].instrument_id, removed_id);
+        assert_eq!(retired[0].status, "inactive");
     }
 
     #[test]

@@ -221,6 +221,27 @@ impl InstrumentCatalog {
             &self.raw_symbol
         }
     }
+
+    pub fn with_status(&self, status: impl Into<String>) -> Self {
+        Self::new_with_units(
+            self.venue_instance_id.clone(),
+            self.instrument_id.clone(),
+            self.raw_symbol.clone(),
+            self.feed_symbol.clone(),
+            self.product_type,
+            self.base_asset.clone(),
+            self.quote_asset.clone(),
+            self.settle_asset.clone(),
+            self.margin_asset.clone(),
+            self.price_convention,
+            self.size_unit,
+            self.price_tick,
+            self.size_tick,
+            self.min_size,
+            status,
+            self.source_raw_json.clone(),
+        )
+    }
 }
 
 impl ProductType {
@@ -342,5 +363,31 @@ mod tests {
         );
 
         assert_ne!(first.catalog_id, second.catalog_id);
+    }
+
+    #[test]
+    fn changing_status_creates_a_new_catalog_version_for_the_same_storage_identity() {
+        let active = InstrumentCatalog::new(
+            "lighter",
+            "1",
+            "BTC",
+            Some("1".to_string()),
+            ProductType::Perp,
+            "BTC",
+            "USDC",
+            "USDC",
+            "USDC",
+            None,
+            None,
+            None,
+            "active",
+            None,
+        );
+        let inactive = active.with_status("inactive");
+
+        assert_ne!(active.catalog_id, inactive.catalog_id);
+        assert_eq!(active.venue_instance_id, inactive.venue_instance_id);
+        assert_eq!(active.instrument_id, inactive.instrument_id);
+        assert_eq!(inactive.status, "inactive");
     }
 }

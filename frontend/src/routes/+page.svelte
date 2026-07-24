@@ -1,8 +1,13 @@
 <script lang="ts">
+  import { replaceState } from '$app/navigation';
   import { onMount } from 'svelte';
   import type { Market, QuoteRate, SpreadPoint, SpreadResponse } from '$lib/types';
 
   const RATE_STORAGE_KEY = 'exchangespreadlog.quoteRates';
+  const MAX_SPREAD_CACHE_ENTRIES = 12;
+  const SPREAD_CACHE_TTL_MS = 5 * 60 * 1000;
+  const LIVE_PAIR_GRACE_MS = 5 * 60 * 1000;
+  const LIVE_ANCHOR_INTERVAL_MS = 15 * 1000;
   const CHART = {
     width: 980,
     height: 430,
@@ -85,6 +90,10 @@
     slideWindow?: boolean;
     updateUrl?: boolean;
   };
+  type CachedSpread = {
+    response: SpreadResponse;
+    loadedAt: number;
+  };
 
   type IntervalStats = {
     max: number | null;
@@ -118,6 +127,7 @@
   let refreshSeconds = 15;
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
   let spreadRequestSeq = 0;
+  const spreadCache = new Map<string, CachedSpread>();
 
   let marketError = '';
   let queryError = '';
@@ -130,6 +140,7 @@
 
   $: currentMarket = markets.find((market) => market.baseAsset === selectedBase);
   $: currentInstruments = currentMarket?.instruments ?? [];
+  $: selectedPairIsLive = selectionFollowsLive(currentInstruments, selectedA, selectedB);
   $: venueOptions = buildVenueOptions(markets);
   $: venuePairMarkets = commonMarketsForVenues(markets, selectedVenueA, selectedVenueB);
   $: totalTicks = tickCountForInstruments(currentInstruments);
@@ -152,8 +163,8 @@
   $: positionedAverageLines = positionAverageLines(averageLines, yBounds);
   $: averageScopeSummary = averageScopeLabel(averageScope, averagePercentValue);
   $: bestPath = displayMode === 'best' ? bestLinePath(points, xBounds, yBounds) : '';
-  $: aPath = displayMode === 'both' && showAToB ? linePath(points, 'aToB', xBounds, yBounds) : '';
-  $: bPath = displayMode === 'both' && showBToA ? linePath(points, 'bToA', xBounds, yBounds) : '';
+  $: aPath = displayMode === 'both' && showAToB ? linePath(points, 'aToBBp', xBounds, yBounds) : '';
+  $: bPath = displayMode === 'both' && showBToA ? linePath(points, 'bToABp', xBounds, yBounds) : '';
   $: zeroY = yScale(0, yBounds);
   $: activeIndex = hoverIndex >= 0 ? hoverIndex : selectedIndex;
   $: activePoint = points[activeIndex] ?? null;
@@ -222,7 +233,7 @@
     }
 
     if (options.slideWindow && selectedPreset !== 'custom') {
-      rangeAnchorMs = Date.now();
+      rangeAnchorMs = anchorForSelection(instrumentsForBase(selectedBase), catalogA, catalogB);
     }
 
     const range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
@@ -234,8 +245,29 @@
     const requestId = ++spreadRequestSeq;
     const previousSelectedPoint = selectedIndex >= 0 ? points[selectedIndex] : null;
     const wasFollowingLatest = selectedIndex < 0 || selectedIndex >= points.length - 1;
+    const payload = {
+      catalogA,
+      catalogB,
+      fromMs: range.fromMs,
+      toMs: range.toMs,
+      ...spreadQueryOptions(range),
+      rates: cleanRates(rates)
+    };
+    const cacheKey = spreadCacheKey(payload);
+    const cached = readSpreadCache(cacheKey);
+    const usedCached = cached !== null && !options.silent;
 
-    if (options.silent) {
+    if (usedCached) {
+      spread = cached.response;
+      selectedIndex = nextSelectedIndex(
+        cached.response.points,
+        previousSelectedPoint?.tsMs ?? null,
+        wasFollowingLatest,
+        options.preservePoint
+      );
+      loadingSpread = false;
+      refreshingSpread = true;
+    } else if (options.silent) {
       refreshingSpread = true;
     } else {
       loadingSpread = true;
@@ -248,28 +280,30 @@
       const response = await fetch('/api/spread', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          catalogA,
-          catalogB,
-          fromMs: range.fromMs,
-          toMs: range.toMs,
-          ...spreadQueryOptions(range),
-          rates: cleanRates(rates)
-        })
+        body: JSON.stringify(payload)
       });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error ?? 'Failed to query spread');
       if (requestId !== spreadRequestSeq || selectedA !== catalogA || selectedB !== catalogB) return;
-      spread = body as SpreadResponse;
-      selectedIndex = nextSelectedIndex(spread.points, previousSelectedPoint?.tsMs ?? null, wasFollowingLatest, options.preservePoint);
+      const nextSpread = body as SpreadResponse;
+      rememberSpread(cacheKey, nextSpread);
+      spread = nextSpread;
+      selectedIndex = nextSelectedIndex(
+        nextSpread.points,
+        previousSelectedPoint?.tsMs ?? null,
+        wasFollowingLatest,
+        options.preservePoint
+      );
       if (options.updateUrl !== false) {
         syncQueryState();
       }
     } catch (error) {
       if (requestId !== spreadRequestSeq || selectedA !== catalogA || selectedB !== catalogB) return;
-      spread = null;
-      selectedIndex = -1;
-      queryError = error instanceof Error ? error.message : 'Failed to query spread';
+      if (!usedCached) {
+        spread = null;
+        selectedIndex = -1;
+        queryError = error instanceof Error ? error.message : 'Failed to query spread';
+      }
     } finally {
       if (requestId === spreadRequestSeq) {
         loadingSpread = false;
@@ -363,7 +397,7 @@
     selectedB = option.instrumentB.catalogId;
     selectedIndex = -1;
     hoverIndex = -1;
-    rangeAnchorMs = latestForInstruments(option.market.instruments) ?? Date.now();
+    rangeAnchorMs = anchorForSelection(option.market.instruments, selectedA, selectedB);
     syncVenueSelectionFromSelectedLegs();
     await loadSpreadWhenReady({ slideWindow: true });
   }
@@ -374,6 +408,7 @@
   }
 
   async function refreshCurrentSpread(options: LoadSpreadOptions = {}) {
+    if (options.silent && !selectionFollowsLive(currentInstruments, selectedA, selectedB)) return;
     await loadSpreadWhenReady({ slideWindow: true, ...options });
   }
 
@@ -505,6 +540,32 @@
       .filter((rate) => rate.from && rate.to && rate.rate);
   }
 
+  function spreadCacheKey(payload: object) {
+    return JSON.stringify(payload);
+  }
+
+  function readSpreadCache(key: string): CachedSpread | null {
+    const cached = spreadCache.get(key);
+    if (!cached) return null;
+    if (Date.now() - cached.loadedAt > SPREAD_CACHE_TTL_MS) {
+      spreadCache.delete(key);
+      return null;
+    }
+    spreadCache.delete(key);
+    spreadCache.set(key, cached);
+    return cached;
+  }
+
+  function rememberSpread(key: string, response: SpreadResponse) {
+    spreadCache.delete(key);
+    spreadCache.set(key, { response, loadedAt: Date.now() });
+    while (spreadCache.size > MAX_SPREAD_CACHE_ENTRIES) {
+      const oldest = spreadCache.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      spreadCache.delete(oldest);
+    }
+  }
+
   function spreadQueryOptions(range: { fromMs: number; toMs: number }) {
     if (range.toMs - range.fromMs <= 60 * 60 * 1000) {
       return { precision: 'bucket', bucketSeconds: 15 };
@@ -564,7 +625,7 @@
       selectedA;
     selectedB = catalogB;
 
-    rangeAnchorMs = latestForInstruments(instruments) ?? Date.now();
+    rangeAnchorMs = anchorForSelection(instruments, selectedA, selectedB);
     selectedPreset = presets.some((preset) => preset.value === state?.preset)
       ? (state?.preset ?? selectedPreset)
       : selectedPreset;
@@ -619,7 +680,7 @@
     params.set('preset', selectedPreset);
     params.set('from', String(Math.trunc(range.fromMs)));
     params.set('to', String(Math.trunc(range.toMs)));
-    window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}${window.location.hash}`);
+    replaceState(`${window.location.pathname}?${params.toString()}${window.location.hash}`, {});
   }
 
   function handlePreset(value: string) {
@@ -756,8 +817,8 @@
         mode === 'best'
           ? [bestSpreadValue(point)]
           : [
-              includeAToB ? point.aToB : null,
-              includeBToA ? point.bToA : null
+              includeAToB ? point.aToBBp : null,
+              includeBToA ? point.bToABp : null
             ]
       )
       .filter((value): value is number => value !== null && Number.isFinite(value));
@@ -788,7 +849,7 @@
         id: 'aToB',
         label: 'A-B AVG',
         tone: 'a',
-        values: data.map((point) => point.aToB).filter((value): value is number => value !== null && Number.isFinite(value))
+        values: data.map((point) => point.aToBBp).filter((value): value is number => value !== null && Number.isFinite(value))
       });
     }
     if (includeBToA) {
@@ -796,7 +857,7 @@
         id: 'bToA',
         label: 'B-A AVG',
         tone: 'b',
-        values: data.map((point) => point.bToA).filter((value): value is number => value !== null && Number.isFinite(value))
+        values: data.map((point) => point.bToABp).filter((value): value is number => value !== null && Number.isFinite(value))
       });
     }
     return series;
@@ -846,7 +907,7 @@
 
   function linePath(
     data: SpreadPoint[],
-    key: 'aToB' | 'bToA',
+    key: 'aToBBp' | 'bToABp',
     x: { min: number; max: number },
     y: { min: number; max: number }
   ) {
@@ -987,6 +1048,61 @@
     return latest.length > 0 ? Math.max(...latest) : null;
   }
 
+  function instrumentsForBase(baseAsset: string) {
+    return markets.find((market) => market.baseAsset === baseAsset)?.instruments ?? [];
+  }
+
+  function anchorForSelection(
+    instruments: Market['instruments'],
+    catalogA: string,
+    catalogB: string
+  ) {
+    const pairLatest = [catalogA, catalogB]
+      .map(
+        (catalogId) =>
+          instruments.find((instrument) => instrument.catalogId === catalogId)?.latestRecvMs ?? null
+      )
+      .filter((value): value is number => value !== null && Number.isFinite(value));
+    const comparableLatest = pairLatest.length > 0 ? Math.min(...pairLatest) : null;
+    const globalLatest = latestForInstruments(markets.flatMap((market) => market.instruments));
+    if (selectionFollowsLive(instruments, catalogA, catalogB)) {
+      return Math.floor(Date.now() / LIVE_ANCHOR_INTERVAL_MS) * LIVE_ANCHOR_INTERVAL_MS;
+    }
+    return comparableLatest ?? globalLatest ?? Date.now();
+  }
+
+  function selectionFollowsLive(
+    instruments: Market['instruments'],
+    catalogA: string,
+    catalogB: string
+  ) {
+    const pairLatest = [catalogA, catalogB]
+      .map(
+        (catalogId) =>
+          instruments.find((instrument) => instrument.catalogId === catalogId)?.latestRecvMs ?? null
+      )
+      .filter((value): value is number => value !== null && Number.isFinite(value));
+    if (pairLatest.length < 2) return false;
+    const globalLatest = latestForInstruments(markets.flatMap((market) => market.instruments));
+    return globalLatest !== null && globalLatest - Math.min(...pairLatest) <= LIVE_PAIR_GRACE_MS;
+  }
+
+  function marketComparableLatest(market: Market) {
+    const latest = market.instruments
+      .map((instrument) => instrument.latestRecvMs)
+      .filter((value): value is number => value !== null && Number.isFinite(value))
+      .sort((left, right) => right - left);
+    return latest[1] ?? latest[0] ?? null;
+  }
+
+  function marketActivityLabel(market: Market) {
+    const latest = marketComparableLatest(market);
+    const globalLatest = latestForInstruments(markets.flatMap((item) => item.instruments));
+    if (latest === null) return '无样本';
+    if (globalLatest !== null && globalLatest - latest <= LIVE_PAIR_GRACE_MS) return '活跃';
+    return `截至 ${formatTime(latest)}`;
+  }
+
   function marketPairLabel(market: Market) {
     const quotes = [...new Set(market.instruments.map((instrument) => instrument.quoteAsset).filter(Boolean))];
     if (quotes.length === 0) return `${market.baseAsset}/QUOTE`;
@@ -1056,7 +1172,7 @@
   }
 
   function bestSpreadValue(point: SpreadPoint | null) {
-    return opportunityForPoint(point)?.value ?? null;
+    return opportunityForPoint(point)?.bp ?? null;
   }
 
   function bestBpValue(point: SpreadPoint | null) {
@@ -1196,7 +1312,7 @@
     if (meta.granularity === 'raw') {
       return `${formatInteger(meta.sourceRows)} raw ticks`;
     }
-    return `${meta.bucketSeconds}s extrema`;
+    return `${meta.bucketSeconds}s snapshot`;
   }
 
   function formatBp(value: number | null) {
@@ -1259,7 +1375,6 @@
 <main id="spread-main" class="desk-shell">
   <header class="topbar">
     <div class="brand-lockup">
-      <span class="status-dot" aria-hidden="true"></span>
       <div>
         <strong>SPREADDESK</strong>
         <span>跨交易所价差监控</span>
@@ -1268,7 +1383,15 @@
     <div class="topbar-meta" aria-live="polite">
       <span>数据源: ClickHouse</span>
       <span>{points.length > 0 ? `${formatInteger(points.length)} samples / ${sampleLabel(spread?.meta)}` : loadingMarkets ? '读取市场中' : '等待样本'}</span>
-      <span>{refreshingSpread ? '同步当前组合中' : autoRefresh ? `实时 ${refreshSeconds}s` : '实时已暂停'}</span>
+      <span>
+        {refreshingSpread
+          ? '同步当前组合中'
+          : !selectedPairIsLive
+            ? '历史快照'
+            : autoRefresh
+              ? `实时 ${refreshSeconds}s`
+              : '实时已暂停'}
+      </span>
       <span class="route-badge">{routeCode}</span>
       <button
         type="button"
@@ -1344,7 +1467,7 @@
                   </span>
                   <span class="market-meta">
                     <span>{formatInteger(market.instruments.length)} venues</span>
-                    <span>{formatInteger(tickCountForInstruments(market.instruments))} ticks</span>
+                    <span>{marketActivityLabel(market)}</span>
                   </span>
                 </button>
               {/each}
@@ -1498,7 +1621,7 @@
       {/if}
 
       <details class="sidebar-details">
-        <summary>换算率 / 实时</summary>
+        <summary>换算率 / 刷新</summary>
         <div class="rate-stack">
           {#each rates as rate, index (index)}
             <div class="rate-row">
@@ -1565,7 +1688,6 @@
     <section class="main-panel" aria-label="价差曲线">
       <div class="pair-header">
         <div>
-          <p class="eyebrow">Spread curve</p>
           <h1>{selectedBase || 'No market'}/{spread?.meta.targetQuote ?? selectedInstrumentA?.quoteAsset ?? '-'}</h1>
           <p>{selectedLabel(selectedA)} vs {selectedLabel(selectedB)}</p>
         </div>
@@ -1770,7 +1892,7 @@
                 x={CHART.width - CHART.right - 8}
                 y={line.labelY}
               >
-                {line.label} {formatNumber(line.value)}
+                {line.label} {formatBp(line.value)}
               </text>
             {/each}
             {#if displayMode === 'best'}
@@ -1783,10 +1905,10 @@
                 <path class="spread-line b" d={bPath} />
               {/if}
             {/if}
-            <text class="axis-label y top" x="12" y={CHART.top + 4}>{formatNumber(yBounds.max)}</text>
-            <text class="axis-label y middle" x="12" y={zeroY + 4}>0</text>
+            <text class="axis-label y top" x="12" y={CHART.top + 4}>{formatBp(yBounds.max)}</text>
+            <text class="axis-label y middle" x="12" y={zeroY + 4}>0 bp</text>
             <text class="axis-label y bottom" x="12" y={CHART.height - CHART.bottom}>
-              {formatNumber(yBounds.min)}
+              {formatBp(yBounds.min)}
             </text>
             <text class="axis-label x" x={CHART.left} y={CHART.height - 12}>
               {formatAxisTime(xBounds.min)}
@@ -1812,20 +1934,20 @@
                   height="10"
                 />
               {:else}
-                {#if showAToB && activePoint.aToB !== null}
+                {#if showAToB && activePoint.aToBBp !== null}
                   <rect
                     class="point a"
                     x={xScale(activePoint.tsMs, xBounds) - 5}
-                    y={yScale(activePoint.aToB, yBounds) - 5}
+                    y={yScale(activePoint.aToBBp, yBounds) - 5}
                     width="10"
                     height="10"
                   />
                 {/if}
-                {#if showBToA && activePoint.bToA !== null}
+                {#if showBToA && activePoint.bToABp !== null}
                   <rect
                     class="point b"
                     x={xScale(activePoint.tsMs, xBounds) - 5}
-                    y={yScale(activePoint.bToA, yBounds) - 5}
+                    y={yScale(activePoint.bToABp, yBounds) - 5}
                     width="10"
                     height="10"
                   />
@@ -1839,7 +1961,7 @@
           {#if spread?.meta.granularity === 'raw'}
             当前短窗口使用数据库逐 tick BBO 更新计算价差；每个样本来自 A/B 任一侧的新盘口，并与另一侧最新盘口对齐。
           {:else}
-            当前先按事件流维护 A/B 最新盘口，再在每个 bucket 内选择可交易价差最极端的真实状态；盘口超过 {formatMaybeDuration(spread?.meta.maxStaleMs ?? null)} 未更新的状态会被跳过。
+            每个 bucket 展示结束时刻的 A/B 最新有效盘口，纵轴统一为 bp；质量异常或超过 {formatMaybeDuration(spread?.meta.maxStaleMs ?? null)} 未更新的状态会被跳过。
           {/if}
         </p>
       </section>
@@ -1987,8 +2109,10 @@
 
       <section class="meta-card">
         <div class="meta-row">
-          <span>Live</span>
-          <strong>{autoRefresh ? `${refreshSeconds}s` : 'Paused'}</strong>
+          <span>Mode</span>
+          <strong>
+            {selectedPairIsLive ? (autoRefresh ? `${refreshSeconds}s live` : 'Paused') : 'Historical'}
+          </strong>
         </div>
         <div class="meta-row">
           <span>Window</span>
@@ -2032,7 +2156,8 @@
     color: var(--foreground);
     background: var(--background);
     font-family:
-      Geist, Inter, "Helvetica Neue", Helvetica, "Noto Sans SC", "Microsoft YaHei UI", Arial, sans-serif;
+      ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Noto Sans CJK SC", "Microsoft YaHei UI", Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
     -webkit-tap-highlight-color: rgba(48, 214, 151, 0.18);
   }
@@ -2066,9 +2191,7 @@
     display: flex;
     min-height: 100dvh;
     flex-direction: column;
-    background:
-      radial-gradient(circle at 80% 0%, rgba(48, 214, 151, 0.05), transparent 30rem),
-      var(--background);
+    background: var(--background);
   }
 
   .topbar {
@@ -2097,38 +2220,14 @@
     min-width: 0;
   }
 
-  .status-dot {
-    width: 8px;
-    height: 8px;
-    flex: 0 0 auto;
-    border-radius: 999px;
-    background: var(--primary);
-    box-shadow: 0 0 18px rgba(48, 214, 151, 0.7);
-  }
-
   .brand-lockup div {
     display: grid;
     gap: 1px;
   }
 
-  .brand-lockup strong,
-  .topbar-meta,
-  .eyebrow,
-  .sidebar-heading,
-  .section-heading,
-  .stats-heading,
-  label span,
-  dt,
-  .chart-help,
-  .chart-caption,
-  .market-meta,
-  .meta-row span {
-    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
-  }
-
   .brand-lockup strong {
     font-size: 0.8rem;
-    letter-spacing: 0.14em;
+    letter-spacing: 0.08em;
   }
 
   .brand-lockup span,
@@ -2233,8 +2332,7 @@
     color: var(--muted-foreground);
     font-size: 0.75rem;
     font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+    letter-spacing: 0.02em;
   }
 
   .sidebar-heading strong,
@@ -2406,7 +2504,6 @@
 
   .selected-legs span {
     color: var(--muted-foreground);
-    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
     font-size: 0.68rem;
     font-weight: 700;
     letter-spacing: 0.12em;
@@ -2485,7 +2582,6 @@
   .leg-choice-actions button {
     min-height: 30px;
     padding: 0;
-    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
   }
 
   label {
@@ -2498,8 +2594,7 @@
     color: var(--muted-foreground);
     font-size: 0.72rem;
     font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+    letter-spacing: 0.02em;
   }
 
   select,
@@ -2616,15 +2711,6 @@
     gap: 18px;
   }
 
-  .eyebrow {
-    margin: 0 0 6px;
-    color: var(--muted-foreground);
-    font-size: 0.74rem;
-    font-weight: 600;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-  }
-
   h1,
   p,
   dl {
@@ -2638,7 +2724,7 @@
     line-height: 1;
   }
 
-  .pair-header p:not(.eyebrow) {
+  .pair-header p {
     margin-top: 7px;
     color: var(--muted-foreground);
     font-size: 0.92rem;
@@ -2661,7 +2747,7 @@
   }
 
   .latest-card strong {
-    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
     font-size: 1.15rem;
     font-variant-numeric: tabular-nums;
   }
@@ -2694,8 +2780,7 @@
     color: var(--muted-foreground);
     font-size: 0.72rem;
     font-weight: 750;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+    letter-spacing: 0.02em;
   }
 
   .range-cluster {
@@ -2774,7 +2859,7 @@
     padding: 0 8px;
     color: var(--muted-foreground);
     background: var(--card);
-    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
     font-size: 0.78rem;
   }
 
@@ -2789,7 +2874,7 @@
     padding: 0;
     color: var(--foreground);
     background: transparent;
-    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
     text-align: right;
   }
 
@@ -2841,7 +2926,7 @@
 
   .chart-heading strong {
     color: var(--foreground);
-    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
     font-variant-numeric: tabular-nums;
     font-weight: 600;
   }
@@ -2906,7 +2991,7 @@
 
   .average-label {
     fill: var(--foreground);
-    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
     font-size: 12px;
     font-weight: 650;
     paint-order: stroke;
@@ -2961,7 +3046,7 @@
 
   .axis-label {
     fill: var(--muted-foreground);
-    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
     font-size: 12px;
   }
 
@@ -2999,7 +3084,7 @@
   .point-ledger dd,
   .stat-list dd,
   .meta-row strong {
-    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
     font-feature-settings:
       "tnum" 1,
       "zero" 1;
@@ -3053,7 +3138,6 @@
     border-radius: 999px;
     padding: 4px 8px;
     color: var(--muted-foreground);
-    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
     font-size: 0.7rem;
   }
 
@@ -3084,8 +3168,7 @@
     color: var(--muted-foreground);
     font-size: 0.72rem;
     font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
+    letter-spacing: 0.01em;
   }
 
   dd {
@@ -3156,7 +3239,6 @@
   .meta-row span {
     color: var(--muted-foreground);
     font-size: 0.72rem;
-    text-transform: uppercase;
   }
 
   .positive {
@@ -3212,6 +3294,13 @@
   }
 
   @media (max-width: 760px) {
+    .market-list,
+    .exchange-market-list {
+      max-height: min(46vh, 420px);
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+
     .topbar,
     .pair-header,
     .chart-heading {

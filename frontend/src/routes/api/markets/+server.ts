@@ -5,10 +5,17 @@ import { ClickHouseError } from '$lib/server/clickhouse';
 export const GET: RequestHandler = async () => {
   try {
     const instruments = await fetchInstruments();
-    return json({
-      generatedAt: new Date().toISOString(),
-      markets: groupMarkets(instruments)
-    });
+    return json(
+      {
+        generatedAt: new Date().toISOString(),
+        markets: groupMarkets(instruments)
+      },
+      {
+        headers: {
+          'cache-control': 'public, max-age=15, stale-while-revalidate=45'
+        }
+      }
+    );
   } catch (error) {
     return apiError(error);
   }

@@ -3,13 +3,15 @@ import type { QuoteRate, SpreadPoint, SpreadResponse } from '$lib/types';
 import { fetchInstrumentMetadata } from '$lib/server/catalog';
 import { ClickHouseError, numericLiteral, queryClickHouse, tickTable } from '$lib/server/clickhouse';
 import { resolveRates } from '$lib/server/rates';
-import { getTickSchema, tickIdentityWhere } from '$lib/server/tick-schema';
+import { getTickSchema, tickIdentityWhere, type TickSchema } from '$lib/server/tick-schema';
 
 const MAX_RANGE_MS = 31 * 24 * 60 * 60 * 1000;
 const TARGET_POINTS = 420;
 const RAW_EXPLICIT_MAX_RANGE_MS = 6 * 60 * 60 * 1000;
 const MAX_RAW_TICK_ROWS = 100_000;
 const SPREAD_QUERY_OPTIONS = { maxThreads: 2 } as const;
+const SPREAD_CACHE_TTL_MS = 20_000;
+const MAX_SPREAD_CACHE_ENTRIES = 48;
 
 type SpreadRequest = {
   catalogA?: unknown;
@@ -54,6 +56,11 @@ type BookRowsResult = {
   tickRows: RawTickRow[];
 };
 
+type CachedSpreadResult = {
+  expiresAt: number;
+  promise: Promise<SpreadQueryResult>;
+};
+
 type RawTickRow = {
   side: 'a' | 'b';
   tsMs: number | string;
@@ -88,6 +95,8 @@ type TickEvent = {
   tsNs: bigint;
 };
 
+const spreadResultCache = new Map<string, CachedSpreadResult>();
+
 export const POST: RequestHandler = async ({ request }) => {
   try {
     const payload = (await request.json()) as SpreadRequest;
@@ -110,6 +119,12 @@ export const POST: RequestHandler = async ({ request }) => {
     if (instrumentA.baseAsset !== instrumentB.baseAsset) {
       throw new ClickHouseError('Selected instruments must share the same base asset', 400);
     }
+    if (
+      instrumentA.venueInstanceId === instrumentB.venueInstanceId &&
+      instrumentA.instrumentId === instrumentB.instrumentId
+    ) {
+      throw new ClickHouseError('Choose two distinct venue instruments', 400);
+    }
 
     const { targetQuote, aRate, bRate } = resolveRates(
       instrumentA.quoteAsset,
@@ -121,29 +136,37 @@ export const POST: RequestHandler = async ({ request }) => {
       granularity === 'bucket' ? parseBucketSeconds(payload.bucketSeconds, fromMs, toMs) : 0;
     const maxStaleMs = maxStaleMsForBucket(granularity === 'bucket' ? bucketSeconds : 15);
     const tickSchema = await getTickSchema();
-    const result =
+    const queryInput = {
+      instrumentA,
+      instrumentB,
+      fromMs,
+      toMs,
+      aRate,
+      bRate,
+      maxStaleMs,
+      tickSchema
+    };
+    const cacheKey = [
+      instrumentA.venueInstanceId,
+      instrumentA.instrumentId,
+      instrumentB.venueInstanceId,
+      instrumentB.instrumentId,
+      fromMs,
+      toMs,
+      granularity,
+      bucketSeconds,
+      aRate,
+      bRate,
+      maxStaleMs
+    ].join('|');
+    const result = await cachedSpreadResult(cacheKey, () =>
       granularity === 'raw'
-        ? await fetchRawSpreadPoints({
-            instrumentA,
-            instrumentB,
-            fromMs,
-            toMs,
-            aRate,
-            bRate,
-            maxStaleMs,
-            tickSchema
+        ? fetchRawSpreadPoints(queryInput)
+        : fetchBucketedSpreadPoints({
+            ...queryInput,
+            bucketSeconds
           })
-        : await fetchBucketedSpreadPoints({
-            instrumentA,
-            instrumentB,
-            fromMs,
-            toMs,
-            bucketSeconds,
-            aRate,
-            bRate,
-            maxStaleMs,
-            tickSchema
-          });
+    );
 
     const points = result.points;
 
@@ -163,7 +186,11 @@ export const POST: RequestHandler = async ({ request }) => {
       },
       points
     };
-    return json(response);
+    return json(response, {
+      headers: {
+        'cache-control': 'private, max-age=15'
+      }
+    });
   } catch (error) {
     return apiError(error);
   }
@@ -177,6 +204,35 @@ async function fetchSelectedInstruments(catalogA: string, catalogB: string) {
     throw new ClickHouseError('Selected instrument was not found in instrument_catalog', 400);
   }
   return [instrumentA, instrumentB] as const;
+}
+
+function cachedSpreadResult(
+  key: string,
+  load: () => Promise<SpreadQueryResult>
+): Promise<SpreadQueryResult> {
+  const now = Date.now();
+  const cached = spreadResultCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    spreadResultCache.delete(key);
+    spreadResultCache.set(key, cached);
+    return cached.promise;
+  }
+  if (cached) spreadResultCache.delete(key);
+
+  const promise = load().catch((error) => {
+    spreadResultCache.delete(key);
+    throw error;
+  });
+  spreadResultCache.set(key, {
+    expiresAt: now + SPREAD_CACHE_TTL_MS,
+    promise
+  });
+  while (spreadResultCache.size > MAX_SPREAD_CACHE_ENTRIES) {
+    const oldest = spreadResultCache.keys().next().value;
+    if (typeof oldest !== 'string') break;
+    spreadResultCache.delete(oldest);
+  }
+  return promise;
 }
 
 async function fetchRawSpreadPoints(input: BaseSpreadInput): Promise<SpreadQueryResult> {
@@ -213,7 +269,7 @@ async function fetchBucketedSpreadPoints(
   });
 
   return {
-    points: buildBucketExtremeSpreadPoints(
+    points: buildBucketSnapshotSpreadPoints(
       seedRows,
       tickRows,
       input.fromMs,
@@ -230,6 +286,7 @@ async function fetchBucketedSpreadPoints(
 async function fetchExactBookRows(input: ExactBookRowsInput): Promise<BookRowsResult> {
   const whereA = tickIdentityWhere(input.tickSchema, input.instrumentA, 'ticks');
   const whereB = tickIdentityWhere(input.tickSchema, input.instrumentB, 'ticks');
+  const validBooks = validBookWhere(input.tickSchema, 'ticks');
   const limit = input.maxRows + 1;
 
   const [seedRows, tickRows] = await Promise.all([
@@ -255,8 +312,7 @@ FROM ${tickTable()} AS ticks
 WHERE ((${whereA}) OR (${whereB}))
   AND ticks.recv_time >= start_time
   AND ticks.recv_time <= end_time
-  AND ticks.bid_price IS NOT NULL
-  AND ticks.ask_price IS NOT NULL
+  AND ${validBooks}
 ORDER BY tsMs ASC, tsNs ASC, side ASC
 LIMIT ${limit}
 FORMAT JSONEachRow
@@ -276,6 +332,7 @@ FORMAT JSONEachRow
 async function fetchSampledBookRows(input: SampledBookRowsInput): Promise<BookRowsResult> {
   const whereA = tickIdentityWhere(input.tickSchema, input.instrumentA, 'ticks');
   const whereB = tickIdentityWhere(input.tickSchema, input.instrumentB, 'ticks');
+  const validBooks = validBookWhere(input.tickSchema, 'ticks');
   const sampleSeconds = Math.max(1, Math.trunc(input.sampleSeconds));
 
   const [seedRows, tickRows] = await Promise.all([
@@ -287,7 +344,7 @@ WITH
 SELECT *
 FROM
 (
-  ${sampledCandidateSelect(whereA, whereB, sampleSeconds)}
+  ${sampledCandidateSelect(whereA, whereB, validBooks, sampleSeconds, input.fromMs)}
 )
 ORDER BY tsMs ASC, tsNs ASC, side ASC
 FORMAT JSONEachRow
@@ -301,6 +358,7 @@ async function fetchSeedRows(input: BookRowsInput): Promise<RawTickRow[]> {
   const alias = 'seed_ticks';
   const whereA = tickIdentityWhere(input.tickSchema, input.instrumentA, alias);
   const whereB = tickIdentityWhere(input.tickSchema, input.instrumentB, alias);
+  const validBooks = validBookWhere(input.tickSchema, alias);
   const rowTuple = tickRowTuple(alias);
   const seedFromMs = input.fromMs - input.maxStaleMs;
 
@@ -330,47 +388,54 @@ FROM
   WHERE ((${whereA}) OR (${whereB}))
     AND ${alias}.recv_time >= seed_start_time
     AND ${alias}.recv_time < start_time
-    AND ${alias}.bid_price IS NOT NULL
-    AND ${alias}.ask_price IS NOT NULL
+    AND ${validBooks}
   GROUP BY side
 )
 FORMAT JSONEachRow
 `, SPREAD_QUERY_OPTIONS);
 }
 
-function sampledCandidateSelect(whereA: string, whereB: string, sampleSeconds: number) {
+function sampledCandidateSelect(
+  whereA: string,
+  whereB: string,
+  validBooks: string,
+  sampleSeconds: number,
+  fromMs: number
+) {
   const alias = 'ticks';
   const rowTuple = tickRowTuple(alias);
+  const sampleMs = sampleSeconds * 1000;
   return `
   SELECT
     side,
-    toUnixTimestamp64Milli(tupleElement(candidate, 1)) AS tsMs,
-    tupleElement(candidate, 2) AS tsNs,
-    tupleElement(candidate, 3) AS bid,
-    tupleElement(candidate, 4) AS ask,
-    tupleElement(candidate, 5) AS bidSize,
-    tupleElement(candidate, 6) AS askSize,
-    tupleElement(candidate, 7) AS bidSizeText,
-    tupleElement(candidate, 8) AS askSizeText,
-    tupleElement(candidate, 9) AS bidOrderCount,
-    tupleElement(candidate, 10) AS askOrderCount,
-    tupleElement(candidate, 11) AS mid
+    toUnixTimestamp64Milli(tupleElement(latest_row, 1)) AS tsMs,
+    tupleElement(latest_row, 2) AS tsNs,
+    tupleElement(latest_row, 3) AS bid,
+    tupleElement(latest_row, 4) AS ask,
+    tupleElement(latest_row, 5) AS bidSize,
+    tupleElement(latest_row, 6) AS askSize,
+    tupleElement(latest_row, 7) AS bidSizeText,
+    tupleElement(latest_row, 8) AS askSizeText,
+    tupleElement(latest_row, 9) AS bidOrderCount,
+    tupleElement(latest_row, 10) AS askOrderCount,
+    tupleElement(latest_row, 11) AS mid
   FROM
   (
     SELECT
       if(${whereA}, 'a', 'b') AS side,
-      argMax(${rowTuple}, ${alias}.recv_ts_ns) AS latest_row,
-      argMax(${rowTuple}, tuple(${alias}.bid_price, ${alias}.recv_ts_ns)) AS max_bid_row,
-      argMin(${rowTuple}, tuple(${alias}.ask_price, ${alias}.recv_ts_ns)) AS min_ask_row
+      argMax(${rowTuple}, ${alias}.recv_ts_ns) AS latest_row
     FROM ${tickTable()} AS ${alias}
     WHERE ((${whereA}) OR (${whereB}))
       AND ${alias}.recv_time >= start_time
       AND ${alias}.recv_time <= end_time
-      AND ${alias}.bid_price IS NOT NULL
-      AND ${alias}.ask_price IS NOT NULL
-    GROUP BY side, toStartOfInterval(${alias}.recv_time, INTERVAL ${sampleSeconds} SECOND)
+      AND ${validBooks}
+    GROUP BY
+      side,
+      intDiv(
+        toUnixTimestamp64Milli(${alias}.recv_time) - ${numericLiteral(fromMs)},
+        ${numericLiteral(sampleMs)}
+      )
   )
-  ARRAY JOIN [latest_row, max_bid_row, min_ask_row] AS candidate
 `;
 }
 
@@ -388,6 +453,27 @@ function tickRowTuple(alias: string): string {
       ${alias}.ask_order_count,
       ${alias}.mid
     )`;
+}
+
+function validBookWhere(schema: TickSchema, alias: string): string {
+  const prefix = `${alias}.`;
+  const predicates = [
+    `${prefix}bid_price IS NOT NULL`,
+    `${prefix}ask_price IS NOT NULL`,
+    `${prefix}bid_price > 0`,
+    `${prefix}ask_price > 0`,
+    `${prefix}bid_price <= ${prefix}ask_price`,
+    `(${prefix}bid_size IS NULL OR ${prefix}bid_size > 0)`,
+    `(${prefix}ask_size IS NULL OR ${prefix}ask_size > 0)`
+  ];
+  if (schema.hasQualityFlags) {
+    predicates.push(
+      `${prefix}quality_gap = false`,
+      `${prefix}quality_stale = false`,
+      `${prefix}quality_inconsistent = false`
+    );
+  }
+  return predicates.join('\n      AND ');
 }
 
 function buildEventSpreadPoints(
@@ -410,7 +496,7 @@ function buildEventSpreadPoints(
   return points;
 }
 
-function buildBucketExtremeSpreadPoints(
+function buildBucketSnapshotSpreadPoints(
   seedRows: RawTickRow[],
   tickRows: RawTickRow[],
   fromMs: number,
@@ -428,25 +514,23 @@ function buildBucketExtremeSpreadPoints(
 
   for (let bucketStart = fromMs; bucketStart < toMs; bucketStart += bucketMs) {
     const bucketEnd = Math.min(toMs, bucketStart + bucketMs);
-    const includeEnd = bucketEnd >= toMs;
-    let bucketPoint = pointFromFreshState(bucketStart, state.latestA, state.latestB, aRate, bRate, maxStaleMs);
 
     while (eventIndex < events.length) {
       const event = events[eventIndex];
-      const eventTs = event.snapshot.tsMs;
-      if (eventTs < bucketStart) {
-        applyTickEvent(state, event);
-        eventIndex += 1;
-        continue;
-      }
-      if (eventTs > bucketEnd || (!includeEnd && eventTs >= bucketEnd)) break;
+      if (event.snapshot.tsMs > bucketEnd) break;
 
       applyTickEvent(state, event);
-      const eventPoint = pointFromFreshState(eventTs, state.latestA, state.latestB, aRate, bRate, maxStaleMs);
-      bucketPoint = moreExtremePoint(bucketPoint, eventPoint);
       eventIndex += 1;
     }
 
+    const bucketPoint = pointFromFreshState(
+      bucketEnd,
+      state.latestA,
+      state.latestB,
+      aRate,
+      bRate,
+      maxStaleMs
+    );
     if (bucketPoint) points.push(bucketPoint);
   }
 
@@ -513,34 +597,6 @@ function hasFreshSnapshots(tsMs: number, a: TickSnapshot, b: TickSnapshot, maxSt
     tsMs - a.tsMs <= maxStaleMs &&
     tsMs - b.tsMs <= maxStaleMs
   );
-}
-
-function moreExtremePoint(current: SpreadPoint | null, candidate: SpreadPoint | null) {
-  if (!candidate) return current;
-  if (!current) return candidate;
-
-  const currentRank = pointExtremeRank(current);
-  const candidateRank = pointExtremeRank(candidate);
-  if (candidateRank.tier !== currentRank.tier) {
-    return candidateRank.tier > currentRank.tier ? candidate : current;
-  }
-  if (candidateRank.value !== currentRank.value) {
-    return candidateRank.value > currentRank.value ? candidate : current;
-  }
-  return candidate.tsMs >= current.tsMs ? candidate : current;
-}
-
-function pointExtremeRank(point: SpreadPoint) {
-  const values = [point.aToBBp, point.bToABp].filter(
-    (value): value is number => value !== null && Number.isFinite(value)
-  );
-  if (values.length === 0) return { tier: -1, value: Number.NEGATIVE_INFINITY };
-
-  const positives = values.filter((value) => value > 0);
-  if (positives.length > 0) {
-    return { tier: 1, value: Math.max(...positives) };
-  }
-  return { tier: 0, value: Math.max(...values.map((value) => Math.abs(value))) };
 }
 
 function normalizeTick(row: RawTickRow | null): TickSnapshot | null {
@@ -649,7 +705,7 @@ function parseBucketSeconds(value: unknown, fromMs: number, toMs: number): numbe
 }
 
 function maxStaleMsForBucket(bucketSeconds: number): number {
-  return clamp(Math.trunc(bucketSeconds * 1000 * 4), 30_000, 5 * 60_000);
+  return clamp(Math.trunc(bucketSeconds * 1000 * 2), 10_000, 60_000);
 }
 
 function sampleSecondsForBucket(bucketSeconds: number): number {

@@ -10,6 +10,7 @@ export type TickSchema = {
   hasCatalogId: boolean;
   hasLegacyVenueMarket: boolean;
   hasStorageIdentity: boolean;
+  hasQualityFlags: boolean;
   mode: 'catalog_id' | 'legacy_venue_market' | 'hybrid' | 'unsupported';
 };
 
@@ -24,6 +25,10 @@ export function getTickSchema(): Promise<TickSchema> {
     const hasLegacyVenueMarket = columns.has('venue') && columns.has('market_id');
     const hasStorageIdentity =
       columns.has('venue_instance_id') && columns.has('instrument_id');
+    const hasQualityFlags =
+      columns.has('quality_gap') &&
+      columns.has('quality_stale') &&
+      columns.has('quality_inconsistent');
     const mode =
       hasCatalogId && hasLegacyVenueMarket
         ? 'hybrid'
@@ -33,7 +38,7 @@ export function getTickSchema(): Promise<TickSchema> {
             ? 'legacy_venue_market'
             : 'unsupported';
 
-    return { hasCatalogId, hasLegacyVenueMarket, hasStorageIdentity, mode };
+    return { hasCatalogId, hasLegacyVenueMarket, hasStorageIdentity, hasQualityFlags, mode };
   });
 
   return cachedTickSchema;
