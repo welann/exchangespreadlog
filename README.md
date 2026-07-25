@@ -68,20 +68,20 @@ You can also print the built-in default config:
 cargo run -- --print-default-config
 ```
 
-Generate a config from all active Lighter perp markets:
+Generate a config for active Lighter perp markets that are also available on at least one other supported venue:
 
 ```bash
 uv run python scripts/generate_config_from_lighter.py --output config.generated.toml
 cargo run -- --config config.generated.toml
 ```
 
-By default the generator selects every active Lighter perp market. A positive `--limit` can still be used as an optional capacity cap; capped selections are ordered by `daily_quote_token_volume`:
+By default the generator takes the deduplicated union of the Hyperliquid, RiseX, 01, Ethereal, Perpl, and Ondo catalogs, intersects it with Lighter's active perp catalog, and subscribes every resulting Lighter market. A positive `--limit` can still be used as an optional capacity cap; it is applied by `daily_quote_token_volume` only after the intersection is calculated:
 
 ```bash
 uv run python scripts/generate_config_from_lighter.py --limit 30 --output config.generated.toml
 ```
 
-The generated config uses Lighter's active perp catalog as the source set, then queries each supported venue for the exchange-specific subscription key. A market is included for a venue only when the script can match the normalized base asset exactly. For example, Lighter market `BTC` maps to Lighter feed `1`, Hyperliquid feed `BTC`, RiseX feed `1`, 01 feed `BTCUSD`, Ethereal feed `BTCUSD`, and Ondo feed `BTC-USD.P` when those markets exist in the corresponding metadata.
+The generated config uses Lighter as the comparison anchor but does not subscribe Lighter-only markets. A market is included only when its normalized base asset exists on Lighter and at least one other supported venue. Each venue then receives only its exact matches from that selected set. For example, Lighter market `BTC` maps to Lighter feed `1`, Hyperliquid feed `BTC`, RiseX feed `1`, 01 feed `BTCUSD`, Ethereal feed `BTCUSD`, and Ondo feed `BTC-USD.P` when those markets exist in the corresponding metadata.
 
 Generated configs enable automatic subscription refresh at `00:05` UTC every day. At that time the collector runs the same generator, validates the new TOML, compares each venue's subscription plan, and restarts only venues whose settings or instruments changed. Removed markets are cleared from the live TUI state; historical storage is retained. Generation or validation failures leave the current subscriptions running.
 
@@ -97,7 +97,7 @@ generator_script = "scripts/generate_config_from_lighter.py"
 market_limit = 0
 ```
 
-`market_limit = 0` means all active Lighter perp markets; a positive value applies the optional volume-ranked cap. `daily_at_utc` uses `HH:MM` in UTC. Set `enabled = false` to disable in-process refresh. The runtime needs `uv`, Python, the generator script, network access, and write access to the active config path. The Docker image includes these dependencies; its entrypoint performs the initial generation before starting the collector, and the collector handles later daily refreshes.
+`market_limit = 0` means the full Lighter/other-venue intersection; a positive value applies the optional volume-ranked cap after matching. `daily_at_utc` uses `HH:MM` in UTC. Set `enabled = false` to disable in-process refresh. The runtime needs `uv`, Python, the generator script, network access, and write access to the active config path. The Docker image includes these dependencies; its entrypoint performs the initial generation before starting the collector, and the collector handles later daily refreshes.
 
 `config.example.toml` leaves refresh disabled so running directly against the tracked example cannot overwrite it. Configs produced by the generator enable refresh by default.
 

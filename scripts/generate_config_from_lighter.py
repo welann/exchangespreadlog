@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate an exchangespreadlog config from Lighter's active perp markets.
+"""Generate an exchangespreadlog config for markets comparable with Lighter.
 
-Lighter is the source catalog. Other venues are only used to resolve the
-exchange-specific instrument identifier for the same base asset. By default
-all active Lighter perp markets are selected.
+The selected base assets are the intersection of Lighter's active perp catalog
+and the deduplicated union of all other supported venues. Other venues also
+subscribe only to that selected set.
 """
 
 from __future__ import annotations
@@ -202,7 +202,7 @@ def fetch_lighter_details() -> list[dict[str, object]]:
     return details
 
 
-def fetch_lighter_markets(limit: int = 0) -> list[LighterMarket]:
+def fetch_active_lighter_markets() -> list[LighterMarket]:
     ranked = [
         LighterMarket(
             market_id=str(market["market_id"]),
@@ -224,25 +224,47 @@ def fetch_lighter_markets(limit: int = 0) -> list[LighterMarket]:
             continue
         selected.append(market)
         seen.add(market.base_asset)
-        if limit > 0 and len(selected) == limit:
-            break
     if not selected:
         raise RuntimeError("no active Lighter perp markets found")
     return selected
 
 
-def select_in_top_order(
+def select_in_lighter_order(
     by_base: dict[str, Instrument],
-    top_markets: list[LighterMarket],
+    lighter_markets: list[LighterMarket],
 ) -> list[Instrument]:
     return [
         by_base[market.base_asset]
-        for market in top_markets
+        for market in lighter_markets
         if market.base_asset in by_base
     ]
 
 
-def fetch_hyperliquid_instruments(top_markets: list[LighterMarket]) -> list[Instrument]:
+def select_comparable_lighter_markets(
+    lighter_markets: list[LighterMarket],
+    other_venue_instruments: list[list[Instrument]],
+    limit: int = 0,
+) -> list[LighterMarket]:
+    other_venue_bases = {
+        item.base_asset
+        for venue_instruments in other_venue_instruments
+        for item in venue_instruments
+    }
+    selected = [
+        market for market in lighter_markets if market.base_asset in other_venue_bases
+    ]
+    if limit > 0:
+        selected = selected[:limit]
+    if not selected:
+        raise RuntimeError(
+            "no active Lighter perp markets are available on another supported venue"
+        )
+    return selected
+
+
+def fetch_hyperliquid_instruments(
+    lighter_markets: list[LighterMarket],
+) -> list[Instrument]:
     data = post_json(HYPERLIQUID_INFO_URL, {"type": "allPerpMetas"})
     if isinstance(data, dict):
         metas = [data]
@@ -264,10 +286,10 @@ def fetch_hyperliquid_instruments(top_markets: list[LighterMarket]) -> list[Inst
                 continue
             base = normalize_base(name)
             by_base.setdefault(base, instrument(name, name, name, base))
-    return select_in_top_order(by_base, top_markets)
+    return select_in_lighter_order(by_base, lighter_markets)
 
 
-def fetch_risex_instruments(top_markets: list[LighterMarket]) -> list[Instrument]:
+def fetch_risex_instruments(lighter_markets: list[LighterMarket]) -> list[Instrument]:
     data = get_json(RISEX_MARKETS_URL)
     if not isinstance(data, dict):
         raise RuntimeError("RiseX markets returned a non-object payload")
@@ -301,10 +323,12 @@ def fetch_risex_instruments(top_markets: list[LighterMarket]) -> list[Instrument
         if base not in best or score > best[base][0]:
             best[base] = (score, candidate)
 
-    return select_in_top_order({base: item for base, (_, item) in best.items()}, top_markets)
+    return select_in_lighter_order(
+        {base: item for base, (_, item) in best.items()}, lighter_markets
+    )
 
 
-def fetch_zero_one_instruments(top_markets: list[LighterMarket]) -> list[Instrument]:
+def fetch_zero_one_instruments(lighter_markets: list[LighterMarket]) -> list[Instrument]:
     data = get_json(ZERO_ONE_INFO_URL)
     if not isinstance(data, dict) or not isinstance(data.get("markets"), list):
         raise RuntimeError("01 info payload is missing markets")
@@ -319,10 +343,10 @@ def fetch_zero_one_instruments(top_markets: list[LighterMarket]) -> list[Instrum
             continue
         base = normalize_base(symbol)
         by_base.setdefault(base, instrument(market_id, symbol, symbol, base))
-    return select_in_top_order(by_base, top_markets)
+    return select_in_lighter_order(by_base, lighter_markets)
 
 
-def fetch_ethereal_instruments(top_markets: list[LighterMarket]) -> list[Instrument]:
+def fetch_ethereal_instruments(lighter_markets: list[LighterMarket]) -> list[Instrument]:
     data = get_json(ETHEREAL_PRODUCTS_URL)
     products = None
     if isinstance(data, dict):
@@ -345,10 +369,10 @@ def fetch_ethereal_instruments(top_markets: list[LighterMarket]) -> list[Instrum
         raw_symbol = product.get("displayTicker") or ticker
         base = normalize_base(product.get("baseTokenName") or ticker)
         by_base.setdefault(base, instrument(ticker, raw_symbol, ticker, base))
-    return select_in_top_order(by_base, top_markets)
+    return select_in_lighter_order(by_base, lighter_markets)
 
 
-def fetch_perpl_instruments(top_markets: list[LighterMarket]) -> list[Instrument]:
+def fetch_perpl_instruments(lighter_markets: list[LighterMarket]) -> list[Instrument]:
     data = get_json(PERPL_CONTEXT_URL)
     if not isinstance(data, dict) or not isinstance(data.get("markets"), list):
         raise RuntimeError("Perpl context payload is missing markets")
@@ -376,10 +400,10 @@ def fetch_perpl_instruments(top_markets: list[LighterMarket]) -> list[Instrument
                 size_tick=decimal_tick(config.get("size_decimals")),
             ),
         )
-    return select_in_top_order(by_base, top_markets)
+    return select_in_lighter_order(by_base, lighter_markets)
 
 
-def fetch_ondo_instruments(top_markets: list[LighterMarket]) -> list[Instrument]:
+def fetch_ondo_instruments(lighter_markets: list[LighterMarket]) -> list[Instrument]:
     data = get_json(ONDO_MARKETS_URL)
     perps = data.get("result", {}).get("perps") if isinstance(data, dict) else None
     trading_pairs = perps.get("tradingPairs") if isinstance(perps, dict) else None
@@ -406,18 +430,44 @@ def fetch_ondo_instruments(top_markets: list[LighterMarket]) -> list[Instrument]
                 size_tick=market.get("baseIncrement"),
             ),
         )
-    return select_in_top_order(by_base, top_markets)
+    return select_in_lighter_order(by_base, lighter_markets)
 
 
-def lighter_instruments(top_markets: list[LighterMarket]) -> list[Instrument]:
+def lighter_instruments(lighter_markets: list[LighterMarket]) -> list[Instrument]:
     return [
         instrument(market.market_id, market.symbol, market.market_id, market.base_asset)
-        for market in top_markets
+        for market in lighter_markets
     ]
 
 
-def build_venues(top_markets: list[LighterMarket]) -> list[Venue]:
-    return [
+def build_venues(
+    lighter_markets: list[LighterMarket],
+    market_limit: int = 0,
+) -> tuple[list[LighterMarket], list[Venue]]:
+    other_instruments = {
+        "hyperliquid": fetch_hyperliquid_instruments(lighter_markets),
+        "risex": fetch_risex_instruments(lighter_markets),
+        "01": fetch_zero_one_instruments(lighter_markets),
+        "ethereal": fetch_ethereal_instruments(lighter_markets),
+        "perpl": fetch_perpl_instruments(lighter_markets),
+        "ondo": fetch_ondo_instruments(lighter_markets),
+    }
+    selected_markets = select_comparable_lighter_markets(
+        lighter_markets,
+        list(other_instruments.values()),
+        market_limit,
+    )
+
+    def selected_instruments(venue_instance_id: str) -> list[Instrument]:
+        return select_in_lighter_order(
+            {
+                item.base_asset: item
+                for item in other_instruments[venue_instance_id]
+            },
+            selected_markets,
+        )
+
+    venues = [
         Venue(
             venue_instance_id="hyperliquid",
             adapter="hyperliquid",
@@ -428,7 +478,7 @@ def build_venues(top_markets: list[LighterMarket]) -> list[Venue]:
             default_quote_asset="USDC",
             default_settle_asset="USDC",
             default_margin_asset="USDC",
-            instruments=fetch_hyperliquid_instruments(top_markets),
+            instruments=selected_instruments("hyperliquid"),
         ),
         Venue(
             venue_instance_id="lighter",
@@ -440,7 +490,7 @@ def build_venues(top_markets: list[LighterMarket]) -> list[Venue]:
             default_quote_asset="USDC",
             default_settle_asset="USDC",
             default_margin_asset="USDC",
-            instruments=lighter_instruments(top_markets),
+            instruments=lighter_instruments(selected_markets),
         ),
         Venue(
             venue_instance_id="risex",
@@ -451,7 +501,7 @@ def build_venues(top_markets: list[LighterMarket]) -> list[Venue]:
             default_quote_asset="USDC",
             default_settle_asset="USDC",
             default_margin_asset="USDC",
-            instruments=fetch_risex_instruments(top_markets),
+            instruments=selected_instruments("risex"),
         ),
         Venue(
             venue_instance_id="01",
@@ -462,7 +512,7 @@ def build_venues(top_markets: list[LighterMarket]) -> list[Venue]:
             default_quote_asset="USD",
             default_settle_asset="USD",
             default_margin_asset="USD",
-            instruments=fetch_zero_one_instruments(top_markets),
+            instruments=selected_instruments("01"),
         ),
         Venue(
             venue_instance_id="ethereal",
@@ -474,7 +524,7 @@ def build_venues(top_markets: list[LighterMarket]) -> list[Venue]:
             default_quote_asset="USD",
             default_settle_asset="USD",
             default_margin_asset="USD",
-            instruments=fetch_ethereal_instruments(top_markets),
+            instruments=selected_instruments("ethereal"),
         ),
         Venue(
             venue_instance_id="perpl",
@@ -486,7 +536,7 @@ def build_venues(top_markets: list[LighterMarket]) -> list[Venue]:
             default_quote_asset="AUSD",
             default_settle_asset="AUSD",
             default_margin_asset="AUSD",
-            instruments=fetch_perpl_instruments(top_markets),
+            instruments=selected_instruments("perpl"),
         ),
         Venue(
             venue_instance_id="ondo",
@@ -498,9 +548,10 @@ def build_venues(top_markets: list[LighterMarket]) -> list[Venue]:
             default_quote_asset="USD",
             default_settle_asset="USD",
             default_margin_asset="USD",
-            instruments=fetch_ondo_instruments(top_markets),
+            instruments=selected_instruments("ondo"),
         ),
     ]
+    return selected_markets, venues
 
 
 def decimal_tick(decimals: object) -> Optional[str]:
@@ -523,7 +574,7 @@ def toml_key_value(key: str, value: object) -> str:
 
 
 def render_config(
-    top_markets: list[LighterMarket],
+    selected_markets: list[LighterMarket],
     venues: list[Venue],
     market_limit: int = 0,
     daily_at_utc: str = "00:05",
@@ -531,8 +582,9 @@ def render_config(
 ) -> str:
     lines = [
         "# Generated by scripts/generate_config_from_lighter.py",
-        "# Lighter source catalog: all active perp markets (market_limit = 0).",
-        "# A positive market_limit keeps only the highest-volume base assets.",
+        "# Selected bases: active Lighter perps also listed by another supported venue.",
+        "# market_limit = 0 keeps the full intersection; a positive value caps it by",
+        "# Lighter daily quote volume after the intersection is calculated.",
         'mode = "bbo"',
         "",
         "[pipeline]",
@@ -628,7 +680,8 @@ def render_config(
             )
 
     selected = ", ".join(
-        f"{market.base_asset}:{market.market_id}:{market.volume}" for market in top_markets
+        f"{market.base_asset}:{market.market_id}:{market.volume}"
+        for market in selected_markets
     )
     lines.extend(
         [
@@ -642,7 +695,10 @@ def render_config(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a config from active Lighter perp markets."
+        description=(
+            "Generate a config for active Lighter perps available on at least "
+            "one other supported venue."
+        )
     )
     parser.add_argument(
         "--output",
@@ -654,8 +710,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Maximum number of active Lighter base assets to select by 24h "
-            "quote volume; 0 selects all active perp markets."
+            "Maximum number of comparable Lighter base assets to select by "
+            "24h quote volume after intersecting venue catalogs; 0 keeps all."
         ),
     )
     parser.add_argument(
@@ -676,14 +732,14 @@ def main() -> int:
     if args.limit < 0:
         raise SystemExit("--limit must be non-negative")
 
-    top_markets = fetch_lighter_markets(args.limit)
-    venues = build_venues(top_markets)
+    lighter_markets = fetch_active_lighter_markets()
+    selected_markets, venues = build_venues(lighter_markets, args.limit)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary_output = output.with_name(f".{output.name}.tmp")
     temporary_output.write_text(
         render_config(
-            top_markets,
+            selected_markets,
             venues,
             args.limit,
             args.refresh_at_utc,
@@ -694,8 +750,10 @@ def main() -> int:
     temporary_output.replace(output)
 
     print(
-        "selected Lighter markets: "
-        + ", ".join(f"{market.base_asset}({market.market_id})" for market in top_markets),
+        "selected comparable Lighter markets: "
+        + ", ".join(
+            f"{market.base_asset}({market.market_id})" for market in selected_markets
+        ),
         file=sys.stderr,
     )
     for venue in venues:
