@@ -643,10 +643,11 @@
     if (intervalSeconds !== null) {
       return { precision: 'bucket', bucketSeconds: intervalSeconds };
     }
-    if (range.toMs - range.fromMs <= 60 * 60 * 1000) {
-      return { precision: 'bucket', bucketSeconds: 15 };
+    // Auto-select: let the server pick raw for ≤1min, candle otherwise
+    if (range.toMs - range.fromMs <= 60_000) {
+      return { precision: 'raw' };
     }
-    return { precision: 'bucket' };
+    return {};
   }
 
   function parseChartInterval(value: string): number | null {
@@ -826,6 +827,39 @@
     if (key === 'End') {
       selectedIndex = points.length - 1;
     }
+  }
+
+  let lastGranularityChangeMs = 0;
+  const GRANULARITY_CHANGE_DEBOUNCE_MS = 500;
+
+  function handleGranularityChange(detail: { fromMs: number; toMs: number }) {
+    const now = Date.now();
+    if (now - lastGranularityChangeMs < GRANULARITY_CHANGE_DEBOUNCE_MS) return;
+
+    const rangeMs = detail.toMs - detail.fromMs;
+    if (rangeMs <= 0) return;
+
+    // Only reload if the range crosses a granularity boundary
+    const currentGranularity = spread?.meta.granularity ?? '1h';
+    const nextGranularity = granularityForRange(rangeMs);
+    if (nextGranularity === currentGranularity) return;
+
+    lastGranularityChangeMs = now;
+    customStart = toDateInput(detail.fromMs - 60_000); // pad slightly
+    customEnd = toDateInput(detail.toMs + 60_000);
+    selectedPreset = 'custom';
+
+    void loadSpread({ silent: true, preservePoint: true });
+  }
+
+  /** Client-side mirror of selectGranularity for boundary detection only. */
+  function granularityForRange(rangeMs: number): string {
+    if (rangeMs <= 60_000) return 'raw';
+    if (rangeMs <= 10 * 60_000) return '1s';
+    if (rangeMs <= 60 * 60_000) return '1m';
+    if (rangeMs <= 6 * 3600_000) return '5m';
+    if (rangeMs <= 24 * 3600_000) return '15m';
+    return '1h';
   }
 
   function computeAverageLines(
@@ -1248,7 +1282,10 @@
     if (meta.granularity === 'raw') {
       return `${formatInteger(meta.sourceRows)} raw ticks`;
     }
-    return `${meta.bucketSeconds}s snapshot`;
+    if (meta.granularity === 'bucket') {
+      return `${meta.bucketSeconds}s snapshot`;
+    }
+    return `${meta.granularity} candle`;
   }
 
   function formatBp(value: number | null) {
@@ -1848,14 +1885,17 @@
             on:hover={(event) => (hoverIndex = event.detail.index)}
             on:select={(event) => (selectedIndex = event.detail.index)}
             on:navigate={(event) => handleChartNavigation(event.detail.key)}
+            on:granularityChange={(event) => handleGranularityChange(event.detail)}
           />
         {/if}
 
         <p class="chart-caption">
           {#if spread?.meta.granularity === 'raw'}
             当前短窗口使用数据库逐 tick BBO 更新计算价差；任一侧更新时都会与另一侧最后有效盘口对齐，未变化的一侧会持续沿用。
-          {:else}
+          {:else if spread?.meta.granularity === 'bucket'}
             每个 bucket 展示结束时刻的 A/B 最新有效盘口，纵轴统一为 bp；盘口会持续沿用到该腿出现新状态，质量异常数据会被跳过。
+          {:else}
+            预聚合 OHLC candle 视图（{spread?.meta.granularity ?? '-'}），纵轴统一为 bp；每个数据点展示该粒度下最新有效盘口。
           {/if}
         </p>
       </section>

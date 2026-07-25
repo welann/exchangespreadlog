@@ -10,10 +10,19 @@ import {
   type RawTickRow
 } from '$lib/server/spread-state';
 import { getTickSchema, tickIdentityWhere, type TickSchema } from '$lib/server/tick-schema';
+import {
+  convertCandleRowsToSpreadPoints,
+  fetchCandleRows,
+  fetchCandleSeedRows,
+  selectGranularity,
+  type CandleGranularityConfig,
+  type RawCandleRow
+} from '$lib/server/candles';
 
 const MAX_RANGE_MS = 31 * 24 * 60 * 60 * 1000;
 const TARGET_POINTS = 420;
 const RAW_EXPLICIT_MAX_RANGE_MS = 6 * 60 * 60 * 1000;
+const RAW_AUTO_MAX_RANGE_MS = 60_000; // 1 minute
 const MAX_RAW_TICK_ROWS = 100_000;
 const SPREAD_QUERY_OPTIONS = { maxThreads: 2 } as const;
 const SPREAD_CACHE_TTL_MS = 30_000;
@@ -61,6 +70,10 @@ type BookRowsResult = {
   tickRows: RawTickRow[];
 };
 
+type CandleBookInput = BaseSpreadInput & {
+  candleConfig: CandleGranularityConfig;
+};
+
 type CachedSpreadResult = {
   expiresAt: number;
   promise: Promise<SpreadQueryResult>;
@@ -102,11 +115,12 @@ export const POST: RequestHandler = async ({ request }) => {
       instrumentB.quoteAsset,
       payload.rates
     );
-    const granularity = resolveGranularity(payload.precision, fromMs, toMs);
+    const rangeMs = toMs - fromMs;
+    const granularity = resolveGranularity(payload.precision, rangeMs);
     const bucketSeconds =
       granularity === 'bucket' ? parseBucketSeconds(payload.bucketSeconds, fromMs, toMs) : 0;
     const tickSchema = await getTickSchema();
-    const queryInput = {
+    const queryInput: BaseSpreadInput = {
       instrumentA,
       instrumentB,
       fromMs,
@@ -127,14 +141,20 @@ export const POST: RequestHandler = async ({ request }) => {
       aRate,
       bRate
     ].join('|');
-    const result = await cachedSpreadResult(cacheKey, () =>
-      granularity === 'raw'
-        ? fetchRawSpreadPoints(queryInput)
-        : fetchBucketedSpreadPoints({
-            ...queryInput,
-            bucketSeconds
-          })
-    );
+    const result = await cachedSpreadResult(cacheKey, () => {
+      if (granularity === 'raw') {
+        return fetchRawSpreadPoints(queryInput);
+      }
+      if (granularity === 'bucket') {
+        return fetchBucketedSpreadPoints({
+          ...queryInput,
+          bucketSeconds
+        });
+      }
+      // Candle granularity: 1s, 1m, 5m, 15m, 1h
+      const candleConfig = selectGranularity(rangeMs);
+      return fetchCandleSpreadPoints({ ...queryInput, candleConfig });
+    });
 
     const points = result.points;
 
@@ -204,6 +224,8 @@ function cachedSpreadResult(
   return promise;
 }
 
+// ── Raw tick path (≤ 1 minute) ────────────────────────────────────────────
+
 async function fetchRawSpreadPoints(input: BaseSpreadInput): Promise<SpreadQueryResult> {
   const { seedRows, tickRows } = await fetchExactBookRows({
     instrumentA: input.instrumentA,
@@ -219,6 +241,8 @@ async function fetchRawSpreadPoints(input: BaseSpreadInput): Promise<SpreadQuery
     sourceRows: tickRows.length
   };
 }
+
+// ── Bucketed tick path (backward compatible, ≤ 6h explicit) ───────────────
 
 async function fetchBucketedSpreadPoints(
   input: BaseSpreadInput & { bucketSeconds: number }
@@ -248,6 +272,35 @@ async function fetchBucketedSpreadPoints(
     sourceRows: tickRows.length
   };
 }
+
+// ── Candle path (auto-selected for ranges > 1 minute) ────────────────────
+
+async function fetchCandleSpreadPoints(input: CandleBookInput): Promise<SpreadQueryResult> {
+  const { tickSchema, instrumentA, instrumentB, fromMs, toMs, aRate, bRate, candleConfig } = input;
+
+  const [seedRows, tickRows] = await Promise.all([
+    fetchCandleSeedRows(tickSchema, instrumentA, instrumentB, fromMs, candleConfig),
+    fetchCandleRows(tickSchema, instrumentA, instrumentB, fromMs, toMs, candleConfig)
+  ]);
+
+  const allRows = [...seedRows, ...tickRows];
+
+  return {
+    points: convertCandleRowsToSpreadPoints(
+      allRows,
+      fromMs,
+      toMs,
+      candleConfig.bucketMs,
+      instrumentA,
+      instrumentB,
+      aRate,
+      bRate
+    ),
+    sourceRows: tickRows.length
+  };
+}
+
+// ── Raw tick query helpers ────────────────────────────────────────────────
 
 async function fetchExactBookRows(input: ExactBookRowsInput): Promise<BookRowsResult> {
   const whereA = tickIdentityWhere(input.tickSchema, input.instrumentA, 'ticks');
@@ -423,6 +476,8 @@ function tickRowTuple(alias: string): string {
     )`;
 }
 
+// ── Validation helpers ────────────────────────────────────────────────────
+
 function validateCatalogId(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.trim().length === 0 || value.length > 256) {
     throw new ClickHouseError(`${label} is required`, 400);
@@ -439,16 +494,25 @@ function parseTimestamp(value: unknown, label: string): number {
   return Math.trunc(parsed);
 }
 
-function resolveGranularity(value: unknown, fromMs: number, toMs: number): SpreadGranularity {
-  const rangeMs = toMs - fromMs;
+function resolveGranularity(value: unknown, rangeMs: number): SpreadGranularity {
   if (value === 'raw') {
     if (rangeMs > RAW_EXPLICIT_MAX_RANGE_MS) {
-      throw new ClickHouseError('Raw tick mode is capped at 6 hours. Use a shorter range or bucketed mode.', 400);
+      throw new ClickHouseError(
+        'Raw tick mode is capped at 6 hours. Use a shorter range or bucketed mode.',
+        400
+      );
     }
     return 'raw';
   }
   if (value === 'bucket') return 'bucket';
-  return 'bucket';
+  if (value === 'candle') {
+    // Explicit candle mode: use auto-selected granularity
+    return selectGranularity(rangeMs).granularity;
+  }
+
+  // Auto-select: raw for ≤ 1 min, candle otherwise
+  if (rangeMs <= RAW_AUTO_MAX_RANGE_MS) return 'raw';
+  return selectGranularity(rangeMs).granularity;
 }
 
 function parseBucketSeconds(value: unknown, fromMs: number, toMs: number): number {

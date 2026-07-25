@@ -53,7 +53,7 @@ export type SpreadResponse = {
     fromMs: number;
     toMs: number;
     bucketSeconds: number;
-    granularity: 'raw' | 'bucket';
+    granularity: 'raw' | 'bucket' | '1s' | '1m' | '5m' | '15m' | '1h';
     sourceRows: number;
     bookStatePolicy: 'carry_forward';
     maxStaleMs: null;

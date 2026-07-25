@@ -48,6 +48,7 @@
     hover: { index: number };
     select: { index: number };
     navigate: { key: 'ArrowLeft' | 'ArrowRight' | 'Home' | 'End' };
+    granularityChange: { fromMs: number; toMs: number };
   }>();
 
   let container: HTMLDivElement;
@@ -233,6 +234,19 @@
     chart.panes()[1]?.setHeight(130);
     chart.subscribeCrosshairMove(handleCrosshair);
     chart.subscribeClick(handleClick);
+
+    // ── Zoom listener: detect when the user zooms in/out enough to warrant a granularity switch ──
+    chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+      if (!range) return;
+      const fromMs = (range.from as number) * 1000;
+      const toMs = (range.to as number) * 1000;
+      if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs >= toMs) return;
+      dispatch('granularityChange', {
+        fromMs: Math.floor(fromMs),
+        toMs: Math.ceil(toMs)
+      });
+    });
+
     syncChart(true);
 
     return () => {
