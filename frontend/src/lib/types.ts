@@ -56,7 +56,8 @@ export type SpreadResponse = {
     bucketSeconds: number;
     granularity: 'raw' | 'bucket';
     sourceRows: number;
-    maxStaleMs: number;
+    bookStatePolicy: 'carry_forward';
+    maxStaleMs: null;
     targetQuote: string;
     aRate: number;
     bRate: number;

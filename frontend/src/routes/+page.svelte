@@ -1959,9 +1959,9 @@
 
         <p class="chart-caption">
           {#if spread?.meta.granularity === 'raw'}
-            当前短窗口使用数据库逐 tick BBO 更新计算价差；每个样本来自 A/B 任一侧的新盘口，并与另一侧最新盘口对齐。
+            当前短窗口使用数据库逐 tick BBO 更新计算价差；任一侧更新时都会与另一侧最后有效盘口对齐，未变化的一侧会持续沿用。
           {:else}
-            每个 bucket 展示结束时刻的 A/B 最新有效盘口，纵轴统一为 bp；质量异常或超过 {formatMaybeDuration(spread?.meta.maxStaleMs ?? null)} 未更新的状态会被跳过。
+            每个 bucket 展示结束时刻的 A/B 最新有效盘口，纵轴统一为 bp；盘口会持续沿用到该腿出现新状态，质量异常数据会被跳过。
           {/if}
         </p>
       </section>
