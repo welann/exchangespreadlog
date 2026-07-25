@@ -47,6 +47,8 @@
   const SPREAD_CACHE_TTL_MS = 5 * 60 * 1000;
   const LIVE_PAIR_GRACE_MS = 5 * 60 * 1000;
   const LIVE_ANCHOR_INTERVAL_MS = 15 * 1000;
+  const MERGE_WINDOW_MS = 30_000; // incremental poll overlap window (handles out-of-order ticks)
+  const MAX_POINTS = 10_000;      // cap merged points to prevent unbounded growth
   const presets = [
     { label: '1H', value: '1h', ms: 60 * 60 * 1000 },
     { label: '6H', value: '6h', ms: 6 * 60 * 60 * 1000 },
@@ -114,6 +116,7 @@
     silent?: boolean;
     slideWindow?: boolean;
     updateUrl?: boolean;
+    delta?: boolean;
   };
   type CachedSpread = {
     response: SpreadResponse;
@@ -291,20 +294,29 @@
       rangeAnchorMs = anchorForSelection(instrumentsForBase(selectedBase), catalogA, catalogB);
     }
 
-    const range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
+    let range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
     if (!Number.isFinite(range.fromMs) || !Number.isFinite(range.toMs) || range.fromMs >= range.toMs) {
       queryError = 'Choose a valid time range with From before To';
       return;
     }
 
-    // Try loading from localStorage cache before network request
-    const localStorageCacheKey = spreadCacheKey({
-      catalogA,
-      catalogB,
-      fromMs: range.fromMs,
-      toMs: range.toMs
-    });
-    const cachedFromStorage = loadSpreadFromCache(localStorageCacheKey);
+    // Delta mode: narrow range to only recent data with merge-window overlap
+    if (options.delta && spread && spread.points.length > 0) {
+      const lastTs = spread.points[spread.points.length - 1].tsMs;
+      range = { fromMs: lastTs - MERGE_WINDOW_MS, toMs: Date.now() };
+    }
+
+    // Try loading from localStorage cache before network request (skip for delta)
+    let cachedFromStorage: SpreadResponse | null = null;
+    if (!options.delta) {
+      const localStorageCacheKey = spreadCacheKey({
+        catalogA,
+        catalogB,
+        fromMs: range.fromMs,
+        toMs: range.toMs
+      });
+      cachedFromStorage = loadSpreadFromCache(localStorageCacheKey);
+    }
     if (cachedFromStorage && points.length === 0 && !spread) {
       spread = cachedFromStorage;
       selectedIndex = cachedFromStorage.points.length > 0 ? cachedFromStorage.points.length - 1 : -1;
@@ -313,16 +325,19 @@
     const requestId = ++spreadRequestSeq;
     const previousSelectedPoint = selectedIndex >= 0 ? points[selectedIndex] : null;
     const wasFollowingLatest = selectedIndex < 0 || selectedIndex >= points.length - 1;
-    const payload = {
+    const payload: Record<string, unknown> = {
       catalogA,
       catalogB,
       fromMs: range.fromMs,
       toMs: range.toMs,
-      ...spreadQueryOptions(range),
       rates: cleanRates(rates)
     };
+    // Delta mode: let server auto-select granularity from short window
+    if (!options.delta) {
+      Object.assign(payload, spreadQueryOptions(range));
+    }
     const cacheKey = spreadCacheKey(payload);
-    const cached = readSpreadCache(cacheKey);
+    const cached = options.delta ? null : readSpreadCache(cacheKey);
     const usedCached = cached !== null && !options.silent;
     const hasExistingPoints = points.length > 0;
 
@@ -356,15 +371,25 @@
       const body = await response.json();
       if (!response.ok) throw new Error(body.error ?? 'Failed to query spread');
       if (requestId !== spreadRequestSeq || selectedA !== catalogA || selectedB !== catalogB) return;
-      const nextSpread = body as SpreadResponse;
-      rememberSpread(cacheKey, nextSpread);
-      spread = nextSpread;
-      selectedIndex = nextSelectedIndex(
-        nextSpread.points,
-        previousSelectedPoint?.tsMs ?? null,
-        wasFollowingLatest,
-        options.preservePoint
-      );
+      if (options.delta && spread && spread.points.length > 0) {
+        // Incremental merge: deduplicate by tsMs, sort, cap
+        const existingTs = new Set(spread.points.map(p => p.tsMs));
+        const newPoints = (body as SpreadResponse).points.filter(p => !existingTs.has(p.tsMs));
+        const merged = [...spread.points, ...newPoints].sort((a, b) => a.tsMs - b.tsMs);
+        const capped = merged.length > MAX_POINTS ? merged.slice(merged.length - MAX_POINTS) : merged;
+        spread = { ...(body as SpreadResponse), points: capped };
+        selectedIndex = capped.length - 1;
+      } else {
+        const nextSpread = body as SpreadResponse;
+        rememberSpread(cacheKey, nextSpread);
+        spread = nextSpread;
+        selectedIndex = nextSelectedIndex(
+          nextSpread.points,
+          previousSelectedPoint?.tsMs ?? null,
+          wasFollowingLatest,
+          options.preservePoint
+        );
+      }
       if (options.updateUrl !== false) {
         syncQueryState();
       }
@@ -499,7 +524,7 @@
     if (!autoRefresh) return;
     refreshTimer = setInterval(() => {
       if (!loadingMarkets && !spreadBusy) {
-        void refreshCurrentSpread({ preservePoint: true, silent: true, updateUrl: false });
+        void refreshCurrentSpread({ preservePoint: true, silent: true, updateUrl: false, delta: true });
       }
     }, refreshSeconds * 1000);
   }
