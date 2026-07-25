@@ -22,6 +22,8 @@ catalog_table = "instrument_catalog"
 username = "zeabur"
 password_env = "CLICKHOUSE_PASSWORD"
 accept_invalid_certs = true
+candle_mode = "auto"
+max_stale_ms = 120000
 create_table = true
 batch_size = 100
 

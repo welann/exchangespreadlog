@@ -4,6 +4,10 @@ export type QuoteRate = {
   rate: string;
 };
 
+export type SpreadRequestedPrecision = 'auto' | 'raw' | 'bucket' | 'candle';
+export type SpreadSource = 'raw' | 'bucket' | 'candle';
+export type SpreadGranularity = 'raw' | 'bucket' | '1s' | '1m' | '5m' | '15m' | '1h';
+
 export type Instrument = {
   catalogId: string;
   venueInstanceId: string;
@@ -22,7 +26,10 @@ export type Market = {
 };
 
 export type SpreadPoint = {
+  id: string;
   tsMs: number;
+  aStateTsMs: number;
+  bStateTsMs: number;
   aBid: number | null;
   aAsk: number | null;
   aBidSize: number | null;
@@ -53,10 +60,19 @@ export type SpreadResponse = {
     fromMs: number;
     toMs: number;
     bucketSeconds: number;
-    granularity: 'raw' | 'bucket' | '1s' | '1m' | '5m' | '15m' | '1h';
+    granularity: SpreadGranularity;
+    requestedPrecision: SpreadRequestedPrecision;
+    source: SpreadSource;
+    fallbackReason: 'candle_disabled' | 'candle_not_ready' | 'coverage_gap' | null;
+    coverage: {
+      fromMs: number;
+      toMs: number;
+      complete: boolean;
+    };
+    nextCursor: string | null;
     sourceRows: number;
-    bookStatePolicy: 'carry_forward';
-    maxStaleMs: null;
+    bookStatePolicy: 'carry_forward_with_expiry';
+    maxStaleMs: number;
     targetQuote: string;
     aRate: number;
     bRate: number;

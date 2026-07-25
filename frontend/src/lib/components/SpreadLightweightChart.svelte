@@ -43,6 +43,8 @@
   export let selectedIndex = -1;
   export let labelA = 'Exchange A';
   export let labelB = 'Exchange B';
+  export let viewKey = '';
+  export let descriptionId = 'chart-help';
 
   const dispatch = createEventDispatcher<{
     hover: { index: number };
@@ -69,6 +71,8 @@
   let renderedSelectedIndex = -2;
   let renderedLabelA = '';
   let renderedLabelB = '';
+  let renderedViewKey = '';
+  let visibleRangeTimer: ReturnType<typeof setTimeout> | null = null;
   let priceLines: Array<{ series: SpreadSeriesApi; line: IPriceLine }> = [];
 
   onMount(() => {
@@ -236,22 +240,15 @@
     chart.subscribeClick(handleClick);
 
     // ── Zoom listener: detect when the user zooms in/out enough to warrant a granularity switch ──
-    chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-      if (!range) return;
-      const fromMs = (range.from as number) * 1000;
-      const toMs = (range.to as number) * 1000;
-      if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs >= toMs) return;
-      dispatch('granularityChange', {
-        fromMs: Math.floor(fromMs),
-        toMs: Math.ceil(toMs)
-      });
-    });
+    chart.timeScale().subscribeVisibleTimeRangeChange(handleVisibleTimeRangeChange);
 
     syncChart(true);
 
     return () => {
       chart?.unsubscribeCrosshairMove(handleCrosshair);
       chart?.unsubscribeClick(handleClick);
+      chart?.timeScale().unsubscribeVisibleTimeRangeChange(handleVisibleTimeRangeChange);
+      if (visibleRangeTimer) clearTimeout(visibleRangeTimer);
       chart?.remove();
       chart = null;
     };
@@ -275,41 +272,52 @@
     }
 
     if (renderedPoints !== points) {
-      chartPoints = normalizeChartPoints(points);
+      const nextChartPoints = normalizeChartPoints(points);
+      const appendFrom = appendStartIndex(chartPoints, nextChartPoints);
+      chartPoints = nextChartPoints;
       timeToIndex = new Map(chartPoints.map((entry) => [entry.time as number, entry.index]));
 
-      bestSeries.setData(
-        chartPoints.map(({ time, point }) => {
+      const bestData = chartPoints.map(({ time, point }) => {
           const value = bestBpValue(point);
           return value === null ? { time } : { time, value };
-        })
-      );
-      aToBSeries.setData(
-        chartPoints.map(({ time, point }) =>
+        });
+      const aToBData = chartPoints.map(({ time, point }) =>
           point.aToBBp === null ? { time } : { time, value: point.aToBBp }
-        )
-      );
-      bToASeries.setData(
-        chartPoints.map(({ time, point }) =>
+        );
+      const bToAData = chartPoints.map(({ time, point }) =>
           point.bToABp === null ? { time } : { time, value: point.bToABp }
-        )
-      );
-      thresholdSeries.setData(chartPoints.map(({ time }) => ({ time, value: 0 })));
-      aMidSeries.setData(
-        chartPoints.map(({ time, point }) =>
+        );
+      const thresholdData = chartPoints.map(({ time }) => ({ time, value: 0 }));
+      const aMidData = chartPoints.map(({ time, point }) =>
           point.aMid === null ? { time } : { time, value: point.aMid }
-        )
-      );
-      bMidSeries.setData(
-        chartPoints.map(({ time, point }) =>
+        );
+      const bMidData = chartPoints.map(({ time, point }) =>
           point.bMid === null ? { time } : { time, value: point.bMid }
-        )
-      );
+        );
+
+      if (appendFrom >= 0) {
+        for (let index = appendFrom; index < chartPoints.length; index += 1) {
+          bestSeries.update(bestData[index]);
+          aToBSeries.update(aToBData[index]);
+          bToASeries.update(bToAData[index]);
+          thresholdSeries.update(thresholdData[index]);
+          aMidSeries.update(aMidData[index]);
+          bMidSeries.update(bMidData[index]);
+        }
+      } else {
+        bestSeries.setData(bestData);
+        aToBSeries.setData(aToBData);
+        bToASeries.setData(bToAData);
+        thresholdSeries.setData(thresholdData);
+        aMidSeries.setData(aMidData);
+        bMidSeries.setData(bMidData);
+      }
 
       renderedPoints = points;
-      if (chartPoints.length > 0) {
+      if ((initial || renderedViewKey !== viewKey) && chartPoints.length > 0) {
         chart.timeScale().fitContent();
       }
+      renderedViewKey = viewKey;
     }
 
     if (
@@ -396,6 +404,38 @@
     return [...bySecond.values()].sort((left, right) => (left.time as number) - (right.time as number));
   }
 
+  function appendStartIndex(
+    previous: IndexedChartPoint[],
+    next: IndexedChartPoint[]
+  ): number {
+    if (previous.length === 0 || next.length < previous.length) return -1;
+    const stableLength = Math.max(0, previous.length - 1);
+    for (let index = 0; index < stableLength; index += 1) {
+      if (
+        previous[index].time !== next[index]?.time ||
+        previous[index].point.id !== next[index]?.point.id
+      ) {
+        return -1;
+      }
+    }
+    if (stableLength === 0) return 0;
+    return stableLength;
+  }
+
+  function handleVisibleTimeRangeChange(range: { from: Time; to: Time } | null) {
+    if (!range || typeof range.from !== 'number' || typeof range.to !== 'number') return;
+    const fromMs = range.from * 1000;
+    const toMs = range.to * 1000;
+    if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs >= toMs) return;
+    if (visibleRangeTimer) clearTimeout(visibleRangeTimer);
+    visibleRangeTimer = setTimeout(() => {
+      dispatch('granularityChange', {
+        fromMs: Math.floor(fromMs),
+        toMs: Math.ceil(toMs)
+      });
+    }, 300);
+  }
+
   function handleCrosshair(param: MouseEventParams<Time>) {
     if (typeof param.time !== 'number') {
       dispatch('hover', { index: -1 });
@@ -436,26 +476,58 @@
   }
 </script>
 
-<div
-  class="chart"
-  bind:this={container}
-  tabindex="0"
-  role="button"
-  aria-label={`${labelA} and ${labelB} spread chart. Use the mouse wheel to zoom, drag to pan, or the arrow keys to inspect samples.`}
-  on:keydown={handleKeydown}
-></div>
+<div class="chart-wrap">
+  <div
+    class="chart"
+    bind:this={container}
+    role="img"
+    aria-describedby={descriptionId}
+    aria-label={`${labelA} 和 ${labelB} 的价差图。可用鼠标滚轮缩放并拖动平移。`}
+  ></div>
+  <button
+    class="keyboard-target"
+    type="button"
+    aria-describedby={descriptionId}
+    aria-label="键盘浏览价差样本"
+    on:keydown={handleKeydown}
+  >
+    键盘浏览
+  </button>
+</div>
 
 <style>
+  .chart-wrap {
+    position: relative;
+    width: 100%;
+    min-width: 0;
+    overflow: hidden;
+  }
+
   .chart {
     width: 100%;
+    min-width: 0;
     height: clamp(410px, 54vh, 560px);
     min-height: 410px;
     outline: 1px solid transparent;
   }
 
-  .chart:focus-visible {
-    outline-color: #29d9c2;
-    outline-offset: -1px;
+  .keyboard-target {
+    position: absolute;
+    top: 6px;
+    right: 82px;
+    z-index: 3;
+    min-height: 28px;
+    border: 1px solid #2a4058;
+    border-radius: 2px;
+    padding: 4px 8px;
+    color: #95a4b7;
+    background: rgba(10, 17, 27, 0.9);
+    font-size: 0.7rem;
+  }
+
+  .keyboard-target:focus-visible {
+    outline: 2px solid #29d9c2;
+    outline-offset: 2px;
   }
 
   @media (max-width: 760px) {

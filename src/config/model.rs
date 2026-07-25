@@ -69,6 +69,8 @@ pub struct ClickHouseConfig {
     pub password: Option<String>,
     pub password_env: Option<String>,
     pub accept_invalid_certs: bool,
+    pub candle_mode: String,
+    pub max_stale_ms: u64,
     pub create_table: bool,
     pub batch_size: usize,
 }
@@ -393,6 +395,8 @@ impl Default for ClickHouseConfig {
             password: None,
             password_env: Some("CLICKHOUSE_PASSWORD".to_string()),
             accept_invalid_certs: false,
+            candle_mode: "auto".to_string(),
+            max_stale_ms: 120_000,
             create_table: true,
             batch_size: 100,
         }

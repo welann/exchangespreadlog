@@ -1,12 +1,21 @@
 <script lang="ts">
   import { replaceState } from '$app/navigation';
   import { onMount } from 'svelte';
-  import SpreadLightweightChart from '$lib/components/SpreadLightweightChart.svelte';
+  import type SpreadLightweightChart from '$lib/components/SpreadLightweightChart.svelte';
+  import {
+    bestBp,
+    computeTimeWeightedStats,
+    timeWeightedAverage
+  } from '$lib/spread/analytics';
+  import {
+    mergeSpreadResponses,
+    spreadCacheKey,
+    TimedLruCache
+  } from '$lib/spread/cache';
   import type { Market, QuoteRate, SpreadPoint, SpreadResponse } from '$lib/types';
 
   // --- localStorage cache helpers ---
-  const MARKETS_CACHE_KEY = 'spreadlog_markets_v1';
-  const SPREAD_CACHE_PREFIX = 'spreadlog_spread_v1_';
+  const MARKETS_CACHE_KEY = 'spreadlog_markets_v2';
   const MARKETS_CACHE_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
 
   function saveMarketsToCache(data: { generatedAt: string; markets: Market[] }) {
@@ -21,34 +30,25 @@
       if (!raw) return null;
       const parsed = JSON.parse(raw);
       const age = Date.now() - new Date(parsed.generatedAt).getTime();
-      if (age > MARKETS_CACHE_MAX_AGE_MS) return null;
+      if (
+        !Number.isFinite(age) ||
+        age < 0 ||
+        age > MARKETS_CACHE_MAX_AGE_MS ||
+        !Array.isArray(parsed.markets)
+      ) {
+        localStorage.removeItem(MARKETS_CACHE_KEY);
+        return null;
+      }
       return parsed;
     } catch { return null; }
   }
 
-  function saveSpreadToCache(key: string, data: SpreadResponse) {
-    try {
-      const cacheEntry = { savedAt: Date.now(), data };
-      localStorage.setItem(SPREAD_CACHE_PREFIX + key, JSON.stringify(cacheEntry));
-    } catch { /* ignore */ }
-  }
-
-  function loadSpreadFromCache(key: string): SpreadResponse | null {
-    try {
-      const raw = localStorage.getItem(SPREAD_CACHE_PREFIX + key);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      return parsed.data ?? null;
-    } catch { return null; }
-  }
-
-  const RATE_STORAGE_KEY = 'exchangespreadlog.quoteRates';
   const MAX_SPREAD_CACHE_ENTRIES = 12;
   const SPREAD_CACHE_TTL_MS = 5 * 60 * 1000;
   const LIVE_PAIR_GRACE_MS = 5 * 60 * 1000;
   const LIVE_ANCHOR_INTERVAL_MS = 15 * 1000;
   const MERGE_WINDOW_MS = 30_000; // incremental poll overlap window (handles out-of-order ticks)
-  const MAX_POINTS = 10_000;      // cap merged points to prevent unbounded growth
+  const MAX_POINTS = 5_000;
   const presets = [
     { label: '1H', value: '1h', ms: 60 * 60 * 1000 },
     { label: '6H', value: '6h', ms: 6 * 60 * 60 * 1000 },
@@ -118,21 +118,6 @@
     updateUrl?: boolean;
     delta?: boolean;
   };
-  type CachedSpread = {
-    response: SpreadResponse;
-    loadedAt: number;
-  };
-
-  type IntervalStats = {
-    max: number | null;
-    min: number | null;
-    avg: number | null;
-    volatility: number | null;
-    meanReversionMs: number | null;
-    windowCount: number;
-    positiveShare: number | null;
-  };
-
   let markets: Market[] = [];
   let selectedBase = '';
   let selectedA = '';
@@ -147,17 +132,24 @@
   let rangeAnchorMs = Date.now();
   let rates: QuoteRate[] = structuredClone(defaultRates);
   let hydrated = false;
-  let initialLoad = true;
   let showAToB = true;
   let showBToA = true;
   let displayMode: DisplayMode = 'both';
   let averageScope: AverageScope = 'all';
   let averagePercent = '10';
   let autoRefresh = true;
+  let followRealtime = true;
   let refreshSeconds = 15;
-  let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let refreshFailureCount = 0;
   let spreadRequestSeq = 0;
-  const spreadCache = new Map<string, CachedSpread>();
+  let spreadAbortController: AbortController | null = null;
+  let refinementRequestSeq = 0;
+  let refinementAbortController: AbortController | null = null;
+  const spreadCache = new TimedLruCache<SpreadResponse>(
+    MAX_SPREAD_CACHE_ENTRIES,
+    SPREAD_CACHE_TTL_MS
+  );
 
   let marketError = '';
   let queryError = '';
@@ -165,12 +157,20 @@
   let loadingSpread = false;
   let refreshingSpread = false;
   let spread: SpreadResponse | null = null;
+  let baseSpread: SpreadResponse | null = null;
   let selectedIndex = -1;
   let hoverIndex = -1;
+  let marketSearch = '';
+  let onlyLiveMarkets = false;
+  let ChartComponent: typeof SpreadLightweightChart | null = null;
+  let queryFollowsRealtime = false;
 
   $: currentMarket = markets.find((market) => market.baseAsset === selectedBase);
+  $: visibleMarkets = filterMarkets(markets, marketSearch, onlyLiveMarkets);
   $: currentInstruments = currentMarket?.instruments ?? [];
   $: selectedPairIsLive = selectionFollowsLive(currentInstruments, selectedA, selectedB);
+  $: queryFollowsRealtime =
+    followRealtime && selectedPreset !== 'custom' && selectedPairIsLive;
   $: venueOptions = buildVenueOptions(markets);
   $: venuePairMarkets = commonMarketsForVenues(markets, selectedVenueA, selectedVenueB);
   $: selectedInstrumentA = currentInstruments.find((instrument) => instrument.catalogId === selectedA) ?? null;
@@ -185,7 +185,10 @@
     showAToB,
     showBToA,
     averageScope,
-    averagePercentValue
+    averagePercentValue,
+    spread?.meta.fromMs ?? selectedRange.fromMs,
+    spread?.meta.toMs ?? selectedRange.toMs,
+    spread?.meta.maxStaleMs ?? 120_000
   );
   $: averageScopeSummary = averageScopeLabel(averageScope, averagePercentValue);
   $: activeIndex = hoverIndex >= 0 ? hoverIndex : selectedIndex;
@@ -194,7 +197,12 @@
   $: latestOpportunity = opportunityForPoint(latestPoint);
   $: activeOpportunity = opportunityForPoint(activePoint);
   $: pointRows = pointTableRows(points, activeIndex);
-  $: intervalStats = computeIntervalStats(points);
+  $: intervalStats = computeTimeWeightedStats(
+    points,
+    spread?.meta.fromMs ?? selectedRange.fromMs,
+    spread?.meta.toMs ?? selectedRange.toMs,
+    spread?.meta.maxStaleMs ?? 120_000
+  );
   $: routeCode =
     marketError
       ? 'SETUP'
@@ -215,8 +223,9 @@
 
   onMount(() => {
     hydrated = true;
-    loadStoredRates();
-
+    void import('$lib/components/SpreadLightweightChart.svelte').then((module) => {
+      ChartComponent = module.default;
+    });
     // Try loading from localStorage cache first
     const cachedMarkets = loadMarketsFromCache();
     if (cachedMarkets) {
@@ -226,36 +235,21 @@
         applySelectionState(queryState);
         syncVenueSelectionFromSelectedLegs();
 
-        // Try loading cached spread
-        if (selectedA && selectedB && selectedA !== selectedB) {
-          const range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
-          const spreadPayload = {
-            catalogA: selectedA,
-            catalogB: selectedB,
-            fromMs: range.fromMs,
-            toMs: range.toMs,
-            ...spreadQueryOptions(range),
-            rates: cleanRates(rates)
-          };
-          const spreadCacheKeyStr = spreadCacheKey(spreadPayload);
-          const cachedSpread = loadSpreadFromCache(spreadCacheKeyStr);
-          if (cachedSpread) {
-            spread = cachedSpread;
-            selectedIndex = cachedSpread.points.length > 0 ? cachedSpread.points.length - 1 : -1;
-          }
-        }
       }
     }
 
     // Always fetch fresh data
     const queryState = readQueryState();
     void loadMarkets(queryState).finally(() => {
-      initialLoad = false;
       configureAutoRefresh();
     });
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       stopAutoRefresh();
+      spreadAbortController?.abort();
+      refinementAbortController?.abort();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   });
 
@@ -290,61 +284,76 @@
       return;
     }
 
+    if (!options.delta) {
+      refinementAbortController?.abort();
+      refinementAbortController = null;
+      refinementRequestSeq += 1;
+    }
+
     if (options.slideWindow && selectedPreset !== 'custom') {
       rangeAnchorMs = anchorForSelection(instrumentsForBase(selectedBase), catalogA, catalogB);
     }
 
-    let range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
+    const baseRange = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
+    let range = baseRange;
     if (!Number.isFinite(range.fromMs) || !Number.isFinite(range.toMs) || range.fromMs >= range.toMs) {
       queryError = 'Choose a valid time range with From before To';
       return;
     }
 
-    // Delta mode: narrow range to only recent data with merge-window overlap
-    if (options.delta && spread && spread.points.length > 0) {
-      const lastTs = spread.points[spread.points.length - 1].tsMs;
-      range = { fromMs: lastTs - MERGE_WINDOW_MS, toMs: Date.now() };
-    }
+    const deltaBase = options.delta ? (baseSpread ?? spread) : null;
+    const queryOptions =
+      options.delta && deltaBase
+        ? spreadQueryOptionsForDelta(deltaBase.meta)
+        : spreadQueryOptions(baseRange);
 
-    // Try loading from localStorage cache before network request (skip for delta)
-    let cachedFromStorage: SpreadResponse | null = null;
-    if (!options.delta) {
-      const localStorageCacheKey = spreadCacheKey({
-        catalogA,
-        catalogB,
-        fromMs: range.fromMs,
-        toMs: range.toMs
-      });
-      cachedFromStorage = loadSpreadFromCache(localStorageCacheKey);
-    }
-    if (cachedFromStorage && points.length === 0 && !spread) {
-      spread = cachedFromStorage;
-      selectedIndex = cachedFromStorage.points.length > 0 ? cachedFromStorage.points.length - 1 : -1;
+    if (options.delta && deltaBase && deltaBase.points.length > 0) {
+      const lastTs = deltaBase.points[deltaBase.points.length - 1].tsMs;
+      range = { fromMs: lastTs - MERGE_WINDOW_MS, toMs: Date.now() };
     }
 
     const requestId = ++spreadRequestSeq;
     const previousSelectedPoint = selectedIndex >= 0 ? points[selectedIndex] : null;
-    const wasFollowingLatest = selectedIndex < 0 || selectedIndex >= points.length - 1;
+    const wasFollowingLatest =
+      queryFollowsRealtime && (selectedIndex < 0 || selectedIndex >= points.length - 1);
     const payload: Record<string, unknown> = {
       catalogA,
       catalogB,
       fromMs: range.fromMs,
       toMs: range.toMs,
+      ...queryOptions,
+      ...(options.delta && spread?.meta.nextCursor
+        ? { afterCursor: spread.meta.nextCursor }
+        : {}),
       rates: cleanRates(rates)
     };
-    // Delta mode: let server auto-select granularity from short window
-    if (!options.delta) {
-      Object.assign(payload, spreadQueryOptions(range));
-    }
-    const cacheKey = spreadCacheKey(payload);
-    const cached = options.delta ? null : readSpreadCache(cacheKey);
+    const cacheKey = spreadCacheKey({
+      catalogA,
+      catalogB,
+      storageA: selectedInstrumentA
+        ? `${selectedInstrumentA.venueInstanceId}:${selectedInstrumentA.instrumentId}`
+        : catalogA,
+      storageB: selectedInstrumentB
+        ? `${selectedInstrumentB.venueInstanceId}:${selectedInstrumentB.instrumentId}`
+        : catalogB,
+      fromMs: range.fromMs,
+      toMs: range.toMs,
+      ...queryOptions,
+      targetQuote:
+        spread?.meta.targetQuote ??
+        selectedInstrumentA?.quoteAsset ??
+        selectedInstrumentB?.quoteAsset,
+      rates: cleanRates(rates)
+    });
+    const cached = options.delta ? null : spreadCache.get(cacheKey);
     const usedCached = cached !== null && !options.silent;
     const hasExistingPoints = points.length > 0;
 
     if (usedCached) {
-      spread = cached.response;
+      spread = cached;
+      baseSpread = cached;
       selectedIndex = nextSelectedIndex(
-        cached.response.points,
+        cached.points,
         previousSelectedPoint?.tsMs ?? null,
         wasFollowingLatest,
         options.preservePoint
@@ -362,27 +371,37 @@
     if (!options.preservePoint) {
       hoverIndex = -1;
     }
+    spreadAbortController?.abort();
+    const controller = new AbortController();
+    spreadAbortController = controller;
     try {
       const response = await fetch('/api/spread', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: controller.signal
       });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error ?? 'Failed to query spread');
       if (requestId !== spreadRequestSeq || selectedA !== catalogA || selectedB !== catalogB) return;
-      if (options.delta && spread && spread.points.length > 0) {
-        // Incremental merge: deduplicate by tsMs, sort, cap
-        const existingTs = new Set(spread.points.map(p => p.tsMs));
-        const newPoints = (body as SpreadResponse).points.filter(p => !existingTs.has(p.tsMs));
-        const merged = [...spread.points, ...newPoints].sort((a, b) => a.tsMs - b.tsMs);
-        const capped = merged.length > MAX_POINTS ? merged.slice(merged.length - MAX_POINTS) : merged;
-        spread = { ...(body as SpreadResponse), points: capped };
-        selectedIndex = capped.length - 1;
+      if (options.delta && deltaBase && deltaBase.points.length > 0) {
+        const wasShowingBase = spread === deltaBase || baseSpread === null;
+        const merged = mergeSpreadResponses(deltaBase, body as SpreadResponse, MAX_POINTS);
+        baseSpread = merged;
+        if (wasShowingBase) {
+          spread = merged;
+          selectedIndex = nextSelectedIndex(
+            merged.points,
+            previousSelectedPoint?.tsMs ?? null,
+            wasFollowingLatest,
+            true
+          );
+        }
       } else {
         const nextSpread = body as SpreadResponse;
-        rememberSpread(cacheKey, nextSpread);
+        spreadCache.set(cacheKey, nextSpread);
         spread = nextSpread;
+        baseSpread = nextSpread;
         selectedIndex = nextSelectedIndex(
           nextSpread.points,
           previousSelectedPoint?.tsMs ?? null,
@@ -393,28 +412,34 @@
       if (options.updateUrl !== false) {
         syncQueryState();
       }
+      refreshFailureCount = 0;
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
       if (requestId !== spreadRequestSeq || selectedA !== catalogA || selectedB !== catalogB) return;
-      if (!usedCached) {
-        spread = null;
+      refreshFailureCount = Math.min(refreshFailureCount + 1, 5);
+      if (!usedCached && !spread) {
         selectedIndex = -1;
-        queryError = error instanceof Error ? error.message : 'Failed to query spread';
       }
+      queryError = error instanceof Error ? error.message : 'Failed to query spread';
     } finally {
       if (requestId === spreadRequestSeq) {
         loadingSpread = false;
         refreshingSpread = false;
+        if (spreadAbortController === controller) spreadAbortController = null;
       }
+      if (options.delta || options.silent) scheduleNextRefresh();
     }
   }
 
   async function selectBase(baseAsset: string) {
+    baseSpread = null;
     applySelectionState({ ...captureQueryState(), baseAsset });
     syncVenueSelectionFromSelectedLegs();
     await loadSpreadWhenReady({ slideWindow: true });
   }
 
   function selectLegA(catalogId: string) {
+    baseSpread = null;
     selectedA = catalogId;
     if (selectedA === selectedB) {
       selectedB = currentInstruments.find((instrument) => instrument.catalogId !== catalogId)?.catalogId ?? '';
@@ -425,6 +450,7 @@
   }
 
   function selectLegB(catalogId: string) {
+    baseSpread = null;
     selectedB = catalogId;
     if (selectedA === selectedB) {
       selectedA = currentInstruments.find((instrument) => instrument.catalogId !== catalogId)?.catalogId ?? '';
@@ -439,6 +465,7 @@
     const previousA = selectedA;
     selectedA = selectedB;
     selectedB = previousA;
+    baseSpread = null;
     selectedIndex = -1;
     hoverIndex = -1;
     syncVenueSelectionFromSelectedLegs();
@@ -491,6 +518,7 @@
     selectedBase = option.market.baseAsset;
     selectedA = option.instrumentA.catalogId;
     selectedB = option.instrumentB.catalogId;
+    baseSpread = null;
     selectedIndex = -1;
     hoverIndex = -1;
     rangeAnchorMs = anchorForSelection(option.market.instruments, selectedA, selectedB);
@@ -504,12 +532,20 @@
   }
 
   async function refreshCurrentSpread(options: LoadSpreadOptions = {}) {
-    if (options.silent && !selectionFollowsLive(currentInstruments, selectedA, selectedB)) return;
+    if (options.silent && !queryFollowsRealtime) {
+      stopAutoRefresh();
+      return;
+    }
     await loadSpreadWhenReady({ slideWindow: true, ...options });
   }
 
   function toggleAutoRefresh(enabled: boolean) {
     autoRefresh = enabled;
+    configureAutoRefresh();
+  }
+
+  function toggleFollowRealtime(enabled: boolean) {
+    followRealtime = enabled;
     configureAutoRefresh();
   }
 
@@ -521,17 +557,46 @@
 
   function configureAutoRefresh() {
     stopAutoRefresh();
-    if (!autoRefresh) return;
-    refreshTimer = setInterval(() => {
+    scheduleNextRefresh();
+  }
+
+  function scheduleNextRefresh() {
+    stopAutoRefresh();
+    if (
+      !autoRefresh ||
+      !queryFollowsRealtime ||
+      !hydrated ||
+      document.visibilityState !== 'visible'
+    ) {
+      return;
+    }
+    const backoff = Math.min(8, 2 ** refreshFailureCount);
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
       if (!loadingMarkets && !spreadBusy) {
-        void refreshCurrentSpread({ preservePoint: true, silent: true, updateUrl: false, delta: true });
+        void refreshCurrentSpread({
+          preservePoint: true,
+          silent: true,
+          updateUrl: false,
+          delta: true
+        });
+      } else {
+        scheduleNextRefresh();
       }
-    }, refreshSeconds * 1000);
+    }, refreshSeconds * 1000 * backoff);
   }
 
   function stopAutoRefresh() {
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = null;
+  }
+
+  function handleVisibilityChange() {
+    if (document.visibilityState === 'visible') {
+      configureAutoRefresh();
+    } else {
+      stopAutoRefresh();
+    }
   }
 
   function toggleSeries(series: 'aToB' | 'bToA') {
@@ -581,49 +646,18 @@
 
   function updateRate(index: number, field: keyof QuoteRate, value: string) {
     rates = rates.map((rate, current) => (current === index ? { ...rate, [field]: value } : rate));
-    storeRates();
   }
 
   function addRate() {
     rates = [...rates, { from: '', to: '', rate: '1' }];
-    storeRates();
   }
 
   function removeRate(index: number) {
     rates = rates.filter((_, current) => current !== index);
-    storeRates();
   }
 
   function resetRates() {
     rates = structuredClone(defaultRates);
-    storeRates();
-  }
-
-  function loadStoredRates() {
-    try {
-      const raw = localStorage.getItem(RATE_STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        rates = parsed.filter(isQuoteRate);
-      }
-    } catch {
-      rates = structuredClone(defaultRates);
-    }
-  }
-
-  function storeRates() {
-    localStorage.setItem(RATE_STORAGE_KEY, JSON.stringify(rates));
-  }
-
-  function isQuoteRate(value: unknown): value is QuoteRate {
-    return (
-      typeof value === 'object' &&
-      value !== null &&
-      typeof (value as QuoteRate).from === 'string' &&
-      typeof (value as QuoteRate).to === 'string' &&
-      typeof (value as QuoteRate).rate === 'string'
-    );
   }
 
   function cleanRates(input: QuoteRate[]): QuoteRate[] {
@@ -636,43 +670,26 @@
       .filter((rate) => rate.from && rate.to && rate.rate);
   }
 
-  function spreadCacheKey(payload: object) {
-    return JSON.stringify(payload);
-  }
-
-  function readSpreadCache(key: string): CachedSpread | null {
-    const cached = spreadCache.get(key);
-    if (!cached) return null;
-    if (Date.now() - cached.loadedAt > SPREAD_CACHE_TTL_MS) {
-      spreadCache.delete(key);
-      return null;
-    }
-    spreadCache.delete(key);
-    spreadCache.set(key, cached);
-    return cached;
-  }
-
-  function rememberSpread(key: string, response: SpreadResponse) {
-    spreadCache.delete(key);
-    spreadCache.set(key, { response, loadedAt: Date.now() });
-    saveSpreadToCache(key, response);
-    while (spreadCache.size > MAX_SPREAD_CACHE_ENTRIES) {
-      const oldest = spreadCache.keys().next().value;
-      if (typeof oldest !== 'string') break;
-      spreadCache.delete(oldest);
-    }
-  }
-
   function spreadQueryOptions(range: { fromMs: number; toMs: number }) {
     const intervalSeconds = parseChartInterval(chartIntervalSeconds);
     if (intervalSeconds !== null) {
       return { precision: 'bucket', bucketSeconds: intervalSeconds };
     }
-    // Auto-select: let the server pick raw for ≤1min, candle otherwise
-    if (range.toMs - range.fromMs <= 60_000) {
-      return { precision: 'raw' };
-    }
     return {};
+  }
+
+  function spreadQueryOptionsForDelta(meta: SpreadResponse['meta']) {
+    if (meta.source === 'raw') return { precision: 'raw' };
+    if (meta.source === 'candle') {
+      return {
+        precision: 'candle',
+        bucketSeconds: Math.max(1, meta.bucketSeconds)
+      };
+    }
+    return {
+      precision: 'bucket',
+      bucketSeconds: Math.max(1, meta.bucketSeconds)
+    };
   }
 
   function parseChartInterval(value: string): number | null {
@@ -819,6 +836,7 @@
     if (value !== 'custom' && selectedA && selectedB && selectedA !== selectedB) {
       await loadSpread({ slideWindow: true });
     }
+    configureAutoRefresh();
   }
 
   async function handleChartIntervalAndQuery(value: string) {
@@ -827,6 +845,12 @@
     selectedIndex = -1;
     hoverIndex = -1;
     await loadSpreadWhenReady({ slideWindow: true });
+    configureAutoRefresh();
+  }
+
+  async function queryCurrentRange() {
+    await loadSpread({ slideWindow: true });
+    configureAutoRefresh();
   }
 
   function selectValue(event: Event) {
@@ -854,27 +878,113 @@
     }
   }
 
-  let lastGranularityChangeMs = 0;
-  const GRANULARITY_CHANGE_DEBOUNCE_MS = 500;
-
   function handleGranularityChange(detail: { fromMs: number; toMs: number }) {
-    const now = Date.now();
-    if (now - lastGranularityChangeMs < GRANULARITY_CHANGE_DEBOUNCE_MS) return;
+    void refineVisibleRange(detail);
+  }
 
-    const rangeMs = detail.toMs - detail.fromMs;
-    if (rangeMs <= 0) return;
+  async function refineVisibleRange(detail: { fromMs: number; toMs: number }) {
+    const base = baseSpread;
+    const catalogA = selectedA;
+    const catalogB = selectedB;
+    if (!base || !catalogA || !catalogB || chartIntervalSeconds.trim() !== '') return;
+    const previousTs = activePoint?.tsMs ?? null;
+    const visibleFromMs = Math.max(base.meta.fromMs, detail.fromMs);
+    const visibleToMs = Math.min(base.meta.toMs, detail.toMs);
+    const visibleRangeMs = visibleToMs - visibleFromMs;
+    if (visibleRangeMs <= 0) return;
 
-    // Only reload if the range crosses a granularity boundary
-    const currentGranularity = spread?.meta.granularity ?? '1h';
-    const nextGranularity = granularityForRange(rangeMs);
-    if (nextGranularity === currentGranularity) return;
+    const desired = granularityForRange(visibleRangeMs);
+    const baseResolution = granularityResolutionMs(
+      base.meta.granularity,
+      base.meta.bucketSeconds
+    );
+    const desiredResolution = granularityResolutionMs(desired, 0);
+    if (desiredResolution >= baseResolution) {
+      if (spread !== base) {
+        const previousTs = activePoint?.tsMs ?? null;
+        spread = base;
+        selectedIndex = nextSelectedIndex(base.points, previousTs, false, true);
+      }
+      return;
+    }
 
-    lastGranularityChangeMs = now;
-    customStart = toDateInput(detail.fromMs - 60_000); // pad slightly
-    customEnd = toDateInput(detail.toMs + 60_000);
-    selectedPreset = 'custom';
+    const padding = Math.max(1_000, Math.round(visibleRangeMs * 0.1));
+    const range = {
+      fromMs: Math.max(base.meta.fromMs, visibleFromMs - padding),
+      toMs: Math.min(base.meta.toMs, visibleToMs + padding)
+    };
+    if (
+      spread &&
+      spread !== base &&
+      spread.meta.coverage.fromMs <= range.fromMs &&
+      spread.meta.coverage.toMs >= range.toMs &&
+      granularityResolutionMs(spread.meta.granularity, spread.meta.bucketSeconds) <=
+        desiredResolution
+    ) {
+      return;
+    }
 
-    void loadSpread({ silent: true, preservePoint: true });
+    const payload = {
+      catalogA,
+      catalogB,
+      fromMs: range.fromMs,
+      toMs: range.toMs,
+      ...spreadQueryOptions(range),
+      rates: cleanRates(rates)
+    };
+    const key = spreadCacheKey({
+      ...payload,
+      storageA: `${base.meta.instrumentA.venueInstanceId}:${base.meta.instrumentA.instrumentId}`,
+      storageB: `${base.meta.instrumentB.venueInstanceId}:${base.meta.instrumentB.instrumentId}`,
+      targetQuote: base.meta.targetQuote
+    });
+    const cached = spreadCache.get(key);
+    if (cached) {
+      spread = cached;
+      selectedIndex = nextSelectedIndex(cached.points, previousTs, false, true);
+      queryError = '';
+      return;
+    }
+
+    const requestId = ++refinementRequestSeq;
+    refinementAbortController?.abort();
+    const controller = new AbortController();
+    refinementAbortController = controller;
+    refreshingSpread = true;
+    try {
+      const response = await fetch('/api/spread', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error ?? 'Failed to refine chart detail');
+      if (
+        requestId !== refinementRequestSeq ||
+        selectedA !== catalogA ||
+        selectedB !== catalogB
+      ) {
+        return;
+      }
+      const refined = body as SpreadResponse;
+      spreadCache.set(key, refined);
+      spread = refined;
+      selectedIndex = nextSelectedIndex(refined.points, previousTs, false, true);
+      queryError = '';
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      if (
+        requestId === refinementRequestSeq &&
+        selectedA === catalogA &&
+        selectedB === catalogB
+      ) {
+        queryError = error instanceof Error ? error.message : 'Failed to refine chart detail';
+      }
+    } finally {
+      if (requestId === refinementRequestSeq) refreshingSpread = false;
+      if (refinementAbortController === controller) refinementAbortController = null;
+    }
   }
 
   /** Client-side mirror of selectGranularity for boundary detection only. */
@@ -887,22 +997,63 @@
     return '1h';
   }
 
+  function granularityResolutionMs(granularity: string, bucketSeconds: number) {
+    if (granularity === 'raw') return 1;
+    if (granularity === 'bucket') return Math.max(1, bucketSeconds) * 1000;
+    if (granularity === '1s') return 1_000;
+    if (granularity === '1m') return 60_000;
+    if (granularity === '5m') return 300_000;
+    if (granularity === '15m') return 900_000;
+    return 3_600_000;
+  }
+
   function computeAverageLines(
     data: SpreadPoint[],
     mode: DisplayMode,
     includeAToB: boolean,
     includeBToA: boolean,
     scope: AverageScope,
-    percent: number
+    percent: number,
+    fromMs: number,
+    toMs: number,
+    maxStaleMs: number
   ): AverageLine[] {
     return averageSeries(data, mode, includeAToB, includeBToA)
       .map((series) => {
-        const { values: seriesValues, ...line } = series;
+        const { valueForPoint, ...line } = series;
+        const seriesValues = data
+          .map(valueForPoint)
+          .filter((value): value is number => value !== null && Number.isFinite(value));
         const values = averageSubset(seriesValues, scope, percent);
         if (values.length === 0) return null;
+        const threshold =
+          scope === 'all'
+            ? null
+            : scope === 'top'
+              ? Math.min(...values)
+              : Math.max(...values);
+        const scopedValue = (point: SpreadPoint) => {
+          const value = valueForPoint(point);
+          if (value === null || threshold === null) return value;
+          return scope === 'top'
+            ? value >= threshold
+              ? value
+              : null
+            : value <= threshold
+              ? value
+              : null;
+        };
+        const weighted = timeWeightedAverage(
+          data,
+          fromMs,
+          toMs,
+          scopedValue,
+          maxStaleMs
+        );
+        if (weighted === null) return null;
         return {
           ...line,
-          value: values.reduce((sum, value) => sum + value, 0) / values.length,
+          value: weighted,
           sampleCount: values.length,
           totalCount: seriesValues.length
         };
@@ -915,27 +1066,33 @@
     mode: DisplayMode,
     includeAToB: boolean,
     includeBToA: boolean
-  ): Array<Omit<AverageLine, 'value' | 'sampleCount' | 'totalCount'> & { values: number[] }> {
+  ): Array<
+    Omit<AverageLine, 'value' | 'sampleCount' | 'totalCount'> & {
+      valueForPoint: (point: SpreadPoint) => number | null;
+    }
+  > {
     if (mode === 'best') {
       return [
         {
           id: 'best',
           label: 'Best AVG',
           tone: 'best',
-          values: data
-            .map((point) => bestSpreadValue(point))
-            .filter((value): value is number => value !== null && Number.isFinite(value))
+          valueForPoint: (point) => bestSpreadValue(point)
         }
       ];
     }
 
-    const series: Array<Omit<AverageLine, 'value' | 'sampleCount' | 'totalCount'> & { values: number[] }> = [];
+    const series: Array<
+      Omit<AverageLine, 'value' | 'sampleCount' | 'totalCount'> & {
+        valueForPoint: (point: SpreadPoint) => number | null;
+      }
+    > = [];
     if (includeAToB) {
       series.push({
         id: 'aToB',
         label: 'A-B AVG',
         tone: 'a',
-        values: data.map((point) => point.aToBBp).filter((value): value is number => value !== null && Number.isFinite(value))
+        valueForPoint: (point) => point.aToBBp
       });
     }
     if (includeBToA) {
@@ -943,7 +1100,7 @@
         id: 'bToA',
         label: 'B-A AVG',
         tone: 'b',
-        values: data.map((point) => point.bToABp).filter((value): value is number => value !== null && Number.isFinite(value))
+        valueForPoint: (point) => point.bToABp
       });
     }
     return series;
@@ -1102,6 +1259,34 @@
     return `截至 ${formatTime(latest)}`;
   }
 
+  function filterMarkets(input: Market[], query: string, onlyLive: boolean) {
+    const normalized = query.trim().toLowerCase();
+    const globalLatest = latestForInstruments(input.flatMap((market) => market.instruments));
+    return input.filter((market) => {
+      const latest = marketComparableLatest(market);
+      if (
+        onlyLive &&
+        (latest === null ||
+          globalLatest === null ||
+          globalLatest - latest > LIVE_PAIR_GRACE_MS)
+      ) {
+        return false;
+      }
+      if (!normalized) return true;
+      return (
+        market.baseAsset.toLowerCase().includes(normalized) ||
+        market.instruments.some((instrument) =>
+          [
+            instrument.label,
+            instrument.rawSymbol,
+            instrument.venueInstanceId,
+            instrument.quoteAsset
+          ].some((value) => value.toLowerCase().includes(normalized))
+        )
+      );
+    });
+  }
+
   function marketPairLabel(market: Market) {
     const quotes = [...new Set(market.instruments.map((instrument) => instrument.quoteAsset).filter(Boolean))];
     if (quotes.length === 0) return `${market.baseAsset}/QUOTE`;
@@ -1175,65 +1360,7 @@
   }
 
   function bestBpValue(point: SpreadPoint | null) {
-    return opportunityForPoint(point)?.bp ?? null;
-  }
-
-  function computeIntervalStats(data: SpreadPoint[]): IntervalStats {
-    const samples = data
-      .map((point) => ({ tsMs: point.tsMs, bp: bestBpValue(point) }))
-      .filter((sample): sample is { tsMs: number; bp: number } => sample.bp !== null && Number.isFinite(sample.bp));
-
-    if (samples.length === 0) {
-      return {
-        max: null,
-        min: null,
-        avg: null,
-        volatility: null,
-        meanReversionMs: null,
-        windowCount: 0,
-        positiveShare: null
-      };
-    }
-
-    const values = samples.map((sample) => sample.bp);
-    const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
-    const variance = values.reduce((sum, value) => sum + (value - avg) ** 2, 0) / values.length;
-    let windowCount = 0;
-    let positiveCount = 0;
-    let previousPositive = false;
-    let runStart: number | null = null;
-    const runDurations: number[] = [];
-
-    samples.forEach((sample, index) => {
-      const positive = sample.bp > 0;
-      if (positive) positiveCount += 1;
-      if (positive && !previousPositive) {
-        windowCount += 1;
-        runStart = sample.tsMs;
-      }
-      if (!positive && previousPositive && runStart !== null) {
-        runDurations.push(samples[index - 1].tsMs - runStart);
-        runStart = null;
-      }
-      previousPositive = positive;
-    });
-
-    if (previousPositive && runStart !== null) {
-      runDurations.push(samples[samples.length - 1].tsMs - runStart);
-    }
-
-    return {
-      max: Math.max(...values),
-      min: Math.min(...values),
-      avg,
-      volatility: Math.sqrt(variance),
-      meanReversionMs:
-        runDurations.length > 0
-          ? runDurations.reduce((sum, value) => sum + value, 0) / runDurations.length
-          : null,
-      windowCount,
-      positiveShare: positiveCount / samples.length
-    };
+    return point ? bestBp(point) : null;
   }
 
   function pointTableRows(data: SpreadPoint[], active: number) {
@@ -1384,7 +1511,7 @@
       <span>
         {refreshingSpread
           ? '同步当前组合中'
-          : !selectedPairIsLive
+          : !queryFollowsRealtime
             ? '历史快照'
             : autoRefresh
               ? `实时 ${refreshSeconds}s`
@@ -1443,7 +1570,26 @@
         <section class="sidebar-block">
           <div class="sidebar-heading">
             <span>监控交易对</span>
-            <strong>{formatInteger(markets.length)}</strong>
+            <strong>{formatInteger(visibleMarkets.length)} / {formatInteger(markets.length)}</strong>
+          </div>
+          <div class="market-filter">
+            <input
+              type="search"
+              name="market-search"
+              aria-label="搜索交易对或交易所"
+              autocomplete="off"
+              placeholder="搜索资产 / 交易所"
+              value={marketSearch}
+              on:input={(event) => (marketSearch = inputValue(event))}
+            />
+            <button
+              type="button"
+              class:active={onlyLiveMarkets}
+              aria-pressed={onlyLiveMarkets}
+              on:click={() => (onlyLiveMarkets = !onlyLiveMarkets)}
+            >
+              仅活跃
+            </button>
           </div>
 
           <div class="market-list">
@@ -1453,10 +1599,10 @@
                   <div class="skeleton skeleton-row"></div>
                 {/each}
               </div>
-            {:else if markets.length === 0}
+            {:else if visibleMarkets.length === 0}
               <p class="sidebar-empty">没有可比较的交易对。</p>
             {:else}
-              {#each markets as market}
+              {#each visibleMarkets as market}
                 <button
                   type="button"
                   class:active={market.baseAsset === selectedBase}
@@ -1670,6 +1816,15 @@
             />
             自动更新当前交易对
           </label>
+          <label class="checkbox-line">
+            <input
+              type="checkbox"
+              name="follow-realtime"
+              checked={followRealtime}
+              on:change={(event) => toggleFollowRealtime((event.currentTarget as HTMLInputElement).checked)}
+            />
+            跟随实时并滚动视口
+          </label>
           <label>
             <span>刷新间隔</span>
             <select
@@ -1790,7 +1945,7 @@
           class="primary-button"
           type="button"
           disabled={spreadBusy || loadingMarkets || currentInstruments.length < 2}
-          on:click={() => void loadSpread({ slideWindow: true })}
+          on:click={() => void queryCurrentRange()}
         >
           {spreadBusy ? '同步中' : '查询'}
         </button>
@@ -1897,8 +2052,12 @@
           </div>
         {:else if points.length === 0}
           <div class="empty-state">当前组合没有可比较的盘口状态样本。请调整交易所腿或时间范围。</div>
+        {:else if !ChartComponent}
+          <div class="skeleton-chart" aria-label="正在加载交互式图表">
+            <div class="skeleton" style="width: 100%; height: 100%; border-radius: var(--radius);"></div>
+          </div>
         {:else}
-          <SpreadLightweightChart
+          <ChartComponent
             {points}
             {displayMode}
             {showAToB}
@@ -1907,6 +2066,8 @@
             {selectedIndex}
             labelA={selectedLabel(selectedA)}
             labelB={selectedLabel(selectedB)}
+            descriptionId="chart-help"
+            viewKey={`${selectedA}:${selectedB}:${baseSpread?.meta.fromMs ?? 0}:${baseSpread?.meta.toMs ?? 0}`}
             on:hover={(event) => (hoverIndex = event.detail.index)}
             on:select={(event) => (selectedIndex = event.detail.index)}
             on:navigate={(event) => handleChartNavigation(event.detail.key)}
@@ -1915,12 +2076,15 @@
         {/if}
 
         <p class="chart-caption">
+          {#if spread?.meta.fallbackReason}
+            聚合数据尚未覆盖当前范围，已自动使用 bucket 查询；页面功能保持可用。
+          {/if}
           {#if spread?.meta.granularity === 'raw'}
-            当前短窗口使用数据库逐 tick BBO 更新计算价差；任一侧更新时都会与另一侧最后有效盘口对齐，未变化的一侧会持续沿用。
+            当前短窗口使用数据库逐 tick BBO 更新计算价差；任一腿超过 120 秒未更新时会形成数据缺口。
           {:else if spread?.meta.granularity === 'bucket'}
-            每个 bucket 展示结束时刻的 A/B 最新有效盘口，纵轴统一为 bp；盘口会持续沿用到该腿出现新状态，质量异常数据会被跳过。
+            每个 bucket 展示结束时刻的 A/B 最新有效盘口；质量异常或超过 120 秒的陈旧状态会被跳过。
           {:else}
-            预聚合 OHLC candle 视图（{spread?.meta.granularity ?? '-'}），纵轴统一为 bp；每个数据点展示该粒度下最新有效盘口。
+            预聚合 candle 视图（{spread?.meta.granularity ?? '-'}）；仅显示验证覆盖范围内、双腿均新鲜的盘口。
           {/if}
         </p>
       </section>
@@ -2021,6 +2185,10 @@
             <dt>正价差占比</dt>
             <dd>{formatPercent(intervalStats.positiveShare)}</dd>
           </div>
+          <div>
+            <dt>有效覆盖率</dt>
+            <dd>{formatPercent(intervalStats.coverageShare)}</dd>
+          </div>
         </dl>
       </section>
 
@@ -2069,7 +2237,7 @@
         <div class="meta-row">
           <span>Mode</span>
           <strong>
-            {selectedPairIsLive ? (autoRefresh ? `${refreshSeconds}s live` : 'Paused') : 'Historical'}
+            {queryFollowsRealtime ? (autoRefresh ? `${refreshSeconds}s live` : 'Paused') : 'Historical'}
           </strong>
         </div>
         <div class="meta-row">
@@ -2257,10 +2425,14 @@
 
   .main-panel {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     flex: 1;
+    width: 100%;
+    max-width: 100%;
     min-width: 0;
     align-content: start;
     gap: 0;
+    overflow-x: clip;
     background: var(--background);
   }
 
@@ -2884,6 +3056,9 @@
 
   .chart-shell {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    min-width: 0;
+    overflow: hidden;
     gap: 12px;
   }
 
@@ -3746,10 +3921,10 @@
     color: var(--profit) !important;
   }
 
-  @media (min-width: 1200px) {
+  @media (min-width: 1280px) {
     .desk-layout {
       display: grid;
-      grid-template-columns: 17rem minmax(42rem, 1fr) 18rem;
+      grid-template-columns: 17rem minmax(0, 1fr) 18rem;
     }
 
     .market-sidebar,
@@ -3772,7 +3947,26 @@
     }
   }
 
-  @media (min-width: 820px) and (max-width: 1199px) {
+  @media (min-width: 1280px) and (max-width: 1599px) {
+    .query-toolbar {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .mode-cluster {
+      justify-content: flex-start;
+    }
+
+    .chart-options {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
+    .average-control {
+      margin-left: 0;
+    }
+  }
+
+  @media (min-width: 1024px) and (max-width: 1279px) {
     .desk-layout {
       display: grid;
       grid-template-columns: 16rem minmax(0, 1fr);
@@ -3803,8 +3997,14 @@
     }
   }
 
-  @media (max-width: 819px) {
+  @media (max-width: 1023px) {
+    .desk-layout {
+      display: flex;
+      align-items: stretch;
+    }
+
     .market-sidebar {
+      width: 100%;
       max-height: none;
       overflow: visible;
     }
@@ -3954,5 +4154,39 @@
     display: grid;
     gap: 6px;
     padding: 8px 12px;
+  }
+
+  .market-filter {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+
+  .market-filter input,
+  .market-filter button {
+    min-height: 34px;
+  }
+
+  .market-filter input {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .market-list button,
+  .exchange-market-list button {
+    content-visibility: auto;
+    contain-intrinsic-size: 62px;
+  }
+
+  :global(body) {
+    overflow-x: hidden;
+  }
+
+  .desk-layout,
+  .main-panel,
+  .market-sidebar,
+  .stats-sidebar {
+    min-width: 0;
   }
 </style>

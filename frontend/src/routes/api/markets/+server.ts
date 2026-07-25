@@ -3,6 +3,7 @@ import { fetchInstruments, groupMarkets } from '$lib/server/catalog';
 import { ClickHouseError } from '$lib/server/clickhouse';
 
 export const GET: RequestHandler = async () => {
+  const requestId = crypto.randomUUID();
   try {
     const instruments = await fetchInstruments();
     return json(
@@ -17,12 +18,22 @@ export const GET: RequestHandler = async () => {
       }
     );
   } catch (error) {
-    return apiError(error);
+    return apiError(error, requestId);
   }
 };
 
-function apiError(error: unknown): Response {
-  const status = error instanceof ClickHouseError ? error.status : 500;
-  const message = error instanceof Error ? error.message : 'Unknown server error';
-  return json({ error: message }, { status });
+function apiError(error: unknown, requestId: string): Response {
+  console.error(`[api/markets:${requestId}]`, error);
+  const exposed = error instanceof ClickHouseError && error.expose;
+  return json(
+    {
+      error: exposed ? error.message : 'The market catalog is temporarily unavailable.',
+      code: exposed ? error.code : 'UPSTREAM_UNAVAILABLE',
+      requestId
+    },
+    {
+      status: exposed ? error.status : 502,
+      headers: { 'cache-control': 'no-store', 'x-request-id': requestId }
+    }
+  );
 }

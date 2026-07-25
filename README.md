@@ -119,6 +119,8 @@ Important config sections:
 - `storage.clickhouse.username`: ClickHouse HTTP username.
 - `storage.clickhouse.password_env`: environment variable holding the ClickHouse password.
 - `storage.clickhouse.accept_invalid_certs`: explicitly allow a self-signed ClickHouse TLS certificate. Keep this disabled for endpoints with a valid certificate.
+- `storage.clickhouse.candle_mode`: frontend aggregate-table mode: `off`, `auto`, or `force`.
+- `storage.clickhouse.max_stale_ms`: maximum age of either carried BBO leg; defaults to 120 seconds.
 - `storage.clickhouse.batch_size`: number of rows buffered before each HTTP insert.
 - `tui.enabled`: enable or disable the terminal UI.
 - `tui.refresh_ms`: terminal UI refresh interval.
@@ -141,6 +143,8 @@ catalog_table = "instrument_catalog"
 username = "zeabur"
 password_env = "CLICKHOUSE_PASSWORD"
 accept_invalid_certs = true
+candle_mode = "auto"
+max_stale_ms = 120000
 create_table = true
 batch_size = 100
 ```

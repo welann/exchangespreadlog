@@ -1,257 +1,230 @@
--- =============================================================================
--- Migration 001: Pre-aggregated Candlestick Materialized Views
--- =============================================================================
--- Creates 5 layers of candle tables (1s, 1m, 5m, 15m, 1h) with cascading
--- materialized views from the raw tick table. Each table uses
--- AggregatingMergeTree with SimpleAggregateFunction for the aggregate columns.
+-- Candle schema v2 for ClickHouse 24.10.
 --
--- The lowest layer (1s) is fed directly from the tick table. Each subsequent
--- layer aggregates from the next-finer layer: 1m ← 1s, 5m ← 1m, etc.
+-- Required substitutions:
+--   {database}             e.g. zeabur
+--   {table}                e.g. bbo_ticks
+--   {cutover_recv_ts_ns}   activation watermark scheduled after this DDL is
+--                          expected to finish (or captured while writes pause)
 --
--- Query pattern: use `argMinMerge(open_mid)`, `maxMerge(high_mid)`, etc. when
--- reading from these tables, or include the -Merge suffix automatically if
--- using FINAL (not required for most dashboards).
---
--- All times are bucket-aligned (toStartOfSecond, toStartOfMinute, etc.) and
--- stored as DateTime64(3, 'UTC').
--- =============================================================================
+-- For an online rollout, choose a watermark several minutes in the future,
+-- finish every view before that watermark, then wait for it to pass before
+-- starting 002_backfill_tick_candles.sql. The live raw-table views accept only
+-- rows newer than the watermark, while backfill accepts only rows at or below
+-- it. This prevents both DDL-window gaps and duplicate aggregate states.
 
--- =============================================================================
--- Candle Table Template
--- =============================================================================
--- Repeated 5 times below for each granularity. Column list is identical.
--- =============================================================================
-
--- ── Layer 1: 1-second candles (source: tick_table) ────────────────────────
-
-CREATE TABLE IF NOT EXISTS {database}.tick_candle_1s
+CREATE TABLE IF NOT EXISTS {database}.{table}_candle_1s
 (
     venue_instance_id LowCardinality(String),
     instrument_id String,
     bucket_time DateTime64(3, 'UTC'),
-    -- OHLC based on mid = (bid + ask) / 2
-    open_mid SimpleAggregateFunction(argMin, Float64),
-    high_mid SimpleAggregateFunction(max, Float64),
-    low_mid SimpleAggregateFunction(min, Float64),
-    close_mid SimpleAggregateFunction(argMax, Float64),
-    -- Final snapshot within bucket (for spread carry-forward)
-    final_bid_price SimpleAggregateFunction(argMax, Float64),
-    final_bid_size SimpleAggregateFunction(argMax, Float64),
-    final_bid_order_count SimpleAggregateFunction(argMax, UInt32),
-    final_ask_price SimpleAggregateFunction(argMax, Float64),
-    final_ask_size SimpleAggregateFunction(argMax, Float64),
-    final_ask_order_count SimpleAggregateFunction(argMax, UInt32),
-    -- Metadata
-    tick_count SimpleAggregateFunction(sum, UInt32)
+    open_mid AggregateFunction(argMin, Float64, Int64),
+    high_mid AggregateFunction(max, Float64),
+    low_mid AggregateFunction(min, Float64),
+    close_mid AggregateFunction(argMax, Float64, Int64),
+    final_book AggregateFunction(
+        argMax,
+        Tuple(
+            Nullable(Float64),
+            Nullable(Float64),
+            Nullable(Float64),
+            Nullable(Float64),
+            Nullable(UInt32),
+            Nullable(UInt32),
+            Float64,
+            Int64
+        ),
+        Int64
+    ),
+    tick_count AggregateFunction(sum, UInt64)
 )
-ENGINE = AggregatingMergeTree()
+ENGINE = AggregatingMergeTree
 PARTITION BY toDate(bucket_time)
 ORDER BY (venue_instance_id, instrument_id, bucket_time)
+TTL toDateTime(bucket_time, 'UTC') + INTERVAL 31 DAY DELETE
 SETTINGS index_granularity = 8192;
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.tick_candle_1s_mv
-TO {database}.tick_candle_1s
-AS SELECT
-    venue_instance_id,
-    instrument_id,
-    toStartOfSecond(recv_time) AS bucket_time,
-    -- OHLC on mid
-    argMinState((bid_price + ask_price) / 2, recv_time) AS open_mid,
-    maxState((bid_price + ask_price) / 2) AS high_mid,
-    minState((bid_price + ask_price) / 2) AS low_mid,
-    argMaxState((bid_price + ask_price) / 2, recv_time) AS close_mid,
-    -- Final snapshot (last per bucket, ordered by recv_time)
-    argMaxState(bid_price, recv_time) AS final_bid_price,
-    argMaxState(bid_size, recv_time) AS final_bid_size,
-    argMaxState(bid_order_count, recv_time) AS final_bid_order_count,
-    argMaxState(ask_price, recv_time) AS final_ask_price,
-    argMaxState(ask_size, recv_time) AS final_ask_size,
-    argMaxState(ask_order_count, recv_time) AS final_ask_order_count,
-    -- Count
-    sumState(1) AS tick_count
-FROM {database}.tick_table
-WHERE bid_price IS NOT NULL AND ask_price IS NOT NULL
-  AND bid_price > 0 AND ask_price > 0
-  AND bid_price <= ask_price
-  AND (bid_size IS NULL OR bid_size > 0)
-  AND (ask_size IS NULL OR ask_size > 0)
-  AND venue_instance_id != '' AND instrument_id != ''
-GROUP BY venue_instance_id, instrument_id, bucket_time;
-
--- ── Layer 2: 1-minute candles (source: tick_candle_1s) ────────────────────
-
-CREATE TABLE IF NOT EXISTS {database}.tick_candle_1m
-(
-    venue_instance_id LowCardinality(String),
-    instrument_id String,
-    bucket_time DateTime64(3, 'UTC'),
-    open_mid SimpleAggregateFunction(argMin, Float64),
-    high_mid SimpleAggregateFunction(max, Float64),
-    low_mid SimpleAggregateFunction(min, Float64),
-    close_mid SimpleAggregateFunction(argMax, Float64),
-    final_bid_price SimpleAggregateFunction(argMax, Float64),
-    final_bid_size SimpleAggregateFunction(argMax, Float64),
-    final_bid_order_count SimpleAggregateFunction(argMax, UInt32),
-    final_ask_price SimpleAggregateFunction(argMax, Float64),
-    final_ask_size SimpleAggregateFunction(argMax, Float64),
-    final_ask_order_count SimpleAggregateFunction(argMax, UInt32),
-    tick_count SimpleAggregateFunction(sum, UInt32)
-)
-ENGINE = AggregatingMergeTree()
+CREATE TABLE IF NOT EXISTS {database}.{table}_candle_1m AS {database}.{table}_candle_1s
+ENGINE = AggregatingMergeTree
 PARTITION BY toDate(bucket_time)
 ORDER BY (venue_instance_id, instrument_id, bucket_time)
+TTL toDateTime(bucket_time, 'UTC') + INTERVAL 31 DAY DELETE
 SETTINGS index_granularity = 8192;
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.tick_candle_1m_mv
-TO {database}.tick_candle_1m
+CREATE TABLE IF NOT EXISTS {database}.{table}_candle_5m AS {database}.{table}_candle_1s
+ENGINE = AggregatingMergeTree
+PARTITION BY toDate(bucket_time)
+ORDER BY (venue_instance_id, instrument_id, bucket_time)
+TTL toDateTime(bucket_time, 'UTC') + INTERVAL 31 DAY DELETE
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS {database}.{table}_candle_15m AS {database}.{table}_candle_1s
+ENGINE = AggregatingMergeTree
+PARTITION BY toDate(bucket_time)
+ORDER BY (venue_instance_id, instrument_id, bucket_time)
+TTL toDateTime(bucket_time, 'UTC') + INTERVAL 31 DAY DELETE
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS {database}.{table}_candle_1h AS {database}.{table}_candle_1s
+ENGINE = AggregatingMergeTree
+PARTITION BY toDate(bucket_time)
+ORDER BY (venue_instance_id, instrument_id, bucket_time)
+TTL toDateTime(bucket_time, 'UTC') + INTERVAL 31 DAY DELETE
+SETTINGS index_granularity = 8192;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.{table}_candle_1m_mv
+TO {database}.{table}_candle_1m
 AS SELECT
     venue_instance_id,
     instrument_id,
     toStartOfMinute(bucket_time) AS bucket_time,
-    -- Aggregate OHLC from the 1s layer
-    argMinState(argMinMerge(open_mid), bucket_time) AS open_mid,
-    maxState(maxMerge(high_mid)) AS high_mid,
-    minState(minMerge(low_mid)) AS low_mid,
-    argMaxState(argMaxMerge(close_mid), bucket_time) AS close_mid,
-    -- Final snapshot: argMax on the already-argMax columns
-    argMaxState(argMaxMerge(final_bid_price), bucket_time) AS final_bid_price,
-    argMaxState(argMaxMerge(final_bid_size), bucket_time) AS final_bid_size,
-    argMaxState(argMaxMerge(final_bid_order_count), bucket_time) AS final_bid_order_count,
-    argMaxState(argMaxMerge(final_ask_price), bucket_time) AS final_ask_price,
-    argMaxState(argMaxMerge(final_ask_size), bucket_time) AS final_ask_size,
-    argMaxState(argMaxMerge(final_ask_order_count), bucket_time) AS final_ask_order_count,
-    sumState(sumMerge(tick_count)) AS tick_count
-FROM {database}.tick_candle_1s
-GROUP BY venue_instance_id, instrument_id, bucket_time;
+    argMinMergeState(open_mid) AS open_mid,
+    maxMergeState(high_mid) AS high_mid,
+    minMergeState(low_mid) AS low_mid,
+    argMaxMergeState(close_mid) AS close_mid,
+    argMaxMergeState(final_book) AS final_book,
+    sumMergeState(tick_count) AS tick_count
+FROM {database}.{table}_candle_1s
+GROUP BY venue_instance_id, instrument_id, toStartOfMinute(bucket_time);
 
--- ── Layer 3: 5-minute candles (source: tick_candle_1m) ────────────────────
-
-CREATE TABLE IF NOT EXISTS {database}.tick_candle_5m
-(
-    venue_instance_id LowCardinality(String),
-    instrument_id String,
-    bucket_time DateTime64(3, 'UTC'),
-    open_mid SimpleAggregateFunction(argMin, Float64),
-    high_mid SimpleAggregateFunction(max, Float64),
-    low_mid SimpleAggregateFunction(min, Float64),
-    close_mid SimpleAggregateFunction(argMax, Float64),
-    final_bid_price SimpleAggregateFunction(argMax, Float64),
-    final_bid_size SimpleAggregateFunction(argMax, Float64),
-    final_bid_order_count SimpleAggregateFunction(argMax, UInt32),
-    final_ask_price SimpleAggregateFunction(argMax, Float64),
-    final_ask_size SimpleAggregateFunction(argMax, Float64),
-    final_ask_order_count SimpleAggregateFunction(argMax, UInt32),
-    tick_count SimpleAggregateFunction(sum, UInt32)
-)
-ENGINE = AggregatingMergeTree()
-PARTITION BY toDate(bucket_time)
-ORDER BY (venue_instance_id, instrument_id, bucket_time)
-SETTINGS index_granularity = 8192;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.tick_candle_5m_mv
-TO {database}.tick_candle_5m
+CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.{table}_candle_5m_mv
+TO {database}.{table}_candle_5m
 AS SELECT
     venue_instance_id,
     instrument_id,
     toStartOfFiveMinutes(bucket_time) AS bucket_time,
-    argMinState(argMinMerge(open_mid), bucket_time) AS open_mid,
-    maxState(maxMerge(high_mid)) AS high_mid,
-    minState(minMerge(low_mid)) AS low_mid,
-    argMaxState(argMaxMerge(close_mid), bucket_time) AS close_mid,
-    argMaxState(argMaxMerge(final_bid_price), bucket_time) AS final_bid_price,
-    argMaxState(argMaxMerge(final_bid_size), bucket_time) AS final_bid_size,
-    argMaxState(argMaxMerge(final_bid_order_count), bucket_time) AS final_bid_order_count,
-    argMaxState(argMaxMerge(final_ask_price), bucket_time) AS final_ask_price,
-    argMaxState(argMaxMerge(final_ask_size), bucket_time) AS final_ask_size,
-    argMaxState(argMaxMerge(final_ask_order_count), bucket_time) AS final_ask_order_count,
-    sumState(sumMerge(tick_count)) AS tick_count
-FROM {database}.tick_candle_1m
-GROUP BY venue_instance_id, instrument_id, bucket_time;
+    argMinMergeState(open_mid) AS open_mid,
+    maxMergeState(high_mid) AS high_mid,
+    minMergeState(low_mid) AS low_mid,
+    argMaxMergeState(close_mid) AS close_mid,
+    argMaxMergeState(final_book) AS final_book,
+    sumMergeState(tick_count) AS tick_count
+FROM {database}.{table}_candle_1m
+GROUP BY venue_instance_id, instrument_id, toStartOfFiveMinutes(bucket_time);
 
--- ── Layer 4: 15-minute candles (source: tick_candle_5m) ───────────────────
-
-CREATE TABLE IF NOT EXISTS {database}.tick_candle_15m
-(
-    venue_instance_id LowCardinality(String),
-    instrument_id String,
-    bucket_time DateTime64(3, 'UTC'),
-    open_mid SimpleAggregateFunction(argMin, Float64),
-    high_mid SimpleAggregateFunction(max, Float64),
-    low_mid SimpleAggregateFunction(min, Float64),
-    close_mid SimpleAggregateFunction(argMax, Float64),
-    final_bid_price SimpleAggregateFunction(argMax, Float64),
-    final_bid_size SimpleAggregateFunction(argMax, Float64),
-    final_bid_order_count SimpleAggregateFunction(argMax, UInt32),
-    final_ask_price SimpleAggregateFunction(argMax, Float64),
-    final_ask_size SimpleAggregateFunction(argMax, Float64),
-    final_ask_order_count SimpleAggregateFunction(argMax, UInt32),
-    tick_count SimpleAggregateFunction(sum, UInt32)
-)
-ENGINE = AggregatingMergeTree()
-PARTITION BY toDate(bucket_time)
-ORDER BY (venue_instance_id, instrument_id, bucket_time)
-SETTINGS index_granularity = 8192;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.tick_candle_15m_mv
-TO {database}.tick_candle_15m
+CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.{table}_candle_15m_mv
+TO {database}.{table}_candle_15m
 AS SELECT
     venue_instance_id,
     instrument_id,
     toStartOfFifteenMinutes(bucket_time) AS bucket_time,
-    argMinState(argMinMerge(open_mid), bucket_time) AS open_mid,
-    maxState(maxMerge(high_mid)) AS high_mid,
-    minState(minMerge(low_mid)) AS low_mid,
-    argMaxState(argMaxMerge(close_mid), bucket_time) AS close_mid,
-    argMaxState(argMaxMerge(final_bid_price), bucket_time) AS final_bid_price,
-    argMaxState(argMaxMerge(final_bid_size), bucket_time) AS final_bid_size,
-    argMaxState(argMaxMerge(final_bid_order_count), bucket_time) AS final_bid_order_count,
-    argMaxState(argMaxMerge(final_ask_price), bucket_time) AS final_ask_price,
-    argMaxState(argMaxMerge(final_ask_size), bucket_time) AS final_ask_size,
-    argMaxState(argMaxMerge(final_ask_order_count), bucket_time) AS final_ask_order_count,
-    sumState(sumMerge(tick_count)) AS tick_count
-FROM {database}.tick_candle_5m
-GROUP BY venue_instance_id, instrument_id, bucket_time;
+    argMinMergeState(open_mid) AS open_mid,
+    maxMergeState(high_mid) AS high_mid,
+    minMergeState(low_mid) AS low_mid,
+    argMaxMergeState(close_mid) AS close_mid,
+    argMaxMergeState(final_book) AS final_book,
+    sumMergeState(tick_count) AS tick_count
+FROM {database}.{table}_candle_5m
+GROUP BY venue_instance_id, instrument_id, toStartOfFifteenMinutes(bucket_time);
 
--- ── Layer 5: 1-hour candles (source: tick_candle_15m) ─────────────────────
-
-CREATE TABLE IF NOT EXISTS {database}.tick_candle_1h
-(
-    venue_instance_id LowCardinality(String),
-    instrument_id String,
-    bucket_time DateTime64(3, 'UTC'),
-    open_mid SimpleAggregateFunction(argMin, Float64),
-    high_mid SimpleAggregateFunction(max, Float64),
-    low_mid SimpleAggregateFunction(min, Float64),
-    close_mid SimpleAggregateFunction(argMax, Float64),
-    final_bid_price SimpleAggregateFunction(argMax, Float64),
-    final_bid_size SimpleAggregateFunction(argMax, Float64),
-    final_bid_order_count SimpleAggregateFunction(argMax, UInt32),
-    final_ask_price SimpleAggregateFunction(argMax, Float64),
-    final_ask_size SimpleAggregateFunction(argMax, Float64),
-    final_ask_order_count SimpleAggregateFunction(argMax, UInt32),
-    tick_count SimpleAggregateFunction(sum, UInt32)
-)
-ENGINE = AggregatingMergeTree()
-PARTITION BY toDate(bucket_time)
-ORDER BY (venue_instance_id, instrument_id, bucket_time)
-SETTINGS index_granularity = 8192;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.tick_candle_1h_mv
-TO {database}.tick_candle_1h
+CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.{table}_candle_1h_mv
+TO {database}.{table}_candle_1h
 AS SELECT
     venue_instance_id,
     instrument_id,
     toStartOfHour(bucket_time) AS bucket_time,
-    argMinState(argMinMerge(open_mid), bucket_time) AS open_mid,
-    maxState(maxMerge(high_mid)) AS high_mid,
-    minState(minMerge(low_mid)) AS low_mid,
-    argMaxState(argMaxMerge(close_mid), bucket_time) AS close_mid,
-    argMaxState(argMaxMerge(final_bid_price), bucket_time) AS final_bid_price,
-    argMaxState(argMaxMerge(final_bid_size), bucket_time) AS final_bid_size,
-    argMaxState(argMaxMerge(final_bid_order_count), bucket_time) AS final_bid_order_count,
-    argMaxState(argMaxMerge(final_ask_price), bucket_time) AS final_ask_price,
-    argMaxState(argMaxMerge(final_ask_size), bucket_time) AS final_ask_size,
-    argMaxState(argMaxMerge(final_ask_order_count), bucket_time) AS final_ask_order_count,
-    sumState(sumMerge(tick_count)) AS tick_count
-FROM {database}.tick_candle_15m
+    argMinMergeState(open_mid) AS open_mid,
+    maxMergeState(high_mid) AS high_mid,
+    minMergeState(low_mid) AS low_mid,
+    argMaxMergeState(close_mid) AS close_mid,
+    argMaxMergeState(final_book) AS final_book,
+    sumMergeState(tick_count) AS tick_count
+FROM {database}.{table}_candle_15m
+GROUP BY venue_instance_id, instrument_id, toStartOfHour(bucket_time);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.{table}_candle_1s_mv
+TO {database}.{table}_candle_1s
+AS SELECT
+    venue_instance_id,
+    instrument_id,
+    toStartOfSecond(recv_time) AS bucket_time,
+    argMinState((bid_price + ask_price) / 2, recv_ts_ns) AS open_mid,
+    maxState((bid_price + ask_price) / 2) AS high_mid,
+    minState((bid_price + ask_price) / 2) AS low_mid,
+    argMaxState((bid_price + ask_price) / 2, recv_ts_ns) AS close_mid,
+    argMaxState(
+        tuple(
+            bid_price,
+            ask_price,
+            bid_size,
+            ask_size,
+            bid_order_count,
+            ask_order_count,
+            (bid_price + ask_price) / 2,
+            recv_ts_ns
+        ),
+        recv_ts_ns
+    ) AS final_book,
+    sumState(toUInt64(1)) AS tick_count
+FROM {database}.{table}
+WHERE recv_ts_ns > {cutover_recv_ts_ns}
+  AND bid_price IS NOT NULL
+  AND ask_price IS NOT NULL
+  AND bid_price > 0
+  AND ask_price > 0
+  AND bid_price <= ask_price
+  AND (bid_size IS NULL OR bid_size > 0)
+  AND (ask_size IS NULL OR ask_size > 0)
+  AND quality_gap = false
+  AND quality_stale = false
+  AND quality_inconsistent = false
+  AND venue_instance_id != ''
+  AND instrument_id != ''
 GROUP BY venue_instance_id, instrument_id, bucket_time;
+
+CREATE TABLE IF NOT EXISTS {database}.{table}_latest_valid
+(
+    venue_instance_id LowCardinality(String),
+    instrument_id String,
+    latest_recv_time AggregateFunction(max, DateTime64(9, 'UTC')),
+    valid_tick_count AggregateFunction(sum, UInt64)
+)
+ENGINE = AggregatingMergeTree
+ORDER BY (venue_instance_id, instrument_id);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.{table}_latest_valid_mv
+TO {database}.{table}_latest_valid
+AS SELECT
+    venue_instance_id,
+    instrument_id,
+    maxState(recv_time) AS latest_recv_time,
+    sumState(toUInt64(1)) AS valid_tick_count
+FROM {database}.{table}
+WHERE recv_ts_ns > {cutover_recv_ts_ns}
+  AND bid_price IS NOT NULL
+  AND ask_price IS NOT NULL
+  AND bid_price > 0
+  AND ask_price > 0
+  AND bid_price <= ask_price
+  AND (bid_size IS NULL OR bid_size > 0)
+  AND (ask_size IS NULL OR ask_size > 0)
+  AND quality_gap = false
+  AND quality_stale = false
+  AND quality_inconsistent = false
+  AND venue_instance_id != ''
+  AND instrument_id != ''
+GROUP BY venue_instance_id, instrument_id;
+
+CREATE TABLE IF NOT EXISTS {database}.{table}_candle_status
+(
+    schema_version UInt16,
+    ready Bool,
+    coverage_from DateTime64(3, 'UTC'),
+    coverage_to DateTime64(3, 'UTC'),
+    cutover_recv_ts_ns Int64,
+    message String,
+    updated_at DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY schema_version;
+
+INSERT INTO {database}.{table}_candle_status
+VALUES
+(
+    2,
+    false,
+    fromUnixTimestamp64Milli(0),
+    fromUnixTimestamp64Milli(0),
+    {cutover_recv_ts_ns},
+    'schema-created-backfill-required',
+    now64(3)
+);

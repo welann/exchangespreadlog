@@ -11,6 +11,8 @@ type ClickHouseConfig = {
   username: string;
   password: string;
   acceptInvalidCerts: boolean;
+  candleMode: 'off' | 'auto' | 'force';
+  maxStaleMs: number;
   redirectedLegacyUrl: boolean;
   source: string;
 };
@@ -24,6 +26,8 @@ type FileClickHouseConfig = {
   password?: string;
   passwordEnv?: string;
   acceptInvalidCerts?: boolean;
+  candleMode?: string;
+  maxStaleMs?: number;
   source: string;
 };
 
@@ -39,7 +43,9 @@ let insecureDispatcher: Dispatcher | null = null;
 export class ClickHouseError extends Error {
   constructor(
     message: string,
-    readonly status = 500
+    readonly status = 500,
+    readonly expose = false,
+    readonly code = 'CLICKHOUSE_ERROR'
   ) {
     super(message);
     this.name = 'ClickHouseError';
@@ -91,6 +97,14 @@ export function clickHouseConfig(): ClickHouseConfig {
       ) ??
       fileConfig?.acceptInvalidCerts ??
       url === DEFAULT_CLICKHOUSE_URL,
+    candleMode: parseCandleMode(
+      envValue('CLICKHOUSE_CANDLE_MODE') ?? fileConfig?.candleMode ?? 'auto'
+    ),
+    maxStaleMs: parsePositiveInteger(
+      'CLICKHOUSE_MAX_STALE_MS',
+      envValue('CLICKHOUSE_MAX_STALE_MS'),
+      fileConfig?.maxStaleMs ?? 120_000
+    ),
     redirectedLegacyUrl: requestedUrl === RETIRED_CLICKHOUSE_URL,
     source: fileConfig?.source ?? 'environment/defaults'
   };
@@ -120,6 +134,8 @@ export function clickHouseConfigSummary() {
     username: config.username || null,
     hasPassword: Boolean(config.password),
     acceptInvalidCerts: config.acceptInvalidCerts,
+    candleMode: config.candleMode,
+    maxStaleMs: config.maxStaleMs,
     redirectedLegacyUrl: config.redirectedLegacyUrl,
     source: config.source
   };
@@ -131,6 +147,11 @@ export function tickTable(): string {
 
 export function catalogTable(): string {
   return quoteIdentifier(clickHouseConfig().catalogTable);
+}
+
+export function configuredTable(suffix = ''): string {
+  const config = clickHouseConfig();
+  return `${quoteIdentifier(config.database)}.${quoteIdentifier(`${config.table}${suffix}`)}`;
 }
 
 export async function queryClickHouse<T>(
@@ -261,6 +282,11 @@ function parseStorageClickHouse(raw: string): Omit<FileClickHouseConfig, 'source
       if (value !== null) parsed.acceptInvalidCerts = value;
       continue;
     }
+    if (key === 'max_stale_ms') {
+      const value = Number(rawValue.trim());
+      if (Number.isInteger(value) && value > 0) parsed.maxStaleMs = value;
+      continue;
+    }
 
     const value = parseTomlString(rawValue.trim());
     if (typeof value !== 'string') continue;
@@ -272,6 +298,7 @@ function parseStorageClickHouse(raw: string): Omit<FileClickHouseConfig, 'source
     if (key === 'username') parsed.username = value;
     if (key === 'password') parsed.password = value;
     if (key === 'password_env') parsed.passwordEnv = value;
+    if (key === 'candle_mode') parsed.candleMode = value;
   }
 
   return parsed;
@@ -324,6 +351,25 @@ function parseBooleanSetting(label: string, value: string | undefined): boolean 
   if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
   if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
   throw new ClickHouseError(`${label} must be true or false`, 500);
+}
+
+function parseCandleMode(value: string): 'off' | 'auto' | 'force' {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'off' || normalized === 'auto' || normalized === 'force') {
+    return normalized;
+  }
+  throw new ClickHouseError('CLICKHOUSE_CANDLE_MODE must be off, auto, or force');
+}
+
+function parsePositiveInteger(
+  label: string,
+  value: string | undefined,
+  fallback: number
+): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const parsed = Number(value);
+  if (Number.isInteger(parsed) && parsed > 0) return parsed;
+  throw new ClickHouseError(`${label} must be a positive integer`);
 }
 
 function envValue(name: string): string | undefined {

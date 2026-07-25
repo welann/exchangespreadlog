@@ -1,6 +1,13 @@
 import type { Instrument, Market } from '$lib/types';
 import { validBookWhere } from './book-filter';
-import { catalogTable, queryClickHouse, quoteString, tickTable } from './clickhouse';
+import { getCandleCapability } from './candle-capability';
+import {
+  catalogTable,
+  configuredTable,
+  queryClickHouse,
+  quoteString,
+  tickTable
+} from './clickhouse';
 import { assertSupportedTickSchema, getTickSchema } from './tick-schema';
 
 type RawInstrument = {
@@ -70,13 +77,13 @@ async function queryInstruments(
   if (catalogIds?.length === 0) return [];
 
   const joinSql = includeTickStats
-    ? await getTickSchema().then((tickSchema) => {
+    ? await getTickSchema().then(async (tickSchema) => {
         assertSupportedTickSchema(tickSchema);
         return buildTickStatsJoin(tickSchema);
       })
     : '';
   const latestRecvMsSql = joinSql
-    ? 'toUnixTimestamp64Milli(tick_stats.latest_recv_time)'
+    ? "if(tick_stats.latest_recv_time <= toDateTime64(0, 9, 'UTC'), NULL, toUnixTimestamp64Milli(tick_stats.latest_recv_time))"
     : 'NULL';
   const catalogFilter =
     catalogIds && catalogIds.length > 0
@@ -114,7 +121,7 @@ export function groupMarkets(instruments: Instrument[]): Market[] {
   const markets = new Map<string, Instrument[]>();
   const uniqueInstruments = new Map<string, Instrument>();
   for (const instrument of instruments) {
-    if (instrument.latestRecvMs === null) continue;
+    if (instrument.latestRecvMs === null || instrument.latestRecvMs <= 0) continue;
     const key = `${instrument.venueInstanceId}\u0000${instrument.instrumentId}`;
     const current = uniqueInstruments.get(key);
     if (
@@ -200,29 +207,47 @@ function toInstrument(row: RawInstrument): Instrument {
 function nullableNumber(value: unknown): number | null {
   if (value === null || value === undefined) return null;
   const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
-function buildTickStatsJoin(schema: Awaited<ReturnType<typeof getTickSchema>>): string {
+async function buildTickStatsJoin(
+  schema: Awaited<ReturnType<typeof getTickSchema>>
+): Promise<string> {
+  const capability = await getCandleCapability();
+  if (schema.hasStorageIdentity && capability.ready) {
+    return `
+LEFT JOIN (
+  SELECT
+    venue_instance_id,
+    instrument_id,
+    maxMerge(latest_recv_time) AS latest_recv_time
+  FROM ${configuredTable('_latest_valid')}
+  GROUP BY venue_instance_id, instrument_id
+) AS tick_stats
+ON latest.venue_instance_id = tick_stats.venue_instance_id
+  AND latest.instrument_id = tick_stats.instrument_id`;
+  }
+
   const validBooks = validBookWhere(schema, 'ticks');
 
-  // Build SELECT columns based on which identity columns actually exist
-  const selectCols = ['venue_instance_id', 'instrument_id'];
-  if (schema.hasCatalogId) {
-    selectCols.push('argMax(catalog_id, recv_time) AS catalog_id');
-  }
-  if (schema.hasLegacyVenueMarket) {
-    selectCols.push('argMax(venue, recv_time) AS legacy_venue');
-    selectCols.push('argMax(market_id, recv_time) AS legacy_market_id');
-  }
-
-  // Build JOIN ON clause based on identity type
+  let selectCols: string[];
+  let identityWhere: string;
+  let groupBy: string;
   let joinOnClause: string;
   if (schema.hasStorageIdentity) {
+    selectCols = ['venue_instance_id', 'instrument_id'];
+    identityWhere = "ticks.venue_instance_id != '' AND ticks.instrument_id != ''";
+    groupBy = 'venue_instance_id, instrument_id';
     joinOnClause = `ON latest.venue_instance_id = tick_stats.venue_instance_id AND latest.instrument_id = tick_stats.instrument_id`;
   } else if (schema.hasCatalogId) {
+    selectCols = ['catalog_id'];
+    identityWhere = "ticks.catalog_id != ''";
+    groupBy = 'catalog_id';
     joinOnClause = `ON latest.catalog_id = tick_stats.catalog_id`;
   } else if (schema.hasLegacyVenueMarket) {
+    selectCols = ['venue AS legacy_venue', 'market_id AS legacy_market_id'];
+    identityWhere = "ticks.venue != '' AND ticks.market_id != ''";
+    groupBy = 'venue, market_id';
     joinOnClause = `ON latest.venue_instance_id = tick_stats.legacy_venue AND latest.instrument_id = tick_stats.legacy_market_id`;
   } else {
     return '';
@@ -234,10 +259,10 @@ LEFT JOIN (
     ${selectCols.join(',\n    ')},
     max(recv_time) AS latest_recv_time
   FROM ${tickTable()} AS ticks
-  WHERE venue_instance_id != '' AND instrument_id != ''
+  WHERE ${identityWhere}
     AND ${validBooks}
     AND ticks.recv_time >= now() - INTERVAL ${TICK_STATS_WINDOW_DAYS} DAY
-  GROUP BY venue_instance_id, instrument_id
+  GROUP BY ${groupBy}
 ) AS tick_stats
 ${joinOnClause}`;
 }

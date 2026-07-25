@@ -1,11 +1,11 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
 import {
-  ClickHouseError,
   catalogTable,
   clickHouseConfigSummary,
   queryClickHouse,
   tickTable
 } from '$lib/server/clickhouse';
+import { getCandleCapability } from '$lib/server/candle-capability';
 import { getTickSchema, usableTickWhere } from '$lib/server/tick-schema';
 
 type HealthRow = {
@@ -20,7 +20,8 @@ export const GET: RequestHandler = async () => {
   try {
     const clickhouse = clickHouseConfigSummary();
     const tickSchema = await getTickSchema();
-    const [row] = await queryClickHouse<HealthRow>(`
+    const [row, candles] = await Promise.all([
+      queryClickHouse<HealthRow>(`
 SELECT
   (SELECT count() FROM ${tickTable()}) AS tickRows,
   (SELECT count() FROM ${catalogTable()}) AS catalogRows,
@@ -28,13 +29,16 @@ SELECT
   (SELECT count() FROM ${tickTable()} AS usable_ticks WHERE ${usableTickWhere(tickSchema, 'usable_ticks')}) AS usableTickRows,
   (SELECT if(isNull(max(usable_ticks.recv_time)), NULL, toUnixTimestamp64Milli(max(usable_ticks.recv_time))) FROM ${tickTable()} AS usable_ticks WHERE ${usableTickWhere(tickSchema, 'usable_ticks')}) AS latestUsableRecvMs
 FORMAT JSONEachRow
-`);
+`).then((rows) => rows[0]),
+      getCandleCapability()
+    ]);
 
     return json({
       ok: true,
-      apiVersion: 'clickhouse-schema-aware-v2',
+      apiVersion: 'clickhouse-schema-aware-v3',
       clickhouse,
       tickSchema,
+      candles,
       stats: {
         tickRows: Number(row?.tickRows ?? 0),
         catalogRows: Number(row?.catalogRows ?? 0),
@@ -59,13 +63,23 @@ function nullableNumber(value: unknown): number | null {
 }
 
 function apiError(error: unknown): Response {
-  const status = error instanceof ClickHouseError ? error.status : 500;
-  const message = error instanceof Error ? error.message : 'Unknown server error';
+  const requestId = crypto.randomUUID();
+  console.error(`[api/health:${requestId}]`, error);
   let clickhouse = null;
   try {
     clickhouse = clickHouseConfigSummary();
   } catch {
     // Keep the original error as the useful failure.
   }
-  return json({ ok: false, apiVersion: 'clickhouse-schema-aware-v2', error: message, clickhouse }, { status });
+  return json(
+    {
+      ok: false,
+      apiVersion: 'clickhouse-schema-aware-v3',
+      error: 'The market data health check is unavailable.',
+      code: 'UPSTREAM_UNAVAILABLE',
+      requestId,
+      clickhouse
+    },
+    { status: 502, headers: { 'cache-control': 'no-store', 'x-request-id': requestId } }
+  );
 }

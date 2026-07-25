@@ -32,10 +32,12 @@ Supported environment variables:
 - `CLICKHOUSE_USERNAME` or `CLICKHOUSE_USER`
 - `CLICKHOUSE_PASSWORD` or `CLICKHOUSE_PASS`
 - `CLICKHOUSE_ACCEPT_INVALID_CERTS` (only for explicitly trusted self-signed endpoints)
+- `CLICKHOUSE_CANDLE_MODE` (`off`, `auto`, or `force`; defaults to `auto`)
+- `CLICKHOUSE_MAX_STALE_MS` (defaults to `120000`)
 
 The retired `https://obdata.zeabur.app/` endpoint is automatically redirected to `https://manyexchanges.zeabur.app/`. Update the deployed `CLICKHOUSE_PASSWORD` secret to the new service password as part of the same migration.
 
-Quote conversion rates are configured in the web page under **Quote conversion**. They are stored in browser localStorage and sent with each spread query, so changing rates does not require restarting the server.
+Quote conversion rates are configured in the web page under **Quote conversion** and sent with each spread query, so changing rates does not require restarting the server. They remain in session memory only; localStorage is reserved for the small, versioned market-directory cache.
 
 The chart toolbar accepts any sampling **Interval** from 1 to 3600 seconds; leaving it blank uses automatic interval selection for the chosen range. The value is included in the page URL and in the server query/cache key. Market discovery uses the same valid-book predicates as spread queries, so instruments with only incomplete, crossed, stale, gap, or inconsistent ticks are not offered as comparable legs.
 
@@ -43,9 +45,10 @@ For deployment diagnostics, open `/api/health`. It returns the effective ClickHo
 
 The current schema-aware frontend should report:
 
-- `apiVersion: "clickhouse-schema-aware-v2"`
+- `apiVersion: "clickhouse-schema-aware-v3"`
 - `tickSchema.mode`: `catalog_id`, `legacy_venue_market`, or `hybrid`
 - `stats.usableTickRows`: rows that can be mapped to an instrument and used by spread charts
+- `candles.ready`: whether schema v2 and its validated coverage can serve candle queries
 
 If `/api/health` does not include `apiVersion` and `tickSchema`, the deployed frontend is still an older build.
 
@@ -61,6 +64,7 @@ docker run --rm -p 3000:3000 \
   -e CLICKHOUSE_USERNAME=zeabur \
   -e CLICKHOUSE_PASSWORD=your-clickhouse-password \
   -e CLICKHOUSE_ACCEPT_INVALID_CERTS=true \
+  -e CLICKHOUSE_CANDLE_MODE=auto \
   exchangespreadlog-frontend
 ```
 
@@ -80,3 +84,25 @@ If you keep values in an env file, pass it explicitly:
 ```bash
 docker run --rm -p 3000:3000 --env-file ./frontend/.env exchangespreadlog-frontend
 ```
+
+## Candle schema rollout
+
+The API remains usable before the aggregate tables exist: `auto` mode falls
+back to bounded bucket queries. Render the templates without embedding
+credentials:
+
+```bash
+python3 scripts/render_candle_migration.py \
+  scripts/migrations/001_tick_candles.sql \
+  --database zeabur \
+  --table bbo_ticks \
+  --cutover-recv-ts-ns <captured-max-recv-ts-ns>
+```
+
+For an online rollout, choose `cutover-recv-ts-ns` several minutes in the
+future, apply all of `001` before that watermark, and wait for the watermark to
+pass. Then backfill non-overlapping daily ranges with `002`, validate raw/candle
+parity, and apply `003` to publish the validated coverage. If a future
+watermark cannot be guaranteed, briefly pause raw-table writes while capturing
+the watermark and installing the views. Keep `CLICKHOUSE_CANDLE_MODE=off` as
+the rollback switch. The templates never contain a ClickHouse password.

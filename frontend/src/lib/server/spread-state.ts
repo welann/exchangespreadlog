@@ -14,7 +14,10 @@ export type RawTickRow = {
 };
 
 export type ComputedSpreadPoint = {
+  id: string;
   tsMs: number;
+  aStateTsMs: number;
+  bStateTsMs: number;
   aBid: number;
   aAsk: number;
   aBidSize: number | null;
@@ -72,7 +75,8 @@ export function buildEventSpreadPoints(
   seedRows: RawTickRow[],
   tickRows: RawTickRow[],
   aRate: number,
-  bRate: number
+  bRate: number,
+  maxStaleMs = 120_000
 ): ComputedSpreadPoint[] {
   const events = normalizeTickEvents(tickRows);
   const state = initialBookState(seedRows);
@@ -81,11 +85,13 @@ export function buildEventSpreadPoints(
   for (const event of events) {
     applyTickEvent(state, event);
     const point = pointFromCurrentState(
+      `raw:${event.side}:${event.tsNs}`,
       event.snapshot.tsMs,
       state.latestA,
       state.latestB,
       aRate,
-      bRate
+      bRate,
+      maxStaleMs
     );
     if (point) points.push(point);
   }
@@ -105,7 +111,8 @@ export function buildBucketSnapshotSpreadPoints(
   toMs: number,
   bucketSeconds: number,
   aRate: number,
-  bRate: number
+  bRate: number,
+  maxStaleMs = 120_000
 ): ComputedSpreadPoint[] {
   const bucketMs = Math.max(1, Math.trunc(bucketSeconds)) * 1000;
   const events = normalizeTickEvents(tickRows);
@@ -125,11 +132,13 @@ export function buildBucketSnapshotSpreadPoints(
     }
 
     const bucketPoint = pointFromCurrentState(
+      `bucket:${bucketMs}:${bucketEnd}`,
       bucketEnd,
       state.latestA,
       state.latestB,
       aRate,
-      bRate
+      bRate,
+      maxStaleMs
     );
     if (bucketPoint) points.push(bucketPoint);
   }
@@ -176,21 +185,25 @@ function applyTickEvent(state: BookState, event: TickEvent) {
 }
 
 function pointFromCurrentState(
+  id: string,
   tsMs: number,
   latestA: TickSnapshot | null,
   latestB: TickSnapshot | null,
   aRate: number,
-  bRate: number
+  bRate: number,
+  maxStaleMs: number
 ): ComputedSpreadPoint | null {
   if (
     !latestA ||
     !latestB ||
     tsMs < latestA.tsMs ||
-    tsMs < latestB.tsMs
+    tsMs < latestB.tsMs ||
+    tsMs - latestA.tsMs > maxStaleMs ||
+    tsMs - latestB.tsMs > maxStaleMs
   ) {
     return null;
   }
-  return pointFromSnapshots(tsMs, latestA, latestB, aRate, bRate);
+  return pointFromSnapshots(id, tsMs, latestA, latestB, aRate, bRate);
 }
 
 function normalizeTick(row: RawTickRow | null): TickSnapshot | null {
@@ -215,6 +228,7 @@ function normalizeTick(row: RawTickRow | null): TickSnapshot | null {
 }
 
 function pointFromSnapshots(
+  id: string,
   tsMs: number,
   a: TickSnapshot,
   b: TickSnapshot,
@@ -231,7 +245,10 @@ function pointFromSnapshots(
   const bToA = bBid - aAsk;
 
   return {
+    id,
     tsMs,
+    aStateTsMs: a.tsMs,
+    bStateTsMs: b.tsMs,
     aBid,
     aAsk,
     aBidSize: a.bidSize,

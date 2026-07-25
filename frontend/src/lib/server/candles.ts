@@ -1,7 +1,13 @@
 import type { Instrument, SpreadPoint } from '$lib/types';
-import { clickHouseConfig, numericLiteral, queryClickHouse, tickTable } from './clickhouse';
+import {
+  convertCandleRowsToSpreadPoints,
+  type RawCandleRow
+} from '$lib/spread/candle-conversion';
+import { configuredTable, numericLiteral, queryClickHouse } from './clickhouse';
 import { tickIdentityWhere, type TickSchema } from './tick-schema';
-import { validBookWhere } from './book-filter';
+
+export { convertCandleRowsToSpreadPoints };
+export type { RawCandleRow };
 
 // ── Granularity types ──────────────────────────────────────────────────────
 
@@ -11,26 +17,6 @@ export interface CandleGranularityConfig {
   granularity: CandleGranularity;
   tableName: string;
   bucketMs: number;
-}
-
-// ── Raw candle row from ClickHouse ─────────────────────────────────────────
-
-/** Shape of a single row returned by a candle table query.
- *  Note: values are already merged by the -Merge suffix applied via FINAL or
- *  explicit merge functions. The query uses FINAL for simplicity. */
-export interface RawCandleRow {
-  bucket_time: string;
-  side: string;
-  open_mid: number | null;
-  high_mid: number | null;
-  low_mid: number | null;
-  close_mid: number | null;
-  final_bid_price: number | null;
-  final_bid_size: number | null;
-  final_bid_order_count: number | null;
-  final_ask_price: number | null;
-  final_ask_size: number | null;
-  final_ask_order_count: number | null;
 }
 
 // ── Candle query result ───────────────────────────────────────────────────
@@ -70,21 +56,35 @@ export function selectGranularity(rangeMs: number): CandleGranularityConfig {
       if (entry.granularity === 'raw') {
         return { granularity: 'raw', tableName: '', bucketMs: 0 };
       }
-      const config = clickHouseConfig();
       return {
         granularity: entry.granularity,
-        tableName: `${config.database}.${config.table}${entry.tableSuffix}`,
+        tableName: configuredTable(entry.tableSuffix),
         bucketMs: entry.bucketMs,
       };
     }
   }
 
   // Fallback
-  const config = clickHouseConfig();
   return {
     granularity: '1h',
-    tableName: `${config.database}.${config.table}_candle_1h`,
+    tableName: configuredTable('_candle_1h'),
     bucketMs: 3600_000,
+  };
+}
+
+export function candleGranularityForBucketSeconds(
+  bucketSeconds: number
+): CandleGranularityConfig | null {
+  const entry = GRANULARITY_TABLE.find(
+    (candidate) =>
+      candidate.granularity !== 'raw' &&
+      candidate.bucketMs === Math.trunc(bucketSeconds) * 1000
+  );
+  if (!entry) return null;
+  return {
+    granularity: entry.granularity,
+    tableName: configuredTable(entry.tableSuffix),
+    bucketMs: entry.bucketMs
   };
 }
 
@@ -106,24 +106,31 @@ export async function fetchCandleRows(
     throw new Error('Candle table name is required for non-raw granularity');
   }
 
+  const alignedFromMs = Math.ceil(fromMs / candleConfig.bucketMs) * candleConfig.bucketMs;
+  const alignedToMs = Math.floor(toMs / candleConfig.bucketMs) * candleConfig.bucketMs;
+  if (alignedFromMs >= alignedToMs) return [];
+
   return queryClickHouse<RawCandleRow>(`
     SELECT
       bucket_time,
       multiIf(${whereA}, 'a', ${whereB}, 'b', '') AS side,
-      open_mid,
-      high_mid,
-      low_mid,
-      close_mid,
-      final_bid_price,
-      final_bid_size,
-      final_bid_order_count,
-      final_ask_price,
-      final_ask_size,
-      final_ask_order_count
-    FROM ${tableName} AS c FINAL
+      argMinMerge(open_mid) AS open_mid,
+      maxMerge(high_mid) AS high_mid,
+      minMerge(low_mid) AS low_mid,
+      argMaxMerge(close_mid) AS close_mid,
+      tupleElement(argMaxMerge(final_book), 1) AS final_bid_price,
+      tupleElement(argMaxMerge(final_book), 3) AS final_bid_size,
+      tupleElement(argMaxMerge(final_book), 5) AS final_bid_order_count,
+      tupleElement(argMaxMerge(final_book), 2) AS final_ask_price,
+      tupleElement(argMaxMerge(final_book), 4) AS final_ask_size,
+      tupleElement(argMaxMerge(final_book), 6) AS final_ask_order_count,
+      tupleElement(argMaxMerge(final_book), 7) AS final_mid,
+      tupleElement(argMaxMerge(final_book), 8) AS final_recv_ts_ns
+    FROM ${tableName} AS c
     WHERE (${whereA} OR ${whereB})
-      AND bucket_time >= fromUnixTimestamp64Milli(${numericLiteral(fromMs)})
-      AND bucket_time < fromUnixTimestamp64Milli(${numericLiteral(toMs)})
+      AND bucket_time >= fromUnixTimestamp64Milli(${numericLiteral(alignedFromMs)})
+      AND bucket_time < fromUnixTimestamp64Milli(${numericLiteral(alignedToMs)})
+    GROUP BY bucket_time, venue_instance_id, instrument_id
     ORDER BY bucket_time ASC, side ASC
     FORMAT JSONEachRow
   `);
@@ -140,138 +147,30 @@ export async function fetchCandleSeedRows(
 ): Promise<RawCandleRow[]> {
   const whereA = tickIdentityWhere(tickSchema, instrumentA, 'c');
   const whereB = tickIdentityWhere(tickSchema, instrumentB, 'c');
+  const seedBeforeMs = Math.ceil(fromMs / candleConfig.bucketMs) * candleConfig.bucketMs;
 
   return queryClickHouse<RawCandleRow>(`
     SELECT
       bucket_time,
       multiIf(${whereA}, 'a', ${whereB}, 'b', '') AS side,
-      open_mid,
-      high_mid,
-      low_mid,
-      close_mid,
-      final_bid_price,
-      final_bid_size,
-      final_bid_order_count,
-      final_ask_price,
-      final_ask_size,
-      final_ask_order_count
-    FROM ${candleConfig.tableName} AS c FINAL
+      argMinMerge(open_mid) AS open_mid,
+      maxMerge(high_mid) AS high_mid,
+      minMerge(low_mid) AS low_mid,
+      argMaxMerge(close_mid) AS close_mid,
+      tupleElement(argMaxMerge(final_book), 1) AS final_bid_price,
+      tupleElement(argMaxMerge(final_book), 3) AS final_bid_size,
+      tupleElement(argMaxMerge(final_book), 5) AS final_bid_order_count,
+      tupleElement(argMaxMerge(final_book), 2) AS final_ask_price,
+      tupleElement(argMaxMerge(final_book), 4) AS final_ask_size,
+      tupleElement(argMaxMerge(final_book), 6) AS final_ask_order_count,
+      tupleElement(argMaxMerge(final_book), 7) AS final_mid,
+      tupleElement(argMaxMerge(final_book), 8) AS final_recv_ts_ns
+    FROM ${candleConfig.tableName} AS c
     WHERE (${whereA} OR ${whereB})
-      AND bucket_time < fromUnixTimestamp64Milli(${numericLiteral(fromMs)})
+      AND bucket_time < fromUnixTimestamp64Milli(${numericLiteral(seedBeforeMs)})
+    GROUP BY bucket_time, venue_instance_id, instrument_id
     ORDER BY bucket_time DESC
     LIMIT 1 BY venue_instance_id, instrument_id
     FORMAT JSONEachRow
   `);
-}
-
-// ── Candle rows → SpreadPoints ────────────────────────────────────────────
-
-/**
- * Convert candle rows into SpreadPoint[] by pairing 'a' and 'b' records
- * within the same bucket, then carry-forward across empty buckets.
- *
- * Rows with bucket_time < fromMs are treated as seed state (carry-forward
- * baseline). Rows within [fromMs, toMs) produce spread points.
- */
-export function convertCandleRowsToSpreadPoints(
-  candleRows: RawCandleRow[],
-  fromMs: number,
-  toMs: number,
-  bucketMs: number,
-  _instrumentA: Instrument,
-  _instrumentB: Instrument,
-  aRate: number,
-  bRate: number,
-): SpreadPoint[] {
-  // Sort all rows by bucket_time ASC, side ASC
-  const sorted = [...candleRows].sort((left, right) => {
-    const tsL = new Date(left.bucket_time).getTime();
-    const tsR = new Date(right.bucket_time).getTime();
-    if (tsL !== tsR) return tsL - tsR;
-    return left.side.localeCompare(right.side);
-  });
-
-  // Seed lastA / lastB from rows before the window
-  let lastA: RawCandleRow | undefined;
-  let lastB: RawCandleRow | undefined;
-
-  // Index rows within the window by bucket time for fast lookup
-  const byBucket = new Map<number, { a?: RawCandleRow; b?: RawCandleRow }>();
-  for (const row of sorted) {
-    const ts = new Date(row.bucket_time).getTime();
-    if (!Number.isFinite(ts)) continue;
-
-    if (ts < fromMs) {
-      // Seed: update carry-forward baseline
-      if (row.side === 'a') lastA = row;
-      else if (row.side === 'b') lastB = row;
-    } else if (ts < toMs) {
-      // In-window row
-      if (!byBucket.has(ts)) byBucket.set(ts, {});
-      const entry = byBucket.get(ts)!;
-      if (row.side === 'a') entry.a = row;
-      else if (row.side === 'b') entry.b = row;
-    }
-  }
-
-  // Walk bucket boundaries, carry-forward last known state
-  const points: SpreadPoint[] = [];
-
-  for (let bucketStart = fromMs; bucketStart < toMs; bucketStart += bucketMs) {
-    const entry = byBucket.get(bucketStart);
-    if (entry?.a) lastA = entry.a;
-    if (entry?.b) lastB = entry.b;
-
-    if (lastA && lastB) {
-      points.push(buildSpreadPoint(bucketStart + bucketMs, lastA, lastB, aRate, bRate));
-    }
-  }
-
-  return points;
-}
-
-// ── Single spread point from paired candle states ─────────────────────────
-
-function buildSpreadPoint(
-  tsMs: number,
-  a: RawCandleRow,
-  b: RawCandleRow,
-  aRate: number,
-  bRate: number,
-): SpreadPoint {
-  const aBid = (a.final_bid_price ?? 0) * aRate;
-  const aAsk = (a.final_ask_price ?? 0) * aRate;
-  const bBid = (b.final_bid_price ?? 0) * bRate;
-  const bAsk = (b.final_ask_price ?? 0) * bRate;
-  const aMid = (a.close_mid ?? 0) * aRate;
-  const bMid = (b.close_mid ?? 0) * bRate;
-  const aToB = aBid - bAsk;
-  const bToA = bBid - aAsk;
-
-  return {
-    tsMs,
-    aBid,
-    aAsk,
-    aBidSize: a.final_bid_size,
-    aAskSize: a.final_ask_size,
-    aBidSizeText: null,
-    aAskSizeText: null,
-    aBidOrderCount: a.final_bid_order_count,
-    aAskOrderCount: a.final_ask_order_count,
-    bBid,
-    bAsk,
-    bBidSize: b.final_bid_size,
-    bAskSize: b.final_ask_size,
-    bBidSizeText: null,
-    bAskSizeText: null,
-    bBidOrderCount: b.final_bid_order_count,
-    bAskOrderCount: b.final_ask_order_count,
-    aMid,
-    bMid,
-    aToB,
-    bToA,
-    aToBBp: bAsk === 0 ? null : (aToB / bAsk) * 10000,
-    bToABp: aAsk === 0 ? null : (bToA / aAsk) * 10000,
-    midDiff: aMid - bMid,
-  };
 }

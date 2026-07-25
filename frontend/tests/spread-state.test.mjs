@@ -37,7 +37,7 @@ test('carries the quiet venue book forward when the other venue updates', () => 
   ];
   const points = buildEventSpreadPoints(
     seedRows,
-    [tick('b', 301_000, 104, 105)],
+    [tick('b', 120_000, 104, 105)],
     1,
     1
   );
@@ -48,13 +48,28 @@ test('carries the quiet venue book forward when the other venue updates', () => 
   assert.equal(points[0].bBid, 104);
   assert.equal(points[0].bAsk, 105);
   assert.equal(points[0].bToA, 3);
+  assert.equal(points[0].id, 'raw:b:120000000000');
 });
 
-test('materializes unchanged seed books at every bucket boundary without age expiry', () => {
-  const dayMs = 24 * 60 * 60 * 1_000;
+test('expires a carried book after 120 seconds', () => {
   const seedRows = [
     tick('a', 1_000, 100, 101),
     tick('b', 1_000, 102, 103)
+  ];
+  const points = buildEventSpreadPoints(
+    seedRows,
+    [tick('b', 121_001, 104, 105)],
+    1,
+    1
+  );
+  assert.deepEqual(points, []);
+});
+
+test('materializes fresh seed books at bucket boundaries and then expires them', () => {
+  const dayMs = 24 * 60 * 60 * 1_000;
+  const seedRows = [
+    tick('a', dayMs - 1_000, 100, 101),
+    tick('b', dayMs - 1_000, 102, 103)
   ];
 
   const points = buildBucketSnapshotSpreadPoints(
@@ -67,12 +82,10 @@ test('materializes unchanged seed books at every bucket boundary without age exp
     1
   );
 
-  assert.equal(points.length, 3);
+  assert.equal(points.length, 1);
   assert.deepEqual(
     points.map((point) => [point.aBid, point.aAsk, point.bBid, point.bAsk]),
     [
-      [100, 101, 102, 103],
-      [100, 101, 102, 103],
       [100, 101, 102, 103]
     ]
   );

@@ -1,8 +1,25 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
-import type { QuoteRate, SpreadPoint, SpreadResponse } from '$lib/types';
+import type {
+  QuoteRate,
+  SpreadGranularity,
+  SpreadPoint,
+  SpreadRequestedPrecision,
+  SpreadResponse,
+  SpreadSource
+} from '$lib/types';
 import { validBookWhere } from '$lib/server/book-filter';
+import {
+  candleCoversRange,
+  getCandleCapability
+} from '$lib/server/candle-capability';
 import { fetchInstrumentMetadata } from '$lib/server/catalog';
-import { ClickHouseError, numericLiteral, queryClickHouse, tickTable } from '$lib/server/clickhouse';
+import {
+  ClickHouseError,
+  clickHouseConfig,
+  numericLiteral,
+  queryClickHouse,
+  tickTable
+} from '$lib/server/clickhouse';
 import { resolveRates } from '$lib/server/rates';
 import {
   buildBucketSnapshotSpreadPoints,
@@ -11,6 +28,7 @@ import {
 } from '$lib/server/spread-state';
 import { getTickSchema, tickIdentityWhere, type TickSchema } from '$lib/server/tick-schema';
 import {
+  candleGranularityForBucketSeconds,
   convertCandleRowsToSpreadPoints,
   fetchCandleRows,
   fetchCandleSeedRows,
@@ -23,10 +41,13 @@ const MAX_RANGE_MS = 31 * 24 * 60 * 60 * 1000;
 const TARGET_POINTS = 420;
 const RAW_EXPLICIT_MAX_RANGE_MS = 6 * 60 * 60 * 1000;
 const RAW_AUTO_MAX_RANGE_MS = 60_000; // 1 minute
-const MAX_RAW_TICK_ROWS = 100_000;
+const MAX_RESPONSE_POINTS = 5_000;
+const MAX_RAW_TICK_ROWS = MAX_RESPONSE_POINTS;
 const SPREAD_QUERY_OPTIONS = { maxThreads: 2 } as const;
 const SPREAD_CACHE_TTL_MS = 30_000;
 const MAX_SPREAD_CACHE_ENTRIES = 48;
+const MAX_CONCURRENT_SPREAD_QUERIES = 6;
+const MAX_QUEUED_SPREAD_QUERIES = 24;
 
 type SpreadRequest = {
   catalogA?: unknown;
@@ -35,14 +56,14 @@ type SpreadRequest = {
   toMs?: unknown;
   bucketSeconds?: unknown;
   precision?: unknown;
+  afterCursor?: unknown;
   rates?: QuoteRate[];
 };
-
-type SpreadGranularity = SpreadResponse['meta']['granularity'];
 
 type SpreadQueryResult = {
   points: SpreadPoint[];
   sourceRows: number;
+  coverage?: { fromMs: number; toMs: number };
 };
 
 type BaseSpreadInput = {
@@ -52,10 +73,11 @@ type BaseSpreadInput = {
   toMs: number;
   aRate: number;
   bRate: number;
+  maxStaleMs: number;
   tickSchema: Awaited<ReturnType<typeof getTickSchema>>;
 };
 
-type BookRowsInput = Omit<BaseSpreadInput, 'aRate' | 'bRate'>;
+type BookRowsInput = Omit<BaseSpreadInput, 'aRate' | 'bRate' | 'maxStaleMs'>;
 
 type ExactBookRowsInput = BookRowsInput & {
   maxRows: number;
@@ -80,34 +102,41 @@ type CachedSpreadResult = {
 };
 
 const spreadResultCache = new Map<string, CachedSpreadResult>();
+const spreadQueryWaiters: Array<() => void> = [];
+let activeSpreadQueries = 0;
 
 export const POST: RequestHandler = async ({ request }) => {
+  const requestId = crypto.randomUUID();
   try {
     const payload = (await request.json()) as SpreadRequest;
     const catalogA = validateCatalogId(payload.catalogA, 'catalogA');
     const catalogB = validateCatalogId(payload.catalogB, 'catalogB');
     if (catalogA === catalogB) {
-      throw new ClickHouseError('Choose two different instruments', 400);
+      throw publicError('Choose two different instruments', 400, 'INVALID_PAIR');
     }
 
     const fromMs = parseTimestamp(payload.fromMs, 'fromMs');
     const toMs = parseTimestamp(payload.toMs, 'toMs');
     if (fromMs >= toMs) {
-      throw new ClickHouseError('fromMs must be before toMs', 400);
+      throw publicError('fromMs must be before toMs', 400, 'INVALID_RANGE');
     }
     if (toMs - fromMs > MAX_RANGE_MS) {
-      throw new ClickHouseError('Time range is capped at 31 days', 400);
+      throw publicError('Time range is capped at 31 days', 422, 'RANGE_TOO_LARGE');
     }
 
     const [instrumentA, instrumentB] = await fetchSelectedInstruments(catalogA, catalogB);
     if (instrumentA.baseAsset !== instrumentB.baseAsset) {
-      throw new ClickHouseError('Selected instruments must share the same base asset', 400);
+      throw publicError(
+        'Selected instruments must share the same base asset',
+        400,
+        'BASE_ASSET_MISMATCH'
+      );
     }
     if (
       instrumentA.venueInstanceId === instrumentB.venueInstanceId &&
       instrumentA.instrumentId === instrumentB.instrumentId
     ) {
-      throw new ClickHouseError('Choose two distinct venue instruments', 400);
+      throw publicError('Choose two distinct venue instruments', 400, 'INVALID_PAIR');
     }
 
     const { targetQuote, aRate, bRate } = resolveRates(
@@ -115,11 +144,17 @@ export const POST: RequestHandler = async ({ request }) => {
       instrumentB.quoteAsset,
       payload.rates
     );
-    const rangeMs = toMs - fromMs;
-    const granularity = resolveGranularity(payload.precision, rangeMs);
-    const bucketSeconds =
-      granularity === 'bucket' ? parseBucketSeconds(payload.bucketSeconds, fromMs, toMs) : 0;
+    const requestedPrecision = parseRequestedPrecision(payload.precision);
+    const afterCursor = parseAfterCursor(payload.afterCursor);
+    const execution = await resolveExecution(
+      requestedPrecision,
+      payload.bucketSeconds,
+      fromMs,
+      toMs
+    );
+    const { granularity, source, bucketSeconds, fallbackReason, candleConfig } = execution;
     const tickSchema = await getTickSchema();
+    const { maxStaleMs } = clickHouseConfig();
     const queryInput: BaseSpreadInput = {
       instrumentA,
       instrumentB,
@@ -127,6 +162,7 @@ export const POST: RequestHandler = async ({ request }) => {
       toMs,
       aRate,
       bRate,
+      maxStaleMs,
       tickSchema
     };
     const cacheKey = [
@@ -138,25 +174,35 @@ export const POST: RequestHandler = async ({ request }) => {
       toMs,
       granularity,
       bucketSeconds,
+      fallbackReason ?? '',
       aRate,
       bRate
     ].join('|');
     const result = await cachedSpreadResult(cacheKey, () => {
-      if (granularity === 'raw') {
+      if (source === 'raw') {
         return fetchRawSpreadPoints(queryInput);
       }
-      if (granularity === 'bucket') {
+      if (source === 'bucket') {
         return fetchBucketedSpreadPoints({
           ...queryInput,
           bucketSeconds
         });
       }
-      // Candle granularity: 1s, 1m, 5m, 15m, 1h
-      const candleConfig = selectGranularity(rangeMs);
+      if (!candleConfig) {
+        throw new ClickHouseError('Candle execution is missing its granularity config');
+      }
       return fetchCandleSpreadPoints({ ...queryInput, candleConfig });
     });
 
-    const points = result.points;
+    const points = applyAfterCursor(result.points, afterCursor);
+    if (points.length > MAX_RESPONSE_POINTS) {
+      throw publicError(
+        `The query would return more than ${MAX_RESPONSE_POINTS} points. Choose a coarser interval.`,
+        422,
+        'POINT_LIMIT_EXCEEDED'
+      );
+    }
+    const resultCoverage = result.coverage ?? { fromMs, toMs };
 
     const response: SpreadResponse = {
       meta: {
@@ -164,9 +210,18 @@ export const POST: RequestHandler = async ({ request }) => {
         toMs,
         bucketSeconds,
         granularity,
+        requestedPrecision,
+        source,
+        fallbackReason,
+        coverage: {
+          fromMs: resultCoverage.fromMs,
+          toMs: resultCoverage.toMs,
+          complete: resultCoverage.fromMs <= fromMs && resultCoverage.toMs >= toMs
+        },
+        nextCursor: points.at(-1)?.id ?? afterCursor,
         sourceRows: result.sourceRows,
-        bookStatePolicy: 'carry_forward',
-        maxStaleMs: null,
+        bookStatePolicy: 'carry_forward_with_expiry',
+        maxStaleMs,
         targetQuote,
         aRate,
         bRate,
@@ -177,20 +232,149 @@ export const POST: RequestHandler = async ({ request }) => {
     };
     return json(response, {
       headers: {
-        'cache-control': 'private, max-age=15'
+        'cache-control': 'no-store',
+        'x-request-id': requestId
       }
     });
   } catch (error) {
-    return apiError(error);
+    return apiError(error, requestId);
   }
 };
+
+type SpreadExecution = {
+  source: SpreadSource;
+  granularity: SpreadGranularity;
+  bucketSeconds: number;
+  fallbackReason: SpreadResponse['meta']['fallbackReason'];
+  candleConfig: CandleGranularityConfig | null;
+};
+
+async function resolveExecution(
+  requested: SpreadRequestedPrecision,
+  rawBucketSeconds: unknown,
+  fromMs: number,
+  toMs: number
+): Promise<SpreadExecution> {
+  const rangeMs = toMs - fromMs;
+  if (requested === 'raw') {
+    if (rangeMs > RAW_EXPLICIT_MAX_RANGE_MS) {
+      throw publicError(
+        'Raw tick mode is capped at 6 hours. Use a shorter range or a bucket interval.',
+        422,
+        'RAW_RANGE_TOO_LARGE'
+      );
+    }
+    return {
+      source: 'raw',
+      granularity: 'raw',
+      bucketSeconds: 0,
+      fallbackReason: null,
+      candleConfig: null
+    };
+  }
+
+  if (requested === 'auto' && rangeMs <= RAW_AUTO_MAX_RANGE_MS) {
+    const bucketSeconds = parseBucketSeconds(undefined, fromMs, toMs, false);
+    return {
+      source: 'bucket',
+      granularity: 'bucket',
+      bucketSeconds,
+      fallbackReason: null,
+      candleConfig: null
+    };
+  }
+
+  if (requested === 'bucket') {
+    const bucketSeconds = parseBucketSeconds(rawBucketSeconds, fromMs, toMs, true);
+    return {
+      source: 'bucket',
+      granularity: 'bucket',
+      bucketSeconds,
+      fallbackReason: null,
+      candleConfig: null
+    };
+  }
+
+  const candleConfig = resolveCandleGranularity(rawBucketSeconds, rangeMs);
+  const capability = await getCandleCapability();
+  const covered = candleCoversRange(capability, fromMs, toMs);
+  if (capability.ready && covered) {
+    return {
+      source: 'candle',
+      granularity: candleConfig.granularity,
+      bucketSeconds: candleConfig.bucketMs / 1000,
+      fallbackReason: null,
+      candleConfig
+    };
+  }
+  if (capability.mode === 'force') {
+    throw publicError(
+      covered
+        ? 'Candle schema v2 is not ready.'
+        : 'The requested range is outside validated candle coverage.',
+      503,
+      covered ? 'CANDLE_NOT_READY' : 'CANDLE_COVERAGE_GAP'
+    );
+  }
+
+  const bucketSeconds = parseBucketSeconds(undefined, fromMs, toMs, false);
+  return {
+    source: 'bucket',
+    granularity: 'bucket',
+    bucketSeconds,
+    fallbackReason:
+      capability.reason === 'candle_disabled'
+        ? 'candle_disabled'
+        : capability.ready
+          ? 'coverage_gap'
+          : 'candle_not_ready',
+    candleConfig: null
+  };
+}
+
+function resolveCandleGranularity(
+  rawBucketSeconds: unknown,
+  rangeMs: number
+): CandleGranularityConfig {
+  if (rawBucketSeconds !== undefined && rawBucketSeconds !== null) {
+    if (
+      typeof rawBucketSeconds !== 'number' ||
+      !Number.isFinite(rawBucketSeconds) ||
+      !Number.isInteger(rawBucketSeconds) ||
+      rawBucketSeconds <= 0
+    ) {
+      throw publicError(
+        'Candle bucketSeconds must be 1, 60, 300, 900, or 3600.',
+        400,
+        'INVALID_PRECISION'
+      );
+    }
+    const requested = candleGranularityForBucketSeconds(rawBucketSeconds);
+    if (!requested) {
+      throw publicError(
+        'Candle bucketSeconds must be 1, 60, 300, 900, or 3600.',
+        400,
+        'INVALID_PRECISION'
+      );
+    }
+    return requested;
+  }
+  const selected = selectGranularity(rangeMs);
+  return selected.granularity === 'raw'
+    ? candleGranularityForBucketSeconds(1)!
+    : selected;
+}
 
 async function fetchSelectedInstruments(catalogA: string, catalogB: string) {
   const instruments = await fetchInstrumentMetadata([catalogA, catalogB]);
   const instrumentA = instruments.find((instrument) => instrument.catalogId === catalogA);
   const instrumentB = instruments.find((instrument) => instrument.catalogId === catalogB);
   if (!instrumentA || !instrumentB) {
-    throw new ClickHouseError('Selected instrument was not found in instrument_catalog', 400);
+    throw publicError(
+      'Selected instrument was not found in instrument_catalog',
+      400,
+      'INSTRUMENT_NOT_FOUND'
+    );
   }
   return [instrumentA, instrumentB] as const;
 }
@@ -208,7 +392,7 @@ function cachedSpreadResult(
   }
   if (cached) spreadResultCache.delete(key);
 
-  const promise = load().catch((error) => {
+  const promise = withSpreadQuerySlot(load).catch((error) => {
     spreadResultCache.delete(key);
     throw error;
   });
@@ -224,6 +408,26 @@ function cachedSpreadResult(
   return promise;
 }
 
+async function withSpreadQuerySlot<T>(load: () => Promise<T>): Promise<T> {
+  if (activeSpreadQueries >= MAX_CONCURRENT_SPREAD_QUERIES) {
+    if (spreadQueryWaiters.length >= MAX_QUEUED_SPREAD_QUERIES) {
+      throw publicError(
+        'The spread service is busy. Retry shortly.',
+        503,
+        'QUERY_CAPACITY_EXCEEDED'
+      );
+    }
+    await new Promise<void>((resolve) => spreadQueryWaiters.push(resolve));
+  }
+  activeSpreadQueries += 1;
+  try {
+    return await load();
+  } finally {
+    activeSpreadQueries -= 1;
+    spreadQueryWaiters.shift()?.();
+  }
+}
+
 // ── Raw tick path (≤ 1 minute) ────────────────────────────────────────────
 
 async function fetchRawSpreadPoints(input: BaseSpreadInput): Promise<SpreadQueryResult> {
@@ -237,7 +441,13 @@ async function fetchRawSpreadPoints(input: BaseSpreadInput): Promise<SpreadQuery
   });
 
   return {
-    points: buildEventSpreadPoints(seedRows, tickRows, input.aRate, input.bRate),
+    points: buildEventSpreadPoints(
+      seedRows,
+      tickRows,
+      input.aRate,
+      input.bRate,
+      input.maxStaleMs
+    ),
     sourceRows: tickRows.length
   };
 }
@@ -267,7 +477,8 @@ async function fetchBucketedSpreadPoints(
       input.toMs,
       input.bucketSeconds,
       input.aRate,
-      input.bRate
+      input.bRate,
+      input.maxStaleMs
     ),
     sourceRows: tickRows.length
   };
@@ -285,6 +496,8 @@ async function fetchCandleSpreadPoints(input: CandleBookInput): Promise<SpreadQu
 
   const allRows = [...seedRows, ...tickRows];
 
+  const alignedFromMs = Math.ceil(fromMs / candleConfig.bucketMs) * candleConfig.bucketMs;
+  const alignedToMs = Math.floor(toMs / candleConfig.bucketMs) * candleConfig.bucketMs;
   return {
     points: convertCandleRowsToSpreadPoints(
       allRows,
@@ -294,9 +507,14 @@ async function fetchCandleSpreadPoints(input: CandleBookInput): Promise<SpreadQu
       instrumentA,
       instrumentB,
       aRate,
-      bRate
+      bRate,
+      input.maxStaleMs
     ),
-    sourceRows: tickRows.length
+    sourceRows: tickRows.length,
+    coverage: {
+      fromMs: alignedFromMs,
+      toMs: alignedToMs
+    }
   };
 }
 
@@ -339,9 +557,10 @@ FORMAT JSONEachRow
   ]);
 
   if (tickRows.length > input.maxRows) {
-    throw new ClickHouseError(
+    throw publicError(
       `Spread query is capped at ${input.maxRows} source rows. Reduce the time range or use a coarser window.`,
-      400
+      422,
+      'POINT_LIMIT_EXCEEDED'
     );
   }
 
@@ -480,7 +699,7 @@ function tickRowTuple(alias: string): string {
 
 function validateCatalogId(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.trim().length === 0 || value.length > 256) {
-    throw new ClickHouseError(`${label} is required`, 400);
+    throw publicError(`${label} is required`, 400, 'INVALID_REQUEST');
   }
   return value.trim();
 }
@@ -489,38 +708,48 @@ function parseTimestamp(value: unknown, label: string): number {
   const parsed =
     typeof value === 'number' ? value : typeof value === 'string' ? Date.parse(value) : Number.NaN;
   if (!Number.isFinite(parsed)) {
-    throw new ClickHouseError(`${label} must be a timestamp`, 400);
+    throw publicError(`${label} must be a timestamp`, 400, 'INVALID_REQUEST');
   }
   return Math.trunc(parsed);
 }
 
-function resolveGranularity(value: unknown, rangeMs: number): SpreadGranularity {
-  if (value === 'raw') {
-    if (rangeMs > RAW_EXPLICIT_MAX_RANGE_MS) {
-      throw new ClickHouseError(
-        'Raw tick mode is capped at 6 hours. Use a shorter range or bucketed mode.',
-        400
-      );
-    }
-    return 'raw';
-  }
-  if (value === 'bucket') return 'bucket';
-  if (value === 'candle') {
-    // Explicit candle mode: use auto-selected granularity
-    return selectGranularity(rangeMs).granularity;
-  }
-
-  // Auto-select: raw for ≤ 1 min, candle otherwise
-  if (rangeMs <= RAW_AUTO_MAX_RANGE_MS) return 'raw';
-  return selectGranularity(rangeMs).granularity;
+function parseRequestedPrecision(value: unknown): SpreadRequestedPrecision {
+  if (value === undefined || value === null || value === '') return 'auto';
+  if (value === 'raw' || value === 'bucket' || value === 'candle') return value;
+  throw publicError('precision must be raw, bucket, or candle', 400, 'INVALID_PRECISION');
 }
 
-function parseBucketSeconds(value: unknown, fromMs: number, toMs: number): number {
-  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
-    return clamp(Math.trunc(value), 1, 3600);
+function parseAfterCursor(value: unknown): string | null {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string' || value.length > 160) {
+    throw publicError('afterCursor must be a short string', 400, 'INVALID_CURSOR');
   }
-  const rangeSeconds = Math.max(1, (toMs - fromMs) / 1000);
-  return clamp(Math.ceil(rangeSeconds / TARGET_POINTS), 1, 3600);
+  return value;
+}
+
+function parseBucketSeconds(
+  value: unknown,
+  fromMs: number,
+  toMs: number,
+  explicit: boolean
+): number {
+  let bucketSeconds: number;
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    bucketSeconds = clamp(Math.trunc(value), 1, 3600);
+  } else {
+    const rangeSeconds = Math.max(1, (toMs - fromMs) / 1000);
+    bucketSeconds = clamp(Math.ceil(rangeSeconds / TARGET_POINTS), 1, 3600);
+  }
+  const pointCount = Math.ceil((toMs - fromMs) / (bucketSeconds * 1000));
+  if (pointCount > MAX_RESPONSE_POINTS) {
+    const suggested = Math.ceil((toMs - fromMs) / 1000 / MAX_RESPONSE_POINTS);
+    throw publicError(
+      `${explicit ? 'The selected interval' : 'The query'} would return too many points. Use at least ${suggested} seconds.`,
+      422,
+      'POINT_LIMIT_EXCEEDED'
+    );
+  }
+  return bucketSeconds;
 }
 
 function sampleSecondsForBucket(bucketSeconds: number): number {
@@ -531,8 +760,24 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function apiError(error: unknown): Response {
-  const status = error instanceof ClickHouseError ? error.status : 500;
-  const message = error instanceof Error ? error.message : 'Unknown server error';
-  return json({ error: message }, { status });
+function applyAfterCursor(points: SpreadPoint[], cursor: string | null): SpreadPoint[] {
+  if (!cursor) return points;
+  const index = points.findIndex((point) => point.id === cursor);
+  return index < 0 ? points : points.slice(index + 1);
+}
+
+function publicError(message: string, status: number, code: string): ClickHouseError {
+  return new ClickHouseError(message, status, true, code);
+}
+
+function apiError(error: unknown, requestId: string): Response {
+  console.error(`[api/spread:${requestId}]`, error);
+  const exposed = error instanceof ClickHouseError && error.expose;
+  const status = exposed ? error.status : 502;
+  const message = exposed ? error.message : 'The market data service is temporarily unavailable.';
+  const code = exposed ? error.code : 'UPSTREAM_UNAVAILABLE';
+  return json(
+    { error: message, code, requestId },
+    { status, headers: { 'cache-control': 'no-store', 'x-request-id': requestId } }
+  );
 }
