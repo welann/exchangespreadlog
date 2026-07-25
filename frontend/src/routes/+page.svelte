@@ -4,6 +4,44 @@
   import SpreadLightweightChart from '$lib/components/SpreadLightweightChart.svelte';
   import type { Market, QuoteRate, SpreadPoint, SpreadResponse } from '$lib/types';
 
+  // --- localStorage cache helpers ---
+  const MARKETS_CACHE_KEY = 'spreadlog_markets_v1';
+  const SPREAD_CACHE_PREFIX = 'spreadlog_spread_v1_';
+  const MARKETS_CACHE_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
+
+  function saveMarketsToCache(data: { generatedAt: string; markets: Market[] }) {
+    try {
+      localStorage.setItem(MARKETS_CACHE_KEY, JSON.stringify(data));
+    } catch { /* quota exceeded, ignore */ }
+  }
+
+  function loadMarketsFromCache(): { generatedAt: string; markets: Market[] } | null {
+    try {
+      const raw = localStorage.getItem(MARKETS_CACHE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      const age = Date.now() - new Date(parsed.generatedAt).getTime();
+      if (age > MARKETS_CACHE_MAX_AGE_MS) return null;
+      return parsed;
+    } catch { return null; }
+  }
+
+  function saveSpreadToCache(key: string, data: SpreadResponse) {
+    try {
+      const cacheEntry = { savedAt: Date.now(), data };
+      localStorage.setItem(SPREAD_CACHE_PREFIX + key, JSON.stringify(cacheEntry));
+    } catch { /* ignore */ }
+  }
+
+  function loadSpreadFromCache(key: string): SpreadResponse | null {
+    try {
+      const raw = localStorage.getItem(SPREAD_CACHE_PREFIX + key);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed.data ?? null;
+    } catch { return null; }
+  }
+
   const RATE_STORAGE_KEY = 'exchangespreadlog.quoteRates';
   const MAX_SPREAD_CACHE_ENTRIES = 12;
   const SPREAD_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -108,6 +146,7 @@
   let rangeAnchorMs = Date.now();
   let rates: QuoteRate[] = structuredClone(defaultRates);
   let hydrated = false;
+  let initialLoad = true;
   let showAToB = true;
   let showBToA = true;
   let displayMode: DisplayMode = 'both';
@@ -177,8 +216,43 @@
   onMount(() => {
     hydrated = true;
     loadStoredRates();
+
+    // Try loading from localStorage cache first
+    const cachedMarkets = loadMarketsFromCache();
+    if (cachedMarkets) {
+      markets = cachedMarkets.markets ?? [];
+      if (markets.length > 0) {
+        const queryState = readQueryState();
+        applySelectionState(queryState);
+        syncVenueSelectionFromSelectedLegs();
+
+        // Try loading cached spread
+        if (selectedA && selectedB && selectedA !== selectedB) {
+          const range = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
+          const spreadPayload = {
+            catalogA: selectedA,
+            catalogB: selectedB,
+            fromMs: range.fromMs,
+            toMs: range.toMs,
+            ...spreadQueryOptions(range),
+            rates: cleanRates(rates)
+          };
+          const spreadCacheKeyStr = spreadCacheKey(spreadPayload);
+          const cachedSpread = loadSpreadFromCache(spreadCacheKeyStr);
+          if (cachedSpread) {
+            spread = cachedSpread;
+            selectedIndex = cachedSpread.points.length > 0 ? cachedSpread.points.length - 1 : -1;
+          }
+        }
+      }
+    }
+
+    // Always fetch fresh data
     const queryState = readQueryState();
-    void loadMarkets(queryState).finally(() => configureAutoRefresh());
+    void loadMarkets(queryState).finally(() => {
+      initialLoad = false;
+      configureAutoRefresh();
+    });
 
     return () => {
       stopAutoRefresh();
@@ -192,6 +266,7 @@
       const response = await fetch('/api/markets');
       const body = await response.json();
       if (!response.ok) throw new Error(body.error ?? 'Failed to load markets');
+      saveMarketsToCache(body);
       markets = body.markets ?? [];
       if (markets.length > 0) {
         applySelectionState(state);
@@ -225,6 +300,19 @@
       return;
     }
 
+    // Try loading from localStorage cache before network request
+    const localStorageCacheKey = spreadCacheKey({
+      catalogA,
+      catalogB,
+      fromMs: range.fromMs,
+      toMs: range.toMs
+    });
+    const cachedFromStorage = loadSpreadFromCache(localStorageCacheKey);
+    if (cachedFromStorage && points.length === 0 && !spread) {
+      spread = cachedFromStorage;
+      selectedIndex = cachedFromStorage.points.length > 0 ? cachedFromStorage.points.length - 1 : -1;
+    }
+
     const requestId = ++spreadRequestSeq;
     const previousSelectedPoint = selectedIndex >= 0 ? points[selectedIndex] : null;
     const wasFollowingLatest = selectedIndex < 0 || selectedIndex >= points.length - 1;
@@ -239,6 +327,7 @@
     const cacheKey = spreadCacheKey(payload);
     const cached = readSpreadCache(cacheKey);
     const usedCached = cached !== null && !options.silent;
+    const hasExistingPoints = points.length > 0;
 
     if (usedCached) {
       spread = cached.response;
@@ -251,6 +340,8 @@
       loadingSpread = false;
       refreshingSpread = true;
     } else if (options.silent) {
+      refreshingSpread = true;
+    } else if (hasExistingPoints) {
       refreshingSpread = true;
     } else {
       loadingSpread = true;
@@ -542,6 +633,7 @@
   function rememberSpread(key: string, response: SpreadResponse) {
     spreadCache.delete(key);
     spreadCache.set(key, { response, loadedAt: Date.now() });
+    saveSpreadToCache(key, response);
     while (spreadCache.size > MAX_SPREAD_CACHE_ENTRIES) {
       const oldest = spreadCache.keys().next().value;
       if (typeof oldest !== 'string') break;
@@ -1305,7 +1397,11 @@
 
           <div class="market-list">
             {#if loadingMarkets && markets.length === 0}
-              <p class="sidebar-empty">正在读取 ClickHouse 市场目录。</p>
+              <div class="skeleton-sidebar">
+                {#each Array(8) as _}
+                  <div class="skeleton skeleton-row"></div>
+                {/each}
+              </div>
             {:else if markets.length === 0}
               <p class="sidebar-empty">没有可比较的交易对。</p>
             {:else}
@@ -1447,7 +1543,11 @@
 
           <div class="exchange-market-list">
             {#if loadingMarkets && markets.length === 0}
-              <p class="sidebar-empty">正在读取 ClickHouse 市场目录。</p>
+              <div class="skeleton-sidebar">
+                {#each Array(8) as _}
+                  <div class="skeleton skeleton-row"></div>
+                {/each}
+              </div>
             {:else if !selectedVenueA || !selectedVenueB || selectedVenueA === selectedVenueB}
               <p class="sidebar-empty">请选择两个不同的交易所。</p>
             {:else if venuePairMarkets.length === 0}
@@ -1741,8 +1841,10 @@
           鼠标悬停或点击可锁定任意一点；聚焦图表后可用 Left / Right / Home / End 查看样本。
         </p>
 
-        {#if loadingSpread}
-          <div class="empty-state">正在查询 ClickHouse。</div>
+        {#if loadingSpread && points.length === 0}
+          <div class="skeleton-chart">
+            <div class="skeleton" style="width: 100%; height: 100%; border-radius: var(--radius);"></div>
+          </div>
         {:else if points.length === 0}
           <div class="empty-state">当前组合没有可比较的盘口状态样本。请调整交易所腿或时间范围。</div>
         {:else}
@@ -3759,5 +3861,46 @@
       animation-duration: 0.01ms !important;
       animation-iteration-count: 1 !important;
     }
+  }
+
+  /* --- skeleton loading --- */
+  .skeleton {
+    background: linear-gradient(90deg, var(--muted) 25%, rgba(255,255,255,0.06) 50%, var(--muted) 75%);
+    background-size: 200% 100%;
+    animation: skeleton-shimmer 1.5s ease-in-out infinite;
+    border-radius: var(--radius);
+  }
+
+  @keyframes skeleton-shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .skeleton {
+      animation: none;
+      background: var(--muted);
+    }
+  }
+
+  .skeleton-row {
+    height: 36px;
+    margin-bottom: 6px;
+  }
+
+  .skeleton-chart {
+    height: clamp(410px, 54vh, 560px);
+    min-height: 410px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted-foreground);
+    font-size: 0.85rem;
+  }
+
+  .skeleton-sidebar {
+    display: grid;
+    gap: 6px;
+    padding: 8px 12px;
   }
 </style>

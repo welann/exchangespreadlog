@@ -16,7 +16,7 @@ const TARGET_POINTS = 420;
 const RAW_EXPLICIT_MAX_RANGE_MS = 6 * 60 * 60 * 1000;
 const MAX_RAW_TICK_ROWS = 100_000;
 const SPREAD_QUERY_OPTIONS = { maxThreads: 2 } as const;
-const SPREAD_CACHE_TTL_MS = 20_000;
+const SPREAD_CACHE_TTL_MS = 30_000;
 const MAX_SPREAD_CACHE_ENTRIES = 48;
 
 type SpreadRequest = {

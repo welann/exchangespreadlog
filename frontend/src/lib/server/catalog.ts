@@ -15,7 +15,8 @@ type RawInstrument = {
   tickCount: number | string | null;
 };
 
-const INSTRUMENT_CACHE_TTL_MS = 30_000;
+const INSTRUMENT_CACHE_TTL_MS = 300_000;
+const TICK_STATS_WINDOW_DAYS = 7;
 const MAX_METADATA_CACHE_ENTRIES = 512;
 
 let cachedInstruments: { expiresAt: number; value: Instrument[] } | null = null;
@@ -225,6 +226,7 @@ LEFT JOIN
   FROM ${tickTable()} AS ticks
   WHERE ticks.venue_instance_id != '' AND ticks.instrument_id != ''
     AND ${validBooks}
+    AND ticks.recv_time >= now() - INTERVAL ${TICK_STATS_WINDOW_DAYS} DAY
   GROUP BY ticks.venue_instance_id, ticks.instrument_id
 ) AS storage_tick_stats
   ON latest.venue_instance_id = storage_tick_stats.venue_instance_id
@@ -244,6 +246,7 @@ LEFT JOIN
   FROM ${tickTable()} AS ticks
   WHERE ticks.catalog_id != ''
     AND ${validBooks}
+    AND ticks.recv_time >= now() - INTERVAL ${TICK_STATS_WINDOW_DAYS} DAY
   GROUP BY ticks.catalog_id
 ) AS catalog_tick_stats ON latest.catalog_id = catalog_tick_stats.catalog_id`);
     latestCandidates.push('catalog_tick_stats.latest_recv_time');
@@ -265,6 +268,7 @@ LEFT JOIN
   FROM ${tickTable()} AS ticks
   WHERE ${legacyWhere}
     AND ${validBooks}
+    AND ticks.recv_time >= now() - INTERVAL ${TICK_STATS_WINDOW_DAYS} DAY
   GROUP BY ticks.venue, ticks.market_id
 ) AS legacy_tick_stats
   ON latest.venue_instance_id = legacy_tick_stats.venue_instance_id
