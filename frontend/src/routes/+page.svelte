@@ -1,6 +1,7 @@
 <script lang="ts">
   import { replaceState } from '$app/navigation';
   import { onMount } from 'svelte';
+  import SpreadLightweightChart from '$lib/components/SpreadLightweightChart.svelte';
   import type { Market, QuoteRate, SpreadPoint, SpreadResponse } from '$lib/types';
 
   const RATE_STORAGE_KEY = 'exchangespreadlog.quoteRates';
@@ -8,15 +9,6 @@
   const SPREAD_CACHE_TTL_MS = 5 * 60 * 1000;
   const LIVE_PAIR_GRACE_MS = 5 * 60 * 1000;
   const LIVE_ANCHOR_INTERVAL_MS = 15 * 1000;
-  const CHART = {
-    width: 980,
-    height: 430,
-    top: 28,
-    right: 24,
-    bottom: 42,
-    left: 68
-  };
-
   const presets = [
     { label: '1H', value: '1h', ms: 60 * 60 * 1000 },
     { label: '6H', value: '6h', ms: 6 * 60 * 60 * 1000 },
@@ -66,10 +58,6 @@
     tone: 'best' | 'a' | 'b';
     sampleCount: number;
     totalCount: number;
-  };
-  type PositionedAverageLine = AverageLine & {
-    y: number;
-    labelY: number;
   };
   type VenueOption = {
     venue: string;
@@ -149,8 +137,6 @@
   $: selectedRange = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
   $: spreadBusy = loadingSpread || refreshingSpread;
   $: points = spread?.points ?? [];
-  $: xBounds = computeXBounds(points, selectedRange);
-  $: yBounds = computeYBounds(points, displayMode, showAToB, showBToA);
   $: averagePercentValue = parseAveragePercent(averagePercent);
   $: averageLines = computeAverageLines(
     points,
@@ -160,12 +146,7 @@
     averageScope,
     averagePercentValue
   );
-  $: positionedAverageLines = positionAverageLines(averageLines, yBounds);
   $: averageScopeSummary = averageScopeLabel(averageScope, averagePercentValue);
-  $: bestPath = displayMode === 'best' ? bestLinePath(points, xBounds, yBounds) : '';
-  $: aPath = displayMode === 'both' && showAToB ? linePath(points, 'aToBBp', xBounds, yBounds) : '';
-  $: bPath = displayMode === 'both' && showBToA ? linePath(points, 'bToABp', xBounds, yBounds) : '';
-  $: zeroY = yScale(0, yBounds);
   $: activeIndex = hoverIndex >= 0 ? hoverIndex : selectedIndex;
   $: activePoint = points[activeIndex] ?? null;
   $: latestPoint = points.length > 0 ? points[points.length - 1] : null;
@@ -709,78 +690,21 @@
     return (event.currentTarget as HTMLInputElement).value;
   }
 
-  function handlePointerMove(event: PointerEvent) {
-    if (points.length === 0) return;
-    const svg = event.currentTarget as SVGSVGElement;
-    const rect = svg.getBoundingClientRect();
-    const viewX = ((event.clientX - rect.left) / rect.width) * CHART.width;
-    const plotX = clamp((viewX - CHART.left) / plotWidth(), 0, 1);
-    const ts = xBounds.min + plotX * (xBounds.max - xBounds.min);
-    hoverIndex = nearestPointIndex(ts);
-  }
-
-  function handleChartClick() {
-    if (hoverIndex >= 0) selectedIndex = hoverIndex;
-  }
-
-  function handleChartKeydown(event: KeyboardEvent) {
+  function handleChartNavigation(key: string) {
     if (points.length === 0) return;
     const current = selectedIndex >= 0 ? selectedIndex : points.length - 1;
-    if (event.key === 'ArrowLeft') {
+    if (key === 'ArrowLeft') {
       selectedIndex = clamp(current - 1, 0, points.length - 1);
-      event.preventDefault();
     }
-    if (event.key === 'ArrowRight') {
+    if (key === 'ArrowRight') {
       selectedIndex = clamp(current + 1, 0, points.length - 1);
-      event.preventDefault();
     }
-    if (event.key === 'Home') {
+    if (key === 'Home') {
       selectedIndex = 0;
-      event.preventDefault();
     }
-    if (event.key === 'End') {
+    if (key === 'End') {
       selectedIndex = points.length - 1;
-      event.preventDefault();
     }
-  }
-
-  function nearestPointIndex(tsMs: number): number {
-    let best = 0;
-    let distance = Number.POSITIVE_INFINITY;
-    points.forEach((point, index) => {
-      const currentDistance = Math.abs(point.tsMs - tsMs);
-      if (currentDistance < distance) {
-        best = index;
-        distance = currentDistance;
-      }
-    });
-    return best;
-  }
-
-  function computeXBounds(data: SpreadPoint[], range: { fromMs: number; toMs: number }) {
-    if (data.length === 0) {
-      return { min: range.fromMs, max: range.toMs };
-    }
-    return {
-      min: data[0].tsMs,
-      max: data[data.length - 1].tsMs
-    };
-  }
-
-  function computeYBounds(
-    data: SpreadPoint[],
-    mode: DisplayMode,
-    includeAToB: boolean,
-    includeBToA: boolean
-  ) {
-    const values = visibleSpreadValues(data, mode, includeAToB, includeBToA);
-
-    if (values.length === 0) return { min: -1, max: 1 };
-    const min = Math.min(0, ...values);
-    const max = Math.max(0, ...values);
-    if (Math.abs(max - min) < Number.EPSILON) return { min: -1, max: 1 };
-    const padding = Math.max((max - min) * 0.12, 0.0001);
-    return { min: min - padding, max: max + padding };
   }
 
   function computeAverageLines(
@@ -804,24 +728,6 @@
         };
       })
       .filter((line): line is AverageLine => line !== null);
-  }
-
-  function visibleSpreadValues(
-    data: SpreadPoint[],
-    mode: DisplayMode,
-    includeAToB: boolean,
-    includeBToA: boolean
-  ) {
-    return data
-      .flatMap((point) =>
-        mode === 'best'
-          ? [bestSpreadValue(point)]
-          : [
-              includeAToB ? point.aToBBp : null,
-              includeBToA ? point.bToABp : null
-            ]
-      )
-      .filter((value): value is number => value !== null && Number.isFinite(value));
   }
 
   function averageSeries(
@@ -868,89 +774,6 @@
     const sorted = [...values].sort((left, right) => left - right);
     const count = clamp(Math.ceil(sorted.length * (percent / 100)), 1, sorted.length);
     return scope === 'top' ? sorted.slice(-count) : sorted.slice(0, count);
-  }
-
-  function positionAverageLines(
-    lines: AverageLine[],
-    y: { min: number; max: number }
-  ): PositionedAverageLine[] {
-    const minLabelY = CHART.top + 14;
-    const maxLabelY = CHART.height - CHART.bottom - 6;
-    const gap = 15;
-    const positioned = lines
-      .map((line) => {
-        const lineY = yScale(line.value, y);
-        return {
-          ...line,
-          y: lineY,
-          labelY: clamp(lineY - 7, minLabelY, maxLabelY)
-        };
-      })
-      .sort((left, right) => left.labelY - right.labelY);
-
-    for (let index = 1; index < positioned.length; index += 1) {
-      positioned[index].labelY = Math.max(positioned[index].labelY, positioned[index - 1].labelY + gap);
-    }
-
-    for (let index = positioned.length - 1; index >= 0; index -= 1) {
-      positioned[index].labelY = Math.min(positioned[index].labelY, maxLabelY);
-      if (index > 0) {
-        positioned[index - 1].labelY = Math.min(positioned[index - 1].labelY, positioned[index].labelY - gap);
-      }
-    }
-
-    return positioned.map((line) => ({
-      ...line,
-      labelY: clamp(line.labelY, minLabelY, maxLabelY)
-    }));
-  }
-
-  function linePath(
-    data: SpreadPoint[],
-    key: 'aToBBp' | 'bToABp',
-    x: { min: number; max: number },
-    y: { min: number; max: number }
-  ) {
-    return data
-      .filter((point) => point[key] !== null)
-      .map((point, index) => {
-        const command = index === 0 ? 'M' : 'L';
-        return `${command}${xScale(point.tsMs, x)},${yScale(point[key] ?? 0, y)}`;
-      })
-      .join(' ');
-  }
-
-  function bestLinePath(
-    data: SpreadPoint[],
-    x: { min: number; max: number },
-    y: { min: number; max: number }
-  ) {
-    return data
-      .map((point) => ({ point, value: bestSpreadValue(point) }))
-      .filter((entry): entry is { point: SpreadPoint; value: number } => entry.value !== null && Number.isFinite(entry.value))
-      .map((entry, index) => {
-        const command = index === 0 ? 'M' : 'L';
-        return `${command}${xScale(entry.point.tsMs, x)},${yScale(entry.value, y)}`;
-      })
-      .join(' ');
-  }
-
-  function xScale(value: number, bounds: { min: number; max: number }) {
-    const span = Math.max(1, bounds.max - bounds.min);
-    return CHART.left + ((value - bounds.min) / span) * plotWidth();
-  }
-
-  function yScale(value: number, bounds: { min: number; max: number }) {
-    const span = Math.max(0.000001, bounds.max - bounds.min);
-    return CHART.top + (1 - (value - bounds.min) / span) * plotHeight();
-  }
-
-  function plotWidth() {
-    return CHART.width - CHART.left - CHART.right;
-  }
-
-  function plotHeight() {
-    return CHART.height - CHART.top - CHART.bottom;
   }
 
   function toDateInput(ms: number) {
@@ -1688,14 +1511,32 @@
     <section class="main-panel" aria-label="价差曲线">
       <div class="pair-header">
         <div>
-          <h1>{selectedBase || 'No market'}/{spread?.meta.targetQuote ?? selectedInstrumentA?.quoteAsset ?? '-'}</h1>
-          <p>{selectedLabel(selectedA)} vs {selectedLabel(selectedB)}</p>
+          <h1>{selectedBase || 'No market'} <span>/ {spread?.meta.targetQuote ?? selectedInstrumentA?.quoteAsset ?? '-'}</span></h1>
+          <p>
+            <i class="leg-dot a"></i>{selectedLabel(selectedA)}
+            <span class="versus">versus</span>
+            <i class="leg-dot b"></i>{selectedLabel(selectedB)}
+          </p>
         </div>
         <div class="latest-card" class:positive={latestOpportunity?.tone === 'positive'} class:negative={latestOpportunity?.tone === 'negative'}>
           <span>Latest best</span>
           <strong>{formatSignedBp(latestOpportunity?.bp ?? null)}</strong>
           <small>{spreadStatus}</small>
         </div>
+      </div>
+
+      <div
+        class="route-ribbon"
+        class:positive={activeOpportunity?.tone === 'positive'}
+        class:negative={activeOpportunity?.tone === 'negative'}
+        aria-live="polite"
+      >
+        <div>
+          <span>Route at crosshair</span>
+          <strong>{activeOpportunity?.label ?? '等待可比较盘口'}</strong>
+        </div>
+        <output>{formatSignedBp(activeOpportunity?.bp ?? null)}</output>
+        <small>{activePoint ? formatTime(activePoint.tsMs) : '移动十字光标查看任意样本'}</small>
       </div>
 
       <div class="control-strip trading-toolbar query-toolbar">
@@ -1847,114 +1688,19 @@
         {:else if points.length === 0}
           <div class="empty-state">当前组合没有可比较的盘口状态样本。请调整交易所腿或时间范围。</div>
         {:else}
-          <svg
-            class="spread-chart"
-            viewBox={`0 0 ${CHART.width} ${CHART.height}`}
-            role="button"
-            tabindex="0"
-            aria-label="Cross venue spread chart. Hover, click, or use arrow keys to inspect samples."
-            aria-describedby="chart-help"
-            on:pointermove={handlePointerMove}
-            on:pointerleave={() => (hoverIndex = -1)}
-            on:click={handleChartClick}
-            on:keydown={handleChartKeydown}
-          >
-            <rect class="plot-bg" x={CHART.left} y={CHART.top} width={plotWidth()} height={plotHeight()} />
-            {#each [0, 0.25, 0.5, 0.75, 1] as tick}
-              <line
-                class="grid-line"
-                x1={CHART.left}
-                x2={CHART.width - CHART.right}
-                y1={CHART.top + tick * plotHeight()}
-                y2={CHART.top + tick * plotHeight()}
-              />
-            {/each}
-            {#each [0, 0.25, 0.5, 0.75, 1] as tick}
-              <line
-                class="grid-line vertical"
-                x1={CHART.left + tick * plotWidth()}
-                x2={CHART.left + tick * plotWidth()}
-                y1={CHART.top}
-                y2={CHART.height - CHART.bottom}
-              />
-            {/each}
-            <line class="zero-line" x1={CHART.left} x2={CHART.width - CHART.right} y1={zeroY} y2={zeroY} />
-            {#each positionedAverageLines as line}
-              <line
-                class={`average-line ${line.tone}`}
-                x1={CHART.left}
-                x2={CHART.width - CHART.right}
-                y1={line.y}
-                y2={line.y}
-              />
-              <text
-                class={`average-label ${line.tone}`}
-                x={CHART.width - CHART.right - 8}
-                y={line.labelY}
-              >
-                {line.label} {formatBp(line.value)}
-              </text>
-            {/each}
-            {#if displayMode === 'best'}
-              <path class="spread-line best" d={bestPath} />
-            {:else}
-              {#if showAToB}
-                <path class="spread-line a" d={aPath} />
-              {/if}
-              {#if showBToA}
-                <path class="spread-line b" d={bPath} />
-              {/if}
-            {/if}
-            <text class="axis-label y top" x="12" y={CHART.top + 4}>{formatBp(yBounds.max)}</text>
-            <text class="axis-label y middle" x="12" y={zeroY + 4}>0 bp</text>
-            <text class="axis-label y bottom" x="12" y={CHART.height - CHART.bottom}>
-              {formatBp(yBounds.min)}
-            </text>
-            <text class="axis-label x" x={CHART.left} y={CHART.height - 12}>
-              {formatAxisTime(xBounds.min)}
-            </text>
-            <text class="axis-label x end" x={CHART.width - CHART.right} y={CHART.height - 12}>
-              {formatAxisTime(xBounds.max)}
-            </text>
-            {#if activePoint}
-              {@const activeBestValue = bestSpreadValue(activePoint)}
-              <line
-                class="cursor-line"
-                x1={xScale(activePoint.tsMs, xBounds)}
-                x2={xScale(activePoint.tsMs, xBounds)}
-                y1={CHART.top}
-                y2={CHART.height - CHART.bottom}
-              />
-              {#if displayMode === 'best' && activeBestValue !== null}
-                <rect
-                  class="point best"
-                  x={xScale(activePoint.tsMs, xBounds) - 5}
-                  y={yScale(activeBestValue, yBounds) - 5}
-                  width="10"
-                  height="10"
-                />
-              {:else}
-                {#if showAToB && activePoint.aToBBp !== null}
-                  <rect
-                    class="point a"
-                    x={xScale(activePoint.tsMs, xBounds) - 5}
-                    y={yScale(activePoint.aToBBp, yBounds) - 5}
-                    width="10"
-                    height="10"
-                  />
-                {/if}
-                {#if showBToA && activePoint.bToABp !== null}
-                  <rect
-                    class="point b"
-                    x={xScale(activePoint.tsMs, xBounds) - 5}
-                    y={yScale(activePoint.bToABp, yBounds) - 5}
-                    width="10"
-                    height="10"
-                  />
-                {/if}
-              {/if}
-            {/if}
-          </svg>
+          <SpreadLightweightChart
+            {points}
+            {displayMode}
+            {showAToB}
+            {showBToA}
+            {averageLines}
+            {selectedIndex}
+            labelA={selectedLabel(selectedA)}
+            labelB={selectedLabel(selectedB)}
+            on:hover={(event) => (hoverIndex = event.detail.index)}
+            on:select={(event) => (selectedIndex = event.detail.index)}
+            on:navigate={(event) => handleChartNavigation(event.detail.key)}
+          />
         {/if}
 
         <p class="chart-caption">
@@ -2639,8 +2385,7 @@
 
   select:focus-visible,
   input:focus-visible,
-  button:focus-visible,
-  .spread-chart:focus-visible {
+  button:focus-visible {
     border-color: var(--primary);
     outline-color: rgba(48, 214, 151, 0.45);
   }
@@ -2859,8 +2604,8 @@
     padding: 0 8px;
     color: var(--muted-foreground);
     background: var(--card);
-    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
     font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
   }
 
   .percent-input.disabled {
@@ -2874,7 +2619,7 @@
     padding: 0;
     color: var(--foreground);
     background: transparent;
-    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+    font-variant-numeric: tabular-nums;
     text-align: right;
   }
 
@@ -2945,113 +2690,6 @@
     border-radius: var(--radius);
     color: var(--muted-foreground);
     text-align: center;
-  }
-
-  .spread-chart {
-    display: block;
-    width: 100%;
-    height: min(44vh, 430px);
-    min-height: 320px;
-    cursor: crosshair;
-    touch-action: none;
-  }
-
-  .plot-bg {
-    fill: #0c0f14;
-  }
-
-  .grid-line {
-    stroke: rgba(255, 255, 255, 0.08);
-    stroke-width: 1;
-  }
-
-  .grid-line.vertical {
-    stroke-dasharray: 2 10;
-  }
-
-  .zero-line {
-    stroke: rgba(255, 255, 255, 0.32);
-    stroke-dasharray: 8 8;
-    stroke-width: 1.1;
-  }
-
-  .average-line {
-    stroke: rgba(233, 235, 239, 0.58);
-    stroke-dasharray: 4 7;
-    stroke-width: 1.2;
-  }
-
-  .average-line.a {
-    stroke: var(--primary);
-  }
-
-  .average-line.b {
-    stroke: var(--warning);
-  }
-
-  .average-label {
-    fill: var(--foreground);
-    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
-    font-size: 12px;
-    font-weight: 650;
-    paint-order: stroke;
-    stroke: var(--background);
-    stroke-linejoin: round;
-    stroke-width: 4px;
-    text-anchor: end;
-  }
-
-  .average-label.a {
-    fill: var(--primary);
-  }
-
-  .average-label.b {
-    fill: var(--warning);
-  }
-
-  .spread-line {
-    fill: none;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-    stroke-width: 2.3;
-  }
-
-  .spread-line.best,
-  .spread-line.a {
-    stroke: var(--primary);
-  }
-
-  .spread-line.b {
-    stroke: var(--warning);
-  }
-
-  .cursor-line {
-    stroke: rgba(233, 235, 239, 0.8);
-    stroke-width: 1;
-  }
-
-  .point {
-    stroke: var(--background);
-    stroke-width: 2;
-  }
-
-  .point.best,
-  .point.a {
-    fill: var(--primary);
-  }
-
-  .point.b {
-    fill: var(--warning);
-  }
-
-  .axis-label {
-    fill: var(--muted-foreground);
-    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
-    font-size: 12px;
-  }
-
-  .axis-label.x.end {
-    text-anchor: end;
   }
 
   .tape-grid {
@@ -3372,11 +3010,6 @@
       grid-template-columns: 1fr;
     }
 
-    .spread-chart {
-      min-height: 280px;
-      height: 340px;
-    }
-
     .tape-grid {
       grid-template-columns: 1fr;
     }
@@ -3402,6 +3035,644 @@
       min-width: 0;
       justify-self: start;
       text-align: left;
+    }
+  }
+
+  /* Decision cockpit: flat hierarchy, directional color, chart-first density. */
+  :global(body) {
+    --background: #07101a;
+    --foreground: #dce5ef;
+    --card: #0b1521;
+    --sidebar: #08121d;
+    --muted: #0f1c2a;
+    --muted-foreground: #74849a;
+    --border: #1b2a3c;
+    --input: #26374b;
+    --primary: #29d9c2;
+    --primary-foreground: #031714;
+    --profit: #4bd19b;
+    --negative: #e26d6a;
+    --warning: #f0a94b;
+    --radius: 3px;
+    letter-spacing: 0.002em;
+  }
+
+  .desk-shell {
+    background: #07101a;
+  }
+
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    min-height: 52px;
+    padding: 8px 14px;
+    background: rgba(7, 16, 26, 0.96);
+  }
+
+  .brand-lockup strong {
+    color: #f3f7fb;
+    font-size: 0.78rem;
+    font-weight: 760;
+    letter-spacing: 0.13em;
+  }
+
+  .brand-lockup span {
+    font-size: 0.68rem;
+  }
+
+  .topbar-meta {
+    gap: 12px;
+    font-size: 0.7rem;
+  }
+
+  .topbar-meta > span {
+    white-space: nowrap;
+  }
+
+  .topbar-meta > span + span {
+    position: relative;
+    padding-left: 13px;
+  }
+
+  .topbar-meta > span + span::before {
+    position: absolute;
+    top: 50%;
+    left: 0;
+    width: 2px;
+    height: 2px;
+    background: #435268;
+    content: "";
+  }
+
+  .route-badge {
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    color: var(--primary);
+    background: transparent;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.04em;
+  }
+
+  .topbar-meta button {
+    min-height: 30px;
+    border-color: #30445b;
+    background: #0c1825;
+    font-size: 0.72rem;
+  }
+
+  .desk-layout {
+    align-items: start;
+  }
+
+  .market-sidebar,
+  .stats-sidebar {
+    background: #08121d;
+  }
+
+  .market-sidebar {
+    max-height: calc(100dvh - 52px);
+    overflow-y: auto;
+    scrollbar-color: #293c52 transparent;
+    scrollbar-width: thin;
+  }
+
+  .main-panel {
+    background: #07101a;
+  }
+
+  .sidebar-block,
+  .sidebar-details,
+  .stats-card,
+  .point-card,
+  .meta-card {
+    padding: 13px 14px;
+  }
+
+  .sidebar-heading,
+  .section-heading,
+  .stats-heading {
+    margin-bottom: 10px;
+    font-size: 0.68rem;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+
+  .sidebar-heading strong,
+  .section-heading strong,
+  .stats-heading strong {
+    font-size: 0.7rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .mode-switch,
+  .segmented,
+  .series-pills,
+  .percent-presets {
+    border-radius: 2px;
+    background: #0a1623;
+  }
+
+  .mode-switch button.active,
+  .segmented button.active,
+  .series-pills button.active,
+  .percent-presets button.active {
+    color: #e9fffb;
+    background: #12322f;
+    box-shadow: inset 0 -2px 0 var(--primary);
+  }
+
+  .market-list,
+  .exchange-market-list {
+    gap: 0;
+  }
+
+  .market-list button,
+  .exchange-market-list button {
+    min-height: 62px;
+    border-top: 1px solid transparent;
+    border-right: 0;
+    border-bottom: 1px solid #142336;
+    border-left-width: 2px;
+    padding: 8px 9px;
+  }
+
+  .market-list button:hover,
+  .market-list button.active,
+  .exchange-market-list button:hover,
+  .exchange-market-list button.active {
+    border-top-color: transparent;
+    border-right-color: transparent;
+    border-bottom-color: #21344a;
+    border-left-color: var(--primary);
+    background: #0d1b29;
+  }
+
+  .market-main strong {
+    font-size: 0.87rem;
+  }
+
+  .market-main em,
+  .market-meta {
+    font-size: 0.68rem;
+  }
+
+  .sidebar-details summary {
+    padding: 12px 0;
+    font-size: 0.8rem;
+  }
+
+  .selected-legs div,
+  .leg-choice-list article {
+    border-radius: 2px;
+    background: #0a1623;
+  }
+
+  .selected-legs div:first-child,
+  .leg-choice-list article.a-selected {
+    border-left-color: var(--primary);
+  }
+
+  .selected-legs div:last-child,
+  .leg-choice-list article.b-selected {
+    border-left-color: var(--warning);
+  }
+
+  select,
+  input,
+  button {
+    border-radius: 2px;
+    background: #0b1724;
+  }
+
+  button:hover:not(:disabled),
+  button.active {
+    border-color: #2e5c5a;
+    background: #102522;
+  }
+
+  .primary-button {
+    color: var(--primary-foreground);
+    border-color: var(--primary);
+    background: var(--primary);
+  }
+
+  .pair-header {
+    padding: 20px 18px 15px;
+    background: #08121d;
+  }
+
+  h1 {
+    color: #f0f5fa;
+    font-size: clamp(1.8rem, 3vw, 3.15rem);
+    font-weight: 690;
+    letter-spacing: -0.03em;
+  }
+
+  h1 span {
+    color: #718197;
+    font-weight: 520;
+  }
+
+  .pair-header p {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin-top: 9px;
+    font-size: 0.78rem;
+  }
+
+  .versus {
+    margin-inline: 3px;
+    color: #52657c;
+  }
+
+  .leg-dot {
+    display: inline-block;
+    width: 9px;
+    height: 2px;
+    border-radius: 0;
+    background: var(--primary);
+  }
+
+  .leg-dot.b {
+    background: var(--warning);
+  }
+
+  .latest-card {
+    min-width: 176px;
+    border: 0;
+    border-left: 1px solid #26374b;
+    border-radius: 0;
+    padding: 4px 0 4px 16px;
+    background: transparent;
+    text-align: right;
+  }
+
+  .latest-card strong {
+    font-size: 1.32rem;
+  }
+
+  .route-ribbon {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(132px, auto);
+    align-items: center;
+    gap: 18px;
+    min-height: 58px;
+    border-bottom: 1px solid #1b2a3c;
+    border-left: 3px solid #52657c;
+    padding: 9px 16px 9px 15px;
+    background: #0b1724;
+  }
+
+  .route-ribbon.positive {
+    border-left-color: var(--profit);
+  }
+
+  .route-ribbon.negative {
+    border-left-color: var(--negative);
+  }
+
+  .route-ribbon div {
+    display: grid;
+    min-width: 0;
+    gap: 3px;
+  }
+
+  .route-ribbon span,
+  .route-ribbon small {
+    color: #718197;
+    font-size: 0.67rem;
+    letter-spacing: 0.04em;
+  }
+
+  .route-ribbon strong {
+    overflow: hidden;
+    color: #e6edf5;
+    font-size: 0.82rem;
+    font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .route-ribbon output {
+    color: #dfe9f3;
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+    font-size: 1.05rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .route-ribbon.positive output {
+    color: var(--profit);
+  }
+
+  .route-ribbon.negative output {
+    color: var(--negative);
+  }
+
+  .route-ribbon small {
+    text-align: right;
+  }
+
+  .control-strip,
+  .chart-options,
+  .custom-range {
+    padding: 9px 14px;
+    background: #08131f;
+  }
+
+  .chart-options {
+    min-height: 46px;
+    background: #091622;
+  }
+
+  .toolbar-label {
+    font-size: 0.65rem;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+
+  .segmented button,
+  .series-pills button {
+    min-height: 31px;
+    padding-inline: 10px;
+    font-size: 0.74rem;
+  }
+
+  .chart-shell {
+    gap: 8px;
+    padding: 11px 10px 10px;
+    background: #0a111b;
+  }
+
+  .chart-heading {
+    padding: 0 6px 2px;
+    font-size: 0.68rem;
+  }
+
+  .chart-help,
+  .chart-caption {
+    padding-inline: 6px;
+    font-size: 0.7rem;
+  }
+
+  .chart-help {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .chart-caption {
+    color: #67778c;
+    line-height: 1.5;
+  }
+
+  .empty-state {
+    min-height: 410px;
+    border-style: solid;
+    background: #0a111b;
+  }
+
+  .tape-panel,
+  .venue-panel {
+    padding: 13px 14px 15px;
+    background: #08121d;
+  }
+
+  .tape-grid {
+    border-radius: 2px;
+  }
+
+  .tape-grid button {
+    min-height: 76px;
+    background: #0a1623;
+  }
+
+  .tape-grid button.active {
+    border-bottom: 2px solid var(--primary);
+    background: #102421;
+  }
+
+  .venue-grid {
+    gap: 1px;
+    background: #1b2a3c;
+  }
+
+  .venue-grid article {
+    border: 0;
+    border-left: 2px solid transparent;
+    border-radius: 0;
+    background: #0a1623;
+  }
+
+  .venue-role {
+    justify-content: flex-start;
+  }
+
+  .venue-role span,
+  .venue-grid article.selected .venue-role span {
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    color: #6d8198;
+    background: transparent;
+    font-size: 0.67rem;
+  }
+
+  .venue-grid article.selected .venue-role span {
+    color: var(--primary);
+  }
+
+  .stats-sidebar {
+    font-size: 0.8rem;
+  }
+
+  .stats-card,
+  .point-card,
+  .meta-card {
+    background: #08121d;
+  }
+
+  .stat-list div,
+  .point-ledger div,
+  .meta-row {
+    border-top-color: #172638;
+    padding-block: 7px;
+  }
+
+  .stat-list dd {
+    font-size: 0.88rem;
+  }
+
+  .point-ledger dd {
+    color: #cad6e2;
+    font-size: 0.75rem;
+  }
+
+  .positive {
+    color: var(--profit) !important;
+  }
+
+  @media (min-width: 1200px) {
+    .desk-layout {
+      display: grid;
+      grid-template-columns: 17rem minmax(42rem, 1fr) 18rem;
+    }
+
+    .market-sidebar,
+    .stats-sidebar {
+      position: sticky;
+      top: 52px;
+      max-height: calc(100dvh - 52px);
+      overflow-y: auto;
+    }
+
+    .market-sidebar {
+      width: auto;
+      border-right: 1px solid var(--border);
+    }
+
+    .stats-sidebar {
+      width: auto;
+      border-top: 0;
+      border-left: 1px solid var(--border);
+    }
+  }
+
+  @media (min-width: 820px) and (max-width: 1199px) {
+    .desk-layout {
+      display: grid;
+      grid-template-columns: 16rem minmax(0, 1fr);
+    }
+
+    .market-sidebar {
+      position: sticky;
+      top: 52px;
+      width: auto;
+      max-height: calc(100dvh - 52px);
+      border-right: 1px solid var(--border);
+      border-bottom: 0;
+      overflow-y: auto;
+    }
+
+    .stats-sidebar {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: 0.85fr 1.4fr 0.75fr;
+      width: auto;
+      max-width: none;
+      border-top: 1px solid var(--border);
+      border-left: 0;
+    }
+
+    .stats-sidebar > section {
+      border-right: 1px solid var(--border);
+    }
+  }
+
+  @media (max-width: 819px) {
+    .market-sidebar {
+      max-height: none;
+      overflow: visible;
+    }
+
+    .main-panel {
+      width: 100%;
+      max-width: 100vw;
+      overflow-x: clip;
+    }
+
+    .topbar {
+      position: relative;
+    }
+
+    .pair-header > div,
+    .latest-card,
+    .query-toolbar,
+    .chart-options,
+    .toolbar-cluster,
+    .segmented,
+    .series-pills,
+    .average-control {
+      min-width: 0;
+      max-width: 100%;
+    }
+
+    .latest-card {
+      width: 100%;
+    }
+
+    .preset-tabs {
+      display: flex;
+      width: 100%;
+      overflow-x: auto;
+    }
+
+    .preset-tabs button {
+      flex: 0 0 auto;
+      min-width: 54px;
+    }
+
+    .display-mode,
+    .series-pills {
+      grid-auto-flow: row;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .display-mode button,
+    .series-pills button {
+      min-width: 0;
+    }
+
+    .average-control > .segmented {
+      grid-auto-flow: row;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .route-ribbon {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .route-ribbon small {
+      grid-column: 1 / -1;
+      text-align: left;
+    }
+  }
+
+  @media (max-width: 560px) {
+    .pair-header {
+      padding-inline: 13px;
+    }
+
+    .route-ribbon {
+      gap: 10px;
+      padding-inline: 11px;
+    }
+
+    .route-ribbon output {
+      font-size: 0.92rem;
+    }
+
+    .chart-heading {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 9px;
+    }
+
+    .tape-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      overflow-x: auto;
+    }
+
+    .tape-grid button {
+      min-width: 118px;
+      border-right: 1px solid var(--border);
+      border-bottom: 0;
     }
   }
 
