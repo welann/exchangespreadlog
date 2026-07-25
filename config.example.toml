@@ -8,7 +8,7 @@ stale_after_ms = 5000
 enabled = false
 daily_at_utc = "00:05"
 generator_script = "scripts/generate_config_from_lighter.py"
-market_limit = 20
+market_limit = 0
 
 [storage]
 mode = "clickhouse"

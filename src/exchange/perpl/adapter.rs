@@ -114,7 +114,7 @@ impl PerplAdapter {
 
         info!(
             venue = %self.venue_instance_id,
-            instruments = ?catalog.instruments(),
+            instruments = catalog.instruments().len(),
             "subscribed"
         );
 

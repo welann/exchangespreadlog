@@ -298,7 +298,7 @@ impl Default for SubscriptionRefreshConfig {
             enabled: false,
             daily_at_utc: "00:05".to_string(),
             generator_script: "scripts/generate_config_from_lighter.py".to_string(),
-            market_limit: 20,
+            market_limit: 0,
         }
     }
 }
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(config.mode, "bbo");
         assert!(!config.subscription_refresh.enabled);
         assert_eq!(config.subscription_refresh.daily_at_utc, "00:05");
-        assert_eq!(config.subscription_refresh.market_limit, 20);
+        assert_eq!(config.subscription_refresh.market_limit, 0);
         assert!(config.tui.enabled);
         assert_eq!(config.tui.refresh_ms, 250);
         assert_eq!(config.storage.mode, Some(StorageMode::Jsonl));

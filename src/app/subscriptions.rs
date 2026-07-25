@@ -36,9 +36,6 @@ pub fn validate_subscription_refresh(settings: &SubscriptionRefreshConfig) -> Re
             settings.daily_at_utc
         )
     })?;
-    if settings.market_limit == 0 {
-        bail!("subscription_refresh.market_limit must be positive");
-    }
     if settings.generator_script.trim().is_empty() {
         bail!("subscription_refresh.generator_script must not be empty");
     }
@@ -241,6 +238,13 @@ impl SubscriptionPlan {
     pub fn venues(&self) -> impl Iterator<Item = &VenueConfig> {
         self.venues.values()
     }
+
+    pub fn catalogs(&self) -> Vec<InstrumentCatalog> {
+        self.venues
+            .values()
+            .flat_map(VenueConfig::catalog)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -341,5 +345,39 @@ mod tests {
             86_399
         );
         assert!(super::next_refresh_delay(before, "25:00").is_err());
+    }
+
+    #[test]
+    fn zero_market_limit_selects_all_lighter_markets() {
+        let settings = Config::default().subscription_refresh;
+
+        assert_eq!(settings.market_limit, 0);
+        super::validate_subscription_refresh(&settings).unwrap();
+    }
+
+    #[test]
+    fn startup_catalog_contains_only_enabled_venues() {
+        let mut config = Config::default();
+        let disabled_instruments = config.venues[0].instruments.len();
+        config.venues[0].enabled = false;
+        let plan = SubscriptionPlan::from_venues(&config.venues).unwrap();
+
+        let catalogs = plan.catalogs();
+
+        assert_eq!(
+            catalogs.len(),
+            config
+                .venues
+                .iter()
+                .skip(1)
+                .map(|venue| venue.instruments.len())
+                .sum::<usize>()
+        );
+        assert!(disabled_instruments > 0);
+        assert!(
+            catalogs
+                .iter()
+                .all(|instrument| instrument.venue_instance_id != "hyperliquid")
+        );
     }
 }

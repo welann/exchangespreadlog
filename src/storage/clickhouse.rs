@@ -1,11 +1,11 @@
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     config::ClickHouseConfig,
@@ -259,6 +259,27 @@ TTL toDateTime(recv_time, 'UTC') + INTERVAL 31 DAY DELETE"#
 
 #[async_trait]
 impl BboSink for ClickHouseSink {
+    async fn reconcile_catalog(
+        &self,
+        managed_venue_ids: &[String],
+        current_catalog: &[InstrumentCatalog],
+    ) -> anyhow::Result<()> {
+        let Some(sql) = build_catalog_reconciliation_sql(
+            &self.catalog_table,
+            managed_venue_ids,
+            current_catalog,
+        ) else {
+            return Ok(());
+        };
+        self.execute_sql(sql).await?;
+        info!(
+            managed_venues = managed_venue_ids.len(),
+            current_instruments = current_catalog.len(),
+            "reconciled ClickHouse instrument catalog with startup subscription plan"
+        );
+        Ok(())
+    }
+
     async fn write_catalog(&self, catalog: &InstrumentCatalog) -> anyhow::Result<()> {
         self.insert_catalog_row(&CatalogClickHouseRow::from_catalog(catalog))
             .await
@@ -497,6 +518,123 @@ fn quote_identifier(value: &str) -> String {
     format!("`{value}`")
 }
 
+fn quote_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn build_catalog_reconciliation_sql(
+    catalog_table: &str,
+    managed_venue_ids: &[String],
+    current_catalog: &[InstrumentCatalog],
+) -> Option<String> {
+    let managed_venue_ids = managed_venue_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if managed_venue_ids.is_empty() {
+        return None;
+    }
+
+    let managed_venues = managed_venue_ids
+        .iter()
+        .map(|venue| quote_string(venue))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let current_identities = current_catalog
+        .iter()
+        .filter(|instrument| managed_venue_ids.contains(instrument.venue_instance_id.as_str()))
+        .map(|instrument| {
+            (
+                instrument.venue_instance_id.as_str(),
+                instrument.instrument_id.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let current_filter = if current_identities.is_empty() {
+        String::new()
+    } else {
+        let identities = current_identities
+            .iter()
+            .map(|(venue, instrument)| {
+                format!("({}, {})", quote_string(venue), quote_string(instrument))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("\n  AND (venue_instance_id, instrument_id) NOT IN ({identities})")
+    };
+    let table = quote_identifier(catalog_table);
+
+    Some(format!(
+        r#"INSERT INTO {table}
+(
+    catalog_id,
+    venue_instance_id,
+    instrument_id,
+    raw_symbol,
+    feed_symbol,
+    product_type,
+    base_asset,
+    quote_asset,
+    settle_asset,
+    margin_asset,
+    price_convention,
+    size_unit,
+    price_tick,
+    size_tick,
+    min_size,
+    status,
+    source_raw_json,
+    inserted_time
+)
+SELECT
+    concat(
+        'retired:',
+        hex(MD5(concat(venue_instance_id, ':', instrument_id, ':', toString(now64(9)))))
+    ) AS catalog_id,
+    venue_instance_id,
+    instrument_id,
+    raw_symbol,
+    feed_symbol,
+    product_type,
+    base_asset,
+    quote_asset,
+    settle_asset,
+    margin_asset,
+    price_convention,
+    size_unit,
+    price_tick,
+    size_tick,
+    min_size,
+    'inactive' AS status,
+    source_raw_json,
+    now64(9) AS inserted_time
+FROM
+(
+    SELECT
+        venue_instance_id,
+        instrument_id,
+        argMax(raw_symbol, inserted_time) AS raw_symbol,
+        argMax(feed_symbol, inserted_time) AS feed_symbol,
+        argMax(product_type, inserted_time) AS product_type,
+        argMax(base_asset, inserted_time) AS base_asset,
+        argMax(quote_asset, inserted_time) AS quote_asset,
+        argMax(settle_asset, inserted_time) AS settle_asset,
+        argMax(margin_asset, inserted_time) AS margin_asset,
+        argMax(price_convention, inserted_time) AS price_convention,
+        argMax(size_unit, inserted_time) AS size_unit,
+        argMax(price_tick, inserted_time) AS price_tick,
+        argMax(size_tick, inserted_time) AS size_tick,
+        argMax(min_size, inserted_time) AS min_size,
+        argMax(status, inserted_time) AS status,
+        argMax(source_raw_json, inserted_time) AS source_raw_json
+    FROM {table}
+    WHERE venue_instance_id IN ({managed_venues})
+    GROUP BY venue_instance_id, instrument_id
+)
+WHERE status = 'active'{current_filter}"#
+    ))
+}
+
 fn clickhouse_status_error(status: StatusCode, body: &str) -> anyhow::Error {
     let body = body.trim();
     let body = if body.chars().count() > 512 {
@@ -513,7 +651,10 @@ mod tests {
 
     use crate::domain::{BboTick, BestLevel, Fixed, InstrumentCatalog, ProductType, SourceKind};
 
-    use super::{BboClickHouseRow, CatalogClickHouseRow, validate_identifier};
+    use super::{
+        BboClickHouseRow, CatalogClickHouseRow, build_catalog_reconciliation_sql,
+        validate_identifier,
+    };
 
     fn catalog() -> InstrumentCatalog {
         InstrumentCatalog::new(
@@ -588,5 +729,34 @@ mod tests {
         assert!(validate_identifier("table", "bbo_ticks").is_ok());
         assert!(validate_identifier("table", "bbo-ticks").is_err());
         assert!(validate_identifier("table", "bbo_ticks; DROP TABLE x").is_err());
+    }
+
+    #[test]
+    fn startup_catalog_reconciliation_retires_only_missing_managed_instruments() {
+        let current = catalog();
+        let sql = build_catalog_reconciliation_sql(
+            "instrument_catalog",
+            &[
+                "hyperliquid".to_string(),
+                "lighter".to_string(),
+                "hyperliquid".to_string(),
+            ],
+            &[current],
+        )
+        .unwrap();
+
+        assert!(sql.starts_with("INSERT INTO `instrument_catalog`"));
+        assert!(sql.contains("WHERE venue_instance_id IN ('hyperliquid', 'lighter')"));
+        assert!(sql.contains("(venue_instance_id, instrument_id) NOT IN (('hyperliquid', 'BTC'))"));
+        assert!(sql.contains("'inactive' AS status"));
+    }
+
+    #[test]
+    fn startup_catalog_reconciliation_can_retire_every_instrument_for_a_disabled_venue() {
+        let sql = build_catalog_reconciliation_sql("instrument_catalog", &["01".to_string()], &[])
+            .unwrap();
+
+        assert!(sql.contains("WHERE venue_instance_id IN ('01')"));
+        assert!(!sql.contains("NOT IN"));
     }
 }

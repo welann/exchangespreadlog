@@ -35,6 +35,7 @@
     catalogA?: string;
     catalogB?: string;
     preset?: string;
+    intervalSeconds?: number;
     fromMs?: number;
     toMs?: number;
   };
@@ -101,6 +102,7 @@
   let selectedVenueA = '';
   let selectedVenueB = '';
   let selectedPreset = '24h';
+  let chartIntervalSeconds = '';
   let customStart = toDateInput(Date.now() - 60 * 60 * 1000);
   let customEnd = toDateInput(Date.now());
   let rangeAnchorMs = Date.now();
@@ -548,10 +550,21 @@
   }
 
   function spreadQueryOptions(range: { fromMs: number; toMs: number }) {
+    const intervalSeconds = parseChartInterval(chartIntervalSeconds);
+    if (intervalSeconds !== null) {
+      return { precision: 'bucket', bucketSeconds: intervalSeconds };
+    }
     if (range.toMs - range.fromMs <= 60 * 60 * 1000) {
       return { precision: 'bucket', bucketSeconds: 15 };
     }
     return { precision: 'bucket' };
+  }
+
+  function parseChartInterval(value: string): number | null {
+    if (value.trim() === '') return null;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return null;
+    return clamp(Math.trunc(parsed), 1, 3600);
   }
 
   function currentRange(presetValue: string, start: string, end: string, anchorMs: number) {
@@ -574,6 +587,7 @@
       catalogA: selectedA,
       catalogB: selectedB,
       preset: selectedPreset,
+      intervalSeconds: parseChartInterval(chartIntervalSeconds) ?? undefined,
       fromMs: range.fromMs,
       toMs: range.toMs
     };
@@ -610,6 +624,9 @@
     selectedPreset = presets.some((preset) => preset.value === state?.preset)
       ? (state?.preset ?? selectedPreset)
       : selectedPreset;
+    if (state?.intervalSeconds !== undefined) {
+      chartIntervalSeconds = String(state.intervalSeconds);
+    }
 
     if (
       selectedPreset === 'custom' &&
@@ -638,6 +655,7 @@
     const catalogA = params.get('a');
     const catalogB = params.get('b');
     const preset = params.get('preset');
+    const interval = params.get('interval');
     const fromMs = Number(params.get('from'));
     const toMs = Number(params.get('to'));
 
@@ -645,6 +663,10 @@
     if (catalogA) state.catalogA = catalogA;
     if (catalogB) state.catalogB = catalogB;
     if (preset) state.preset = preset;
+    if (interval) {
+      const intervalSeconds = parseChartInterval(interval);
+      if (intervalSeconds !== null) state.intervalSeconds = intervalSeconds;
+    }
     if (Number.isFinite(fromMs)) state.fromMs = fromMs;
     if (Number.isFinite(toMs)) state.toMs = toMs;
 
@@ -659,6 +681,8 @@
     if (selectedA) params.set('a', selectedA);
     if (selectedB) params.set('b', selectedB);
     params.set('preset', selectedPreset);
+    const intervalSeconds = parseChartInterval(chartIntervalSeconds);
+    if (intervalSeconds !== null) params.set('interval', String(intervalSeconds));
     params.set('from', String(Math.trunc(range.fromMs)));
     params.set('to', String(Math.trunc(range.toMs)));
     replaceState(`${window.location.pathname}?${params.toString()}${window.location.hash}`, {});
@@ -680,6 +704,14 @@
     if (value !== 'custom' && selectedA && selectedB && selectedA !== selectedB) {
       await loadSpread({ slideWindow: true });
     }
+  }
+
+  async function handleChartIntervalAndQuery(value: string) {
+    const intervalSeconds = parseChartInterval(value);
+    chartIntervalSeconds = intervalSeconds === null ? '' : String(intervalSeconds);
+    selectedIndex = -1;
+    hoverIndex = -1;
+    await loadSpreadWhenReady({ slideWindow: true });
   }
 
   function selectValue(event: Event) {
@@ -1555,6 +1587,32 @@
             {/each}
           </div>
         </div>
+
+        <label class="toolbar-cluster interval-cluster">
+          <span class="toolbar-label">Interval</span>
+          <input
+            list="chart-interval-options"
+            name="chart-interval"
+            aria-label="Chart interval in seconds"
+            type="number"
+            min="1"
+            max="3600"
+            step="1"
+            value={chartIntervalSeconds}
+            placeholder="Auto"
+            on:change={(event) => void handleChartIntervalAndQuery(inputValue(event))}
+          />
+          <span class="interval-unit">s</span>
+          <datalist id="chart-interval-options">
+            <option value="1"></option>
+            <option value="5"></option>
+            <option value="15"></option>
+            <option value="60"></option>
+            <option value="300"></option>
+            <option value="900"></option>
+            <option value="3600"></option>
+          </datalist>
+        </label>
 
         <div class="toolbar-cluster mode-cluster">
           <span class="toolbar-label">视图</span>
@@ -2510,7 +2568,7 @@
 
   .query-toolbar {
     display: grid;
-    grid-template-columns: minmax(320px, 1fr) auto auto;
+    grid-template-columns: minmax(320px, 1fr) auto auto auto;
   }
 
   .toolbar-cluster {
@@ -2539,6 +2597,22 @@
 
   .mode-cluster {
     justify-content: flex-end;
+  }
+
+  .interval-cluster {
+    gap: 5px;
+  }
+
+  .interval-cluster input {
+    width: 76px;
+    min-height: 34px;
+    padding: 6px 8px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .interval-unit {
+    color: var(--muted-foreground);
+    font-size: 0.72rem;
   }
 
   .query-toolbar .primary-button {

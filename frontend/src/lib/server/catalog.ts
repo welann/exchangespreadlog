@@ -1,4 +1,5 @@
 import type { Instrument, Market } from '$lib/types';
+import { validBookWhere } from './book-filter';
 import { catalogTable, queryClickHouse, quoteString, tickTable } from './clickhouse';
 import { assertSupportedTickSchema, getTickSchema } from './tick-schema';
 
@@ -210,6 +211,7 @@ function tickStatsSql(schema: Awaited<ReturnType<typeof getTickSchema>>) {
   const joins: string[] = [];
   const latestCandidates: string[] = [];
   const countCandidates: string[] = [];
+  const validBooks = validBookWhere(schema, 'ticks');
 
   if (schema.hasStorageIdentity) {
     joins.push(`
@@ -222,6 +224,7 @@ LEFT JOIN
     count() AS tick_count
   FROM ${tickTable()} AS ticks
   WHERE ticks.venue_instance_id != '' AND ticks.instrument_id != ''
+    AND ${validBooks}
   GROUP BY ticks.venue_instance_id, ticks.instrument_id
 ) AS storage_tick_stats
   ON latest.venue_instance_id = storage_tick_stats.venue_instance_id
@@ -240,6 +243,7 @@ LEFT JOIN
     count() AS tick_count
   FROM ${tickTable()} AS ticks
   WHERE ticks.catalog_id != ''
+    AND ${validBooks}
   GROUP BY ticks.catalog_id
 ) AS catalog_tick_stats ON latest.catalog_id = catalog_tick_stats.catalog_id`);
     latestCandidates.push('catalog_tick_stats.latest_recv_time');
@@ -260,6 +264,7 @@ LEFT JOIN
     count() AS tick_count
   FROM ${tickTable()} AS ticks
   WHERE ${legacyWhere}
+    AND ${validBooks}
   GROUP BY ticks.venue, ticks.market_id
 ) AS legacy_tick_stats
   ON latest.venue_instance_id = legacy_tick_stats.venue_instance_id

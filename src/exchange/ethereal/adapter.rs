@@ -89,7 +89,7 @@ impl EtherealAdapter {
 
         info!(
             venue = %self.venue_instance_id,
-            instruments = ?catalog.instruments(),
+            instruments = catalog.instruments().len(),
             "subscribed"
         );
         let mut books = EtherealBooks::default();

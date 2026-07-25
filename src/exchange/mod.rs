@@ -236,8 +236,36 @@ pub fn merge_configured_catalog(
     let fetched_by_key = catalog_lookup(fetched);
     configured
         .into_iter()
-        .map(|instrument| lookup_catalog(&fetched_by_key, &instrument).unwrap_or(instrument))
+        .map(|instrument| {
+            lookup_catalog(&fetched_by_key, &instrument)
+                .map(|fetched| enrich_configured_catalog(instrument.clone(), fetched))
+                .unwrap_or(instrument)
+        })
         .collect()
+}
+
+fn enrich_configured_catalog(
+    configured: InstrumentCatalog,
+    fetched: InstrumentCatalog,
+) -> InstrumentCatalog {
+    InstrumentCatalog::new_with_units(
+        configured.venue_instance_id,
+        configured.instrument_id,
+        configured.raw_symbol,
+        configured.feed_symbol,
+        configured.product_type,
+        configured.base_asset,
+        configured.quote_asset,
+        configured.settle_asset,
+        configured.margin_asset,
+        configured.price_convention,
+        configured.size_unit,
+        fetched.price_tick.or(configured.price_tick),
+        fetched.size_tick.or(configured.size_tick),
+        fetched.min_size.or(configured.min_size),
+        fetched.status,
+        fetched.source_raw_json.or(configured.source_raw_json),
+    )
 }
 
 pub fn decimal_tick(decimals: u32) -> Option<Fixed> {
@@ -341,6 +369,18 @@ mod tests {
         assert_eq!(merged[0].price_tick, None);
         assert_eq!(merged[1].instrument_id, "2");
         assert_eq!(merged[1].price_tick, decimal_tick(2));
+    }
+
+    #[test]
+    fn merge_configured_catalog_preserves_normalized_asset_identity() {
+        let mut configured = catalog("96", "EURUSD", "96", None);
+        configured.base_asset = "EUR".to_string();
+        let fetched = vec![catalog("96", "EURUSD", "96", Some("0.00001"))];
+
+        let merged = merge_configured_catalog(vec![configured], fetched);
+
+        assert_eq!(merged[0].base_asset, "EUR");
+        assert_eq!(merged[0].price_tick, decimal_tick(5));
     }
 
     #[test]

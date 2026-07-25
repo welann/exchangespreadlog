@@ -89,7 +89,7 @@ impl HyperliquidAdapter {
 
         info!(
             venue = %self.venue_instance_id,
-            instruments = ?catalog.instruments(),
+            instruments = catalog.instruments().len(),
             "subscribed"
         );
         let mut heartbeat = time::interval(Duration::from_secs(30));

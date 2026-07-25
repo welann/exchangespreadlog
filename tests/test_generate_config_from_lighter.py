@@ -28,7 +28,7 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertEqual(generator.normalize_base(raw), expected)
 
-    def test_fetch_top_lighter_markets_sorts_active_perps_by_quote_volume(self):
+    def test_fetch_lighter_markets_honors_a_positive_volume_limit(self):
         original = generator.fetch_lighter_details
         generator.fetch_lighter_details = lambda: [
             {
@@ -68,7 +68,7 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
             },
         ]
         try:
-            top = generator.fetch_top_lighter_markets(2)
+            top = generator.fetch_lighter_markets(2)
         finally:
             generator.fetch_lighter_details = original
 
@@ -76,12 +76,54 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
         self.assertEqual(top[0].market_id, "1")
         self.assertEqual(top[0].volume, Decimal("100"))
 
-    def test_fetch_top_lighter_markets_rejects_an_empty_market_set(self):
+    def test_fetch_lighter_markets_selects_all_active_perps_when_unlimited(self):
+        original = generator.fetch_lighter_details
+        generator.fetch_lighter_details = lambda: [
+            {
+                "symbol": "ETH",
+                "market_id": 0,
+                "market_type": "perp",
+                "status": "active",
+                "daily_quote_token_volume": "50",
+            },
+            {
+                "symbol": "BTC",
+                "market_id": 1,
+                "market_type": "perp",
+                "status": "active",
+                "daily_quote_token_volume": "100",
+            },
+            {
+                "symbol": "HOOD",
+                "market_id": 92,
+                "market_type": "perp",
+                "status": "active",
+                "daily_quote_token_volume": "1",
+            },
+            {
+                "symbol": "EWY",
+                "market_id": 93,
+                "market_type": "perp",
+                "status": "active",
+                "daily_quote_token_volume": "0",
+            },
+        ]
+        try:
+            selected = generator.fetch_lighter_markets(0)
+        finally:
+            generator.fetch_lighter_details = original
+
+        self.assertEqual(
+            [market.base_asset for market in selected],
+            ["BTC", "ETH", "HOOD", "EWY"],
+        )
+
+    def test_fetch_lighter_markets_rejects_an_empty_market_set(self):
         original = generator.fetch_lighter_details
         generator.fetch_lighter_details = lambda: []
         try:
             with self.assertRaisesRegex(RuntimeError, "no active Lighter perp markets"):
-                generator.fetch_top_lighter_markets(20)
+                generator.fetch_lighter_markets()
         finally:
             generator.fetch_lighter_details = original
 
@@ -155,6 +197,28 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
         self.assertIn('instrument_id = "1"', rendered)
         self.assertIn('feed_symbol = "1"', rendered)
         self.assertIn("# BTC:1:100", rendered)
+
+    def test_render_config_keeps_empty_venues_disabled_for_catalog_reconciliation(self):
+        rendered = generator.render_config(
+            [generator.LighterMarket("1", "BTC", "BTC", Decimal("100"))],
+            [
+                generator.Venue(
+                    venue_instance_id="empty",
+                    adapter="empty",
+                    url="wss://example.invalid",
+                    channel="bbo",
+                    catalog_source="config",
+                    metadata_url=None,
+                    default_quote_asset="USD",
+                    default_settle_asset="USD",
+                    default_margin_asset="USD",
+                    instruments=[],
+                )
+            ],
+        )
+
+        self.assertIn('venue_instance_id = "empty"', rendered)
+        self.assertIn("enabled = false", rendered)
 
     def test_fetch_ethereal_instruments_accepts_data_payload(self):
         original = generator.get_json

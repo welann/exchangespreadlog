@@ -68,22 +68,24 @@ You can also print the built-in default config:
 cargo run -- --print-default-config
 ```
 
-Generate a config from Lighter's highest-volume perp markets:
+Generate a config from all active Lighter perp markets:
 
 ```bash
 uv run python scripts/generate_config_from_lighter.py --output config.generated.toml
 cargo run -- --config config.generated.toml
 ```
 
-By default the generator selects the top 20 active Lighter perp markets by `daily_quote_token_volume`. Use `--limit` to change the count:
+By default the generator selects every active Lighter perp market. A positive `--limit` can still be used as an optional capacity cap; capped selections are ordered by `daily_quote_token_volume`:
 
 ```bash
 uv run python scripts/generate_config_from_lighter.py --limit 30 --output config.generated.toml
 ```
 
-The generated config uses Lighter as the ranking source, then queries each supported venue for the exchange-specific subscription key. A market is included for a venue only when the script can match the normalized base asset exactly. For example, Lighter market `BTC` maps to Lighter feed `1`, Hyperliquid feed `BTC`, RiseX feed `1`, 01 feed `BTCUSD`, Ethereal feed `BTCUSD`, and Ondo feed `BTC-USD.P` when those markets exist in the corresponding metadata.
+The generated config uses Lighter's active perp catalog as the source set, then queries each supported venue for the exchange-specific subscription key. A market is included for a venue only when the script can match the normalized base asset exactly. For example, Lighter market `BTC` maps to Lighter feed `1`, Hyperliquid feed `BTC`, RiseX feed `1`, 01 feed `BTCUSD`, Ethereal feed `BTCUSD`, and Ondo feed `BTC-USD.P` when those markets exist in the corresponding metadata.
 
 Generated configs enable automatic subscription refresh at `00:05` UTC every day. At that time the collector runs the same generator, validates the new TOML, compares each venue's subscription plan, and restarts only venues whose settings or instruments changed. Removed markets are cleared from the live TUI state; historical storage is retained. Generation or validation failures leave the current subscriptions running.
+
+On every collector startup, the configured venue set is reconciled with the latest ClickHouse instrument catalog. Previously active instruments that are no longer part of the startup subscription plan are written back as inactive before adapters start. Empty generated venues remain in TOML with `enabled = false`, which keeps their ownership explicit and allows all of their old instruments to be retired without subscribing to an empty feed.
 
 Configure the schedule and market count in the generated TOML:
 
@@ -92,14 +94,16 @@ Configure the schedule and market count in the generated TOML:
 enabled = true
 daily_at_utc = "00:05"
 generator_script = "scripts/generate_config_from_lighter.py"
-market_limit = 20
+market_limit = 0
 ```
 
-`daily_at_utc` uses `HH:MM` in UTC. Set `enabled = false` to disable in-process refresh. The runtime needs `uv`, Python, the generator script, network access, and write access to the active config path. The Docker image includes these dependencies; its entrypoint performs the initial generation before starting the collector, and the collector handles later daily refreshes.
+`market_limit = 0` means all active Lighter perp markets; a positive value applies the optional volume-ranked cap. `daily_at_utc` uses `HH:MM` in UTC. Set `enabled = false` to disable in-process refresh. The runtime needs `uv`, Python, the generator script, network access, and write access to the active config path. The Docker image includes these dependencies; its entrypoint performs the initial generation before starting the collector, and the collector handles later daily refreshes.
 
 `config.example.toml` leaves refresh disabled so running directly against the tracked example cannot overwrite it. Configs produced by the generator enable refresh by default.
 
 For Hyperliquid, the generator reads `allPerpMetas`, so default perp markets and HIP-3 markets are both considered. If a base asset exists in default Hyperliquid perps, that default coin is preferred; otherwise an exact HIP-3 match such as `xyz:SPCX` can be used for Lighter `SPCX`. The script still does not guess UI remaps or aliases, so `XAU` will not be guessed as `GOLD`, and `1000BONK` will not be guessed as `kBONK`.
+
+01 can reject oversized combined-stream WebSockets without publishing a fixed stream limit. The adapter starts with the current catalog, detects the exchange's `too many subscriptions` response, reduces the per-connection batch size, and caches the learned capacity for later reconnects. Larger future catalogs therefore create as many connections as needed without relying on a hard-coded stream count.
 
 Important config sections:
 

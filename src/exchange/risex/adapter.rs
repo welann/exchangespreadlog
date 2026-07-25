@@ -80,7 +80,11 @@ impl RisexAdapter {
             .await
             .context("subscribe RiseX orderbook")?;
 
-        info!(venue = %self.venue_instance_id, instruments = ?self.catalog.instruments(), "subscribed");
+        info!(
+            venue = %self.venue_instance_id,
+            instruments = self.catalog.instruments().len(),
+            "subscribed"
+        );
         let mut books = RisexBooks::default();
         let mut heartbeat = time::interval(Duration::from_secs(15));
 

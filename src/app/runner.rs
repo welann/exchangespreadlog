@@ -57,7 +57,24 @@ impl AppRunner {
             None
         };
 
+        let initial_plan = SubscriptionPlan::from_venues(&self.config.venues)?;
+        let managed_venue_ids = self
+            .config
+            .venues
+            .iter()
+            .map(|venue| venue.venue_instance_id.clone())
+            .collect::<Vec<_>>();
+        let current_catalog = initial_plan.catalogs();
         let sink = self.build_sink().await?;
+        if let Err(error) = sink
+            .reconcile_catalog(&managed_venue_ids, &current_catalog)
+            .await
+        {
+            warn!(
+                %error,
+                "failed to reconcile persisted instrument catalog; monitoring will continue"
+            );
+        }
         let state = new_shared_state(self.config.quote_rate_book());
         let (tx, rx) = mpsc::channel::<MarketEvent>(self.config.pipeline.channel_capacity);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -69,7 +86,7 @@ impl AppRunner {
             state.clone(),
             stale_after_ms,
         ));
-        let mut adapter_manager = AdapterManager::start(&self.config.venues, tx.clone())?;
+        let mut adapter_manager = AdapterManager::start(initial_plan, tx.clone())?;
         let mut tui_handle = None;
         let (tui_done_tx, mut tui_done_rx) = watch::channel(false);
         let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
@@ -201,8 +218,7 @@ struct AdapterTask {
 }
 
 impl AdapterManager {
-    fn start(venues: &[VenueConfig], tx: mpsc::Sender<MarketEvent>) -> anyhow::Result<Self> {
-        let plan = SubscriptionPlan::from_venues(venues)?;
+    fn start(plan: SubscriptionPlan, tx: mpsc::Sender<MarketEvent>) -> anyhow::Result<Self> {
         let prepared = prepare_adapters(plan.venues())?;
         let mut manager = Self {
             tx,

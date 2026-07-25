@@ -37,6 +37,8 @@ The retired `https://obdata.zeabur.app/` endpoint is automatically redirected to
 
 Quote conversion rates are configured in the web page under **Quote conversion**. They are stored in browser localStorage and sent with each spread query, so changing rates does not require restarting the server.
 
+The chart toolbar accepts any sampling **Interval** from 1 to 3600 seconds; leaving it blank uses automatic interval selection for the chosen range. The value is included in the page URL and in the server query/cache key. Market discovery uses the same valid-book predicates as spread queries, so instruments with only incomplete, crossed, stale, gap, or inconsistent ticks are not offered as comparable legs.
+
 For deployment diagnostics, open `/api/health`. It returns the effective ClickHouse URL/database/table, whether a password was provided, row counts, latest tick time, detected tick schema, usable tick rows, and an `apiVersion`. It never returns the password.
 
 The current schema-aware frontend should report:

@@ -1,5 +1,6 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
 import type { QuoteRate, SpreadPoint, SpreadResponse } from '$lib/types';
+import { validBookWhere } from '$lib/server/book-filter';
 import { fetchInstrumentMetadata } from '$lib/server/catalog';
 import { ClickHouseError, numericLiteral, queryClickHouse, tickTable } from '$lib/server/clickhouse';
 import { resolveRates } from '$lib/server/rates';
@@ -420,27 +421,6 @@ function tickRowTuple(alias: string): string {
       ${alias}.ask_order_count,
       ${alias}.mid
     )`;
-}
-
-function validBookWhere(schema: TickSchema, alias: string): string {
-  const prefix = `${alias}.`;
-  const predicates = [
-    `${prefix}bid_price IS NOT NULL`,
-    `${prefix}ask_price IS NOT NULL`,
-    `${prefix}bid_price > 0`,
-    `${prefix}ask_price > 0`,
-    `${prefix}bid_price <= ${prefix}ask_price`,
-    `(${prefix}bid_size IS NULL OR ${prefix}bid_size > 0)`,
-    `(${prefix}ask_size IS NULL OR ${prefix}ask_size > 0)`
-  ];
-  if (schema.hasQualityFlags) {
-    predicates.push(
-      `${prefix}quality_gap = false`,
-      `${prefix}quality_stale = false`,
-      `${prefix}quality_inconsistent = false`
-    );
-  }
-  return predicates.join('\n      AND ');
 }
 
 function validateCatalogId(value: unknown, label: string): string {

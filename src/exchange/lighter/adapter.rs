@@ -86,7 +86,11 @@ impl LighterAdapter {
                 .with_context(|| format!("subscribe Lighter {feed_key}"))?;
         }
 
-        info!(venue = %self.venue_instance_id, instruments = ?catalog.instruments(), "subscribed");
+        info!(
+            venue = %self.venue_instance_id,
+            instruments = catalog.instruments().len(),
+            "subscribed"
+        );
         let mut heartbeat = time::interval(Duration::from_secs(15));
 
         loop {

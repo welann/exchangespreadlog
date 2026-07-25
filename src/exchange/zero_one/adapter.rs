@@ -1,8 +1,15 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, future::try_join_all};
 use tokio::{
     sync::{mpsc::Sender, watch},
     time,
@@ -29,6 +36,7 @@ pub struct ZeroOneAdapter {
     rest_url: String,
     channel: String,
     catalog: CatalogIndex,
+    learned_batch_size: Arc<AtomicUsize>,
 }
 
 impl ZeroOneAdapter {
@@ -46,13 +54,14 @@ impl ZeroOneAdapter {
                 .clone()
                 .unwrap_or_else(|| "deltas".to_string()),
             catalog: CatalogIndex::new(config.catalog()),
+            learned_batch_size: Arc::new(AtomicUsize::new(usize::MAX)),
         }
     }
 
     async fn run_once(
         &self,
         tx: Sender<MarketEvent>,
-        mut shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         for instrument in self.catalog.instruments() {
             tx.send(MarketEvent::Catalog {
@@ -62,20 +71,60 @@ impl ZeroOneAdapter {
             .context("send 01 catalog")?;
         }
 
+        let markets = self.catalog.instruments();
+        if markets.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch_size = self
+            .learned_batch_size
+            .load(Ordering::Relaxed)
+            .min(markets.len())
+            .max(1);
+        loop {
+            let connections = subscription_batches(markets, batch_size).enumerate().map(
+                |(connection_index, markets)| {
+                    self.run_connection(connection_index, markets, tx.clone(), shutdown.clone())
+                },
+            );
+
+            match try_join_all(connections).await {
+                Ok(_) => return Ok(()),
+                Err(error) if is_too_many_subscriptions(&error) && batch_size > 1 => {
+                    let previous_batch_size = batch_size;
+                    batch_size = reduced_batch_size(batch_size);
+                    self.learned_batch_size.store(batch_size, Ordering::Relaxed);
+                    warn!(
+                        venue = %self.venue_instance_id,
+                        previous_batch_size,
+                        batch_size,
+                        "exchange rejected combined streams; retrying with smaller adaptive batches"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn run_connection(
+        &self,
+        connection_index: usize,
+        markets: &[InstrumentCatalog],
+        tx: Sender<MarketEvent>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
         let client = reqwest::Client::new();
         let mut books = ZeroOneBooks::default();
-        let markets_by_symbol = self
-            .catalog
-            .instruments()
+        let markets_by_symbol = markets
             .iter()
             .map(|market| (market.feed_key().to_string(), market.clone()))
             .collect::<HashMap<_, _>>();
 
-        let ws_url = build_ws_url(&self.url, &self.channel, self.catalog.instruments());
+        let ws_url = build_ws_url(&self.url, &self.channel, markets);
         let (stream, _) = ws::connect(&ws_url).await?;
         let (mut write, mut read) = stream.split();
 
-        for market in self.catalog.instruments() {
+        for market in markets {
             let recv_ts_ns = crate::ingest::time::unix_time_ns();
             let tick = self
                 .fetch_snapshot_tick(&client, &mut books, market, recv_ts_ns)
@@ -86,7 +135,13 @@ impl ZeroOneAdapter {
                 .context("send initial 01 tick")?;
         }
 
-        info!(venue = %self.venue_instance_id, instruments = ?self.catalog.instruments(), url = %ws_url, "subscribed");
+        info!(
+            venue = %self.venue_instance_id,
+            connection_index,
+            instruments = markets.len(),
+            url = %ws_url,
+            "subscribed"
+        );
         let mut heartbeat = time::interval(Duration::from_secs(30));
 
         loop {
@@ -231,9 +286,32 @@ fn build_ws_url(base_url: &str, channel: &str, markets: &[InstrumentCatalog]) ->
     format!("{base}/{streams}")
 }
 
+fn subscription_batches(
+    markets: &[InstrumentCatalog],
+    batch_size: usize,
+) -> std::slice::Chunks<'_, InstrumentCatalog> {
+    markets.chunks(batch_size.max(1))
+}
+
+fn reduced_batch_size(current: usize) -> usize {
+    current.div_ceil(2).max(1)
+}
+
+fn is_too_many_subscriptions(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("too many subscriptions")
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_ws_url, derive_rest_url};
+    use super::{
+        build_ws_url, derive_rest_url, is_too_many_subscriptions, reduced_batch_size,
+        subscription_batches,
+    };
     use crate::domain::{InstrumentCatalog, ProductType};
 
     fn instrument(id: &str, feed: &str, base: &str) -> InstrumentCatalog {
@@ -277,5 +355,44 @@ mod tests {
             build_ws_url("wss://zo-mainnet.n1.xyz", "deltas", &markets),
             "wss://zo-mainnet.n1.xyz/ws/deltas@BTCUSD&deltas@ETHUSD"
         );
+    }
+
+    #[test]
+    fn splits_catalogs_using_the_learned_batch_size() {
+        let markets = (0..25)
+            .map(|index| {
+                instrument(
+                    &index.to_string(),
+                    &format!("ASSET{index}USD"),
+                    &format!("ASSET{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let batch_sizes = subscription_batches(&markets, 13)
+            .map(<[_]>::len)
+            .collect::<Vec<_>>();
+
+        assert_eq!(batch_sizes, vec![13, 12]);
+    }
+
+    #[test]
+    fn halves_rejected_batch_sizes_without_a_fixed_exchange_limit() {
+        assert_eq!(reduced_batch_size(25), 13);
+        assert_eq!(reduced_batch_size(13), 7);
+        assert_eq!(reduced_batch_size(2), 1);
+        assert_eq!(reduced_batch_size(1), 1);
+    }
+
+    #[test]
+    fn recognizes_the_exchange_subscription_limit_error() {
+        let error = anyhow::anyhow!(
+            "01 websocket closed: Some(CloseFrame {{ reason: \"subscribe: too many subscriptions\" }})"
+        );
+
+        assert!(is_too_many_subscriptions(&error));
+        assert!(!is_too_many_subscriptions(&anyhow::anyhow!(
+            "connection reset"
+        )));
     }
 }

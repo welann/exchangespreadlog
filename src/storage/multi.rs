@@ -29,6 +29,28 @@ impl MultiSink {
 
 #[async_trait]
 impl BboSink for MultiSink {
+    async fn reconcile_catalog(
+        &self,
+        managed_venue_ids: &[String],
+        current_catalog: &[InstrumentCatalog],
+    ) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        for sink in &self.sinks {
+            if let Err(err) = sink
+                .reconcile_catalog(managed_venue_ids, current_catalog)
+                .await
+            {
+                errors.push(err);
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(Self::combine_errors("reconcile catalog", errors))
+        }
+    }
+
     async fn write_catalog(&self, catalog: &InstrumentCatalog) -> anyhow::Result<()> {
         let mut errors = Vec::new();
         for sink in &self.sinks {
