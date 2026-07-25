@@ -206,23 +206,32 @@ function nullableNumber(value: unknown): number | null {
 function buildTickStatsJoin(schema: Awaited<ReturnType<typeof getTickSchema>>): string {
   const validBooks = validBookWhere(schema, 'ticks');
 
+  // Build SELECT columns based on which identity columns actually exist
+  const selectCols = ['venue_instance_id', 'instrument_id'];
+  if (schema.hasCatalogId) {
+    selectCols.push('argMax(catalog_id, recv_time) AS catalog_id');
+  }
+  if (schema.hasLegacyVenueMarket) {
+    selectCols.push('argMax(venue, recv_time) AS legacy_venue');
+    selectCols.push('argMax(market_id, recv_time) AS legacy_market_id');
+  }
+
+  // Build JOIN ON clause based on identity type
   let joinOnClause: string;
   if (schema.hasStorageIdentity) {
     joinOnClause = `ON latest.venue_instance_id = tick_stats.venue_instance_id AND latest.instrument_id = tick_stats.instrument_id`;
   } else if (schema.hasCatalogId) {
     joinOnClause = `ON latest.catalog_id = tick_stats.catalog_id`;
-  } else {
+  } else if (schema.hasLegacyVenueMarket) {
     joinOnClause = `ON latest.venue_instance_id = tick_stats.legacy_venue AND latest.instrument_id = tick_stats.legacy_market_id`;
+  } else {
+    return '';
   }
 
   return `
 LEFT JOIN (
   SELECT
-    venue_instance_id,
-    instrument_id,
-    argMax(catalog_id, recv_time) AS catalog_id,
-    argMax(venue, recv_time) AS legacy_venue,
-    argMax(market_id, recv_time) AS legacy_market_id,
+    ${selectCols.join(',\n    ')},
     max(recv_time) AS latest_recv_time
   FROM ${tickTable()} AS ticks
   WHERE venue_instance_id != '' AND instrument_id != ''
