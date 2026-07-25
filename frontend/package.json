@@ -23,5 +23,8 @@
     "@types/node": "^24.0.10",
     "svelte-check": "^4.2.2",
     "typescript": "^5.8.3"
+  },
+  "overrides": {
+    "cookie": "0.7.2"
   }
 }
