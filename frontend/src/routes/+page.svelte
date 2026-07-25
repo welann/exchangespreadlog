@@ -102,14 +102,12 @@
     venue: string;
     markets: number;
     instruments: number;
-    tickCount: number;
   };
   type VenuePairMarket = {
     market: Market;
     instrumentA: Instrument;
     instrumentB: Instrument;
     quoteLabel: string;
-    tickCount: number;
   };
   type LoadSpreadOptions = {
     preservePoint?: boolean;
@@ -172,7 +170,6 @@
   $: selectedPairIsLive = selectionFollowsLive(currentInstruments, selectedA, selectedB);
   $: venueOptions = buildVenueOptions(markets);
   $: venuePairMarkets = commonMarketsForVenues(markets, selectedVenueA, selectedVenueB);
-  $: totalTicks = tickCountForInstruments(currentInstruments);
   $: selectedInstrumentA = currentInstruments.find((instrument) => instrument.catalogId === selectedA) ?? null;
   $: selectedInstrumentB = currentInstruments.find((instrument) => instrument.catalogId === selectedB) ?? null;
   $: selectedRange = currentRange(selectedPreset, customStart, customEnd, rangeAnchorMs);
@@ -911,14 +908,13 @@
   }
 
   function buildVenueOptions(inputMarkets: Market[]): VenueOption[] {
-    const byVenue = new Map<string, { markets: Set<string>; instruments: number; tickCount: number }>();
+    const byVenue = new Map<string, { markets: Set<string>; instruments: number }>();
     inputMarkets.forEach((market) => {
       market.instruments.forEach((instrument) => {
         const venue = instrument.venueInstanceId || 'unknown';
-        const current = byVenue.get(venue) ?? { markets: new Set<string>(), instruments: 0, tickCount: 0 };
+        const current = byVenue.get(venue) ?? { markets: new Set<string>(), instruments: 0 };
         current.markets.add(market.baseAsset);
         current.instruments += 1;
-        current.tickCount += instrument.tickCount;
         byVenue.set(venue, current);
       });
     });
@@ -927,8 +923,7 @@
       .map(([venue, stats]) => ({
         venue,
         markets: stats.markets.size,
-        instruments: stats.instruments,
-        tickCount: stats.tickCount
+        instruments: stats.instruments
       }))
       .sort((left, right) => left.venue.localeCompare(right.venue));
   }
@@ -945,8 +940,7 @@
           market,
           instrumentA,
           instrumentB,
-          quoteLabel: quoteLabelForInstruments([instrumentA, instrumentB]),
-          tickCount: instrumentA.tickCount + instrumentB.tickCount
+          quoteLabel: quoteLabelForInstruments([instrumentA, instrumentB])
         };
       })
       .filter((value): value is VenuePairMarket => value !== null)
@@ -959,7 +953,6 @@
         .filter((instrument) => instrument.venueInstanceId === venue)
         .sort(
           (left, right) =>
-            right.tickCount - left.tickCount ||
             (right.latestRecvMs ?? 0) - (left.latestRecvMs ?? 0) ||
             left.label.localeCompare(right.label)
         )[0] ?? null
@@ -1214,10 +1207,6 @@
       }
     });
     return best;
-  }
-
-  function tickCountForInstruments(instruments: Market['instruments']) {
-    return instruments.reduce((sum, instrument) => sum + instrument.tickCount, 0);
   }
 
   function formatDuration(ms: number) {
@@ -1566,7 +1555,6 @@
                   </span>
                   <span class="market-meta">
                     <span>{option.instrumentA.rawSymbol} vs {option.instrumentB.rawSymbol}</span>
-                    <span>{formatInteger(option.tickCount)} ticks</span>
                   </span>
                 </button>
               {/each}
@@ -1899,7 +1887,7 @@
       <section class="venue-panel" aria-label="交易所数据质量">
         <div class="section-heading">
           <span>Venue legs</span>
-          <strong>{formatInteger(currentInstruments.length)} venues / {formatInteger(totalTicks)} ticks</strong>
+          <strong>{formatInteger(currentInstruments.length)} venues</strong>
         </div>
         <div class="venue-grid">
           {#each currentInstruments as instrument}
@@ -1911,7 +1899,6 @@
               <dl>
                 <div><dt>Quote</dt><dd>{instrument.quoteAsset}</dd></div>
                 <div><dt>Latest</dt><dd>{formatTime(instrument.latestRecvMs)}</dd></div>
-                <div><dt>Ticks</dt><dd>{formatInteger(instrument.tickCount)}</dd></div>
               </dl>
               <div class="venue-role">
                 {#if instrument.catalogId === selectedA}

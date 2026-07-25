@@ -12,7 +12,6 @@ type RawInstrument = {
   quoteAsset: string;
   status: string;
   latestRecvMs: number | string | null;
-  tickCount: number | string | null;
 };
 
 const INSTRUMENT_CACHE_TTL_MS = 300_000;
@@ -70,16 +69,15 @@ async function queryInstruments(
 ): Promise<Instrument[]> {
   if (catalogIds?.length === 0) return [];
 
-  const stats = includeTickStats
+  const joinSql = includeTickStats
     ? await getTickSchema().then((tickSchema) => {
         assertSupportedTickSchema(tickSchema);
-        return tickStatsSql(tickSchema);
+        return buildTickStatsJoin(tickSchema);
       })
-    : {
-        joinsSql: '',
-        latestRecvMsSql: 'NULL',
-        tickCountSql: '0'
-      };
+    : '';
+  const latestRecvMsSql = joinSql
+    ? 'toUnixTimestamp64Milli(tick_stats.latest_recv_time)'
+    : 'NULL';
   const catalogFilter =
     catalogIds && catalogIds.length > 0
       ? `latest.catalog_id IN (${catalogIds.map(quoteString).join(', ')})`
@@ -98,13 +96,12 @@ SELECT
   latest.base_asset AS baseAsset,
   latest.quote_asset AS quoteAsset,
   latest.status AS status,
-  ${stats.latestRecvMsSql} AS latestRecvMs,
-  ${stats.tickCountSql} AS tickCount
+  ${latestRecvMsSql} AS latestRecvMs
 FROM
 (
   ${latestCatalogSql}
 ) AS latest
-${stats.joinsSql}
+${joinSql}
 WHERE ${catalogFilter}
 ORDER BY latest.base_asset ASC, latest.venue_instance_id ASC, latest.raw_symbol ASC
 FORMAT JSONEachRow
@@ -117,13 +114,12 @@ export function groupMarkets(instruments: Instrument[]): Market[] {
   const markets = new Map<string, Instrument[]>();
   const uniqueInstruments = new Map<string, Instrument>();
   for (const instrument of instruments) {
-    if (instrument.latestRecvMs === null || instrument.tickCount <= 0) continue;
+    if (instrument.latestRecvMs === null) continue;
     const key = `${instrument.venueInstanceId}\u0000${instrument.instrumentId}`;
     const current = uniqueInstruments.get(key);
     if (
       !current ||
-      (instrument.latestRecvMs ?? 0) > (current.latestRecvMs ?? 0) ||
-      instrument.tickCount > current.tickCount
+      (instrument.latestRecvMs ?? 0) > (current.latestRecvMs ?? 0)
     ) {
       uniqueInstruments.set(key, instrument);
     }
@@ -197,7 +193,6 @@ function toInstrument(row: RawInstrument): Instrument {
     quoteAsset: row.quoteAsset,
     status: row.status,
     latestRecvMs: nullableNumber(row.latestRecvMs),
-    tickCount: Number(row.tickCount ?? 0),
     label
   };
 }
@@ -208,84 +203,32 @@ function nullableNumber(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function tickStatsSql(schema: Awaited<ReturnType<typeof getTickSchema>>) {
-  const joins: string[] = [];
-  const latestCandidates: string[] = [];
-  const countCandidates: string[] = [];
+function buildTickStatsJoin(schema: Awaited<ReturnType<typeof getTickSchema>>): string {
   const validBooks = validBookWhere(schema, 'ticks');
 
+  let joinOnClause: string;
   if (schema.hasStorageIdentity) {
-    joins.push(`
-LEFT JOIN
-(
-  SELECT
-    ticks.venue_instance_id AS venue_instance_id,
-    ticks.instrument_id AS instrument_id,
-    max(ticks.recv_time) AS latest_recv_time,
-    count() AS tick_count
-  FROM ${tickTable()} AS ticks
-  WHERE ticks.venue_instance_id != '' AND ticks.instrument_id != ''
-    AND ${validBooks}
-    AND ticks.recv_time >= now() - INTERVAL ${TICK_STATS_WINDOW_DAYS} DAY
-  GROUP BY ticks.venue_instance_id, ticks.instrument_id
-) AS storage_tick_stats
-  ON latest.venue_instance_id = storage_tick_stats.venue_instance_id
- AND latest.instrument_id = storage_tick_stats.instrument_id`);
-    latestCandidates.push('storage_tick_stats.latest_recv_time');
-    countCandidates.push('ifNull(storage_tick_stats.tick_count, 0)');
+    joinOnClause = `ON latest.venue_instance_id = tick_stats.venue_instance_id AND latest.instrument_id = tick_stats.instrument_id`;
+  } else if (schema.hasCatalogId) {
+    joinOnClause = `ON latest.catalog_id = tick_stats.catalog_id`;
+  } else {
+    joinOnClause = `ON latest.venue_instance_id = tick_stats.legacy_venue AND latest.instrument_id = tick_stats.legacy_market_id`;
   }
 
-  if (!schema.hasStorageIdentity && schema.hasCatalogId) {
-    joins.push(`
-LEFT JOIN
-(
+  return `
+LEFT JOIN (
   SELECT
-    ticks.catalog_id AS catalog_id,
-    max(ticks.recv_time) AS latest_recv_time,
-    count() AS tick_count
+    venue_instance_id,
+    instrument_id,
+    argMax(catalog_id, recv_time) AS catalog_id,
+    argMax(venue, recv_time) AS legacy_venue,
+    argMax(market_id, recv_time) AS legacy_market_id,
+    max(recv_time) AS latest_recv_time
   FROM ${tickTable()} AS ticks
-  WHERE ticks.catalog_id != ''
+  WHERE venue_instance_id != '' AND instrument_id != ''
     AND ${validBooks}
     AND ticks.recv_time >= now() - INTERVAL ${TICK_STATS_WINDOW_DAYS} DAY
-  GROUP BY ticks.catalog_id
-) AS catalog_tick_stats ON latest.catalog_id = catalog_tick_stats.catalog_id`);
-    latestCandidates.push('catalog_tick_stats.latest_recv_time');
-    countCandidates.push('ifNull(catalog_tick_stats.tick_count, 0)');
-  }
-
-  if (!schema.hasStorageIdentity && schema.hasLegacyVenueMarket) {
-    const legacyWhere = schema.hasCatalogId
-      ? "ticks.catalog_id = '' AND ticks.venue != '' AND ticks.market_id != ''"
-      : "ticks.venue != '' AND ticks.market_id != ''";
-    joins.push(`
-LEFT JOIN
-(
-  SELECT
-    ticks.venue AS venue_instance_id,
-    ticks.market_id AS instrument_id,
-    max(ticks.recv_time) AS latest_recv_time,
-    count() AS tick_count
-  FROM ${tickTable()} AS ticks
-  WHERE ${legacyWhere}
-    AND ${validBooks}
-    AND ticks.recv_time >= now() - INTERVAL ${TICK_STATS_WINDOW_DAYS} DAY
-  GROUP BY ticks.venue, ticks.market_id
-) AS legacy_tick_stats
-  ON latest.venue_instance_id = legacy_tick_stats.venue_instance_id
- AND latest.instrument_id = legacy_tick_stats.instrument_id`);
-    latestCandidates.push('legacy_tick_stats.latest_recv_time');
-    countCandidates.push('ifNull(legacy_tick_stats.tick_count, 0)');
-  }
-
-  return {
-    joinsSql: joins.join('\n'),
-    latestRecvMsSql: `if(isNull(${greatestNullable(latestCandidates)}), NULL, toUnixTimestamp64Milli(${greatestNullable(latestCandidates)}))`,
-    tickCountSql: countCandidates.join(' + ')
-  };
-}
-
-function greatestNullable(values: string[]): string {
-  if (values.length === 1) return values[0];
-  const [first, second] = values;
-  return `multiIf(isNull(${first}), ${second}, isNull(${second}), ${first}, greatest(${first}, ${second}))`;
+  GROUP BY venue_instance_id, instrument_id
+) AS tick_stats
+${joinOnClause}`;
 }

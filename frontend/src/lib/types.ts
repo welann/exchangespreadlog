@@ -13,7 +13,6 @@ export type Instrument = {
   quoteAsset: string;
   status: string;
   latestRecvMs: number | null;
-  tickCount: number;
   label: string;
 };
 
