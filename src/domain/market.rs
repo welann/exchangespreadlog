@@ -271,9 +271,9 @@ impl SizeUnit {
     }
 }
 
-fn stable_catalog_id(venue_instance_id: &str, instrument_id: &str, version_seed: &str) -> String {
+fn stable_catalog_id(venue_instance_id: &str, instrument_id: &str, _version_seed: &str) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in format!("{venue_instance_id}|{instrument_id}|{version_seed}").bytes() {
+    for byte in format!("{venue_instance_id}|{instrument_id}").bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -285,7 +285,7 @@ mod tests {
     use super::{InstrumentCatalog, PriceConvention, ProductType, SizeUnit};
 
     #[test]
-    fn catalog_id_changes_when_market_rules_change() {
+    fn catalog_id_is_stable_when_market_rules_change() {
         let first = InstrumentCatalog::new(
             "lighter",
             "0",
@@ -319,12 +319,12 @@ mod tests {
             None,
         );
 
-        assert_ne!(first.catalog_id, second.catalog_id);
+        assert_eq!(first.catalog_id, second.catalog_id);
         assert_eq!(first.instrument_ref().instrument_id, "0");
     }
 
     #[test]
-    fn catalog_id_changes_when_quote_or_size_semantics_change() {
+    fn catalog_id_is_stable_when_quote_or_size_semantics_change() {
         let first = InstrumentCatalog::new_with_units(
             "lighter",
             "0",
@@ -362,11 +362,11 @@ mod tests {
             None,
         );
 
-        assert_ne!(first.catalog_id, second.catalog_id);
+        assert_eq!(first.catalog_id, second.catalog_id);
     }
 
     #[test]
-    fn changing_status_creates_a_new_catalog_version_for_the_same_storage_identity() {
+    fn changing_status_keeps_the_same_catalog_identity() {
         let active = InstrumentCatalog::new(
             "lighter",
             "1",
@@ -385,7 +385,7 @@ mod tests {
         );
         let inactive = active.with_status("inactive");
 
-        assert_ne!(active.catalog_id, inactive.catalog_id);
+        assert_eq!(active.catalog_id, inactive.catalog_id);
         assert_eq!(active.venue_instance_id, inactive.venue_instance_id);
         assert_eq!(active.instrument_id, inactive.instrument_id);
         assert_eq!(inactive.status, "inactive");

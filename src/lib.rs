@@ -1,10 +1,10 @@
-pub mod app;
+pub mod api;
+pub mod catalog;
+pub mod clickhouse;
 pub mod config;
 pub mod domain;
 pub mod exchange;
 pub mod ingest;
 pub mod pipeline;
-pub mod state;
-pub mod storage;
-pub mod telemetry;
-pub mod tui;
+pub mod store;
+pub mod wal;

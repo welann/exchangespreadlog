@@ -16,8 +16,8 @@ use crate::{
     config::{CatalogSource, VenueConfig},
     domain::{Fixed, InstrumentCatalog, MarketEvent, ProductType},
     exchange::{
-        CatalogIndex, ExchangeAdapter, decimal_tick, merge_configured_catalog,
-        run_with_reconnect_backoff, warn_catalog_miss,
+        CatalogIndex, ExchangeAdapter, LatestTickQueue, TICK_FLUSH_INTERVAL, decimal_tick,
+        merge_configured_catalog, run_with_reconnect_backoff, warn_catalog_miss,
     },
     ingest::{supervisor::Backoff, ws},
 };
@@ -92,6 +92,9 @@ impl LighterAdapter {
             "subscribed"
         );
         let mut heartbeat = time::interval(Duration::from_secs(15));
+        let mut pending_flush = time::interval(TICK_FLUSH_INTERVAL);
+        let mut pending_ticks = LatestTickQueue::default();
+        pending_flush.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -104,6 +107,9 @@ impl LighterAdapter {
                 _ = heartbeat.tick() => {
                     write.send(Message::Ping(Vec::new())).await?;
                 }
+                _ = pending_flush.tick(), if !pending_ticks.is_empty() => {
+                    pending_ticks.flush(&tx)?;
+                }
                 maybe_msg = read.next() => {
                     let Some(msg) = maybe_msg else {
                         anyhow::bail!("Lighter websocket closed");
@@ -114,7 +120,7 @@ impl LighterAdapter {
                             match parser::parse_message(&text, recv_ts_ns, &self.venue_instance_id) {
                                 Ok(Some(tick)) => {
                                     match catalog.retarget_tick(tick) {
-                                        Ok(tick) => tx.send(MarketEvent::Tick { tick }).await.context("send Lighter tick")?,
+                                        Ok(tick) => pending_ticks.push(&tx, tick)?,
                                         Err(miss) => warn_catalog_miss("lighter", miss),
                                     }
                                 }

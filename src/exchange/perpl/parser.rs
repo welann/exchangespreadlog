@@ -5,6 +5,9 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedMessage {
     SubscriptionResponse(Vec<SubscriptionAck>),
+    ClientHeartbeatAck {
+        sent_ts_ms: Option<i64>,
+    },
     ServerHeartbeat {
         sid: u64,
         sequence: i128,
@@ -41,6 +44,8 @@ pub struct PerplLevelDelta {
 #[derive(Debug, Deserialize)]
 struct Envelope {
     mt: u32,
+    #[serde(default)]
+    t: Option<i64>,
     #[serde(default)]
     sid: Option<u64>,
     #[serde(default)]
@@ -91,7 +96,10 @@ pub fn parse_message(text: &str) -> Result<ParsedMessage> {
     let envelope: Envelope = serde_json::from_str(text)?;
 
     match envelope.mt {
-        2 | 3 | 7 | 8 | 9 | 10 | 11 | 12 | 17 | 18 => Ok(ParsedMessage::Ignore),
+        2 => Ok(ParsedMessage::ClientHeartbeatAck {
+            sent_ts_ms: envelope.t,
+        }),
+        3 | 7 | 8 | 9 | 10 | 11 | 12 | 17 | 18 => Ok(ParsedMessage::Ignore),
         6 => parse_subscription_response(envelope).map(ParsedMessage::SubscriptionResponse),
         15 | 16 => parse_l2_book(envelope).map(ParsedMessage::L2Book),
         100 => parse_server_heartbeat(envelope),
@@ -232,7 +240,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_server_heartbeat() {
+    fn parses_server_heartbeat_and_legacy_client_ack() {
+        assert_eq!(
+            parse_message(r#"{"mt":2,"sn":123,"t":1785050434559}"#).unwrap(),
+            ParsedMessage::ClientHeartbeatAck {
+                sent_ts_ms: Some(1_785_050_434_559)
+            }
+        );
         assert_eq!(
             parse_message(r#"{"mt":100,"sid":5000,"sn":90500970,"h":90500970}"#).unwrap(),
             ParsedMessage::ServerHeartbeat {

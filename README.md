@@ -1,319 +1,185 @@
-# Exchange Spread Log
+# Exchange Spread v2
 
-Exchange Spread Log is a Rust collector for top-of-book/BBO data from perpetual DEX venues. It connects to exchange WebSocket feeds, normalizes best bid/ask updates, calculates spread and mid price, deduplicates unchanged ticks, shows the latest state in a terminal UI, and optionally persists ticks as JSONL and/or ClickHouse rows.
+一个从真实交易所元数据出发、只处理最佳买卖价（BBO）的跨交易所价差观测器。它是完全独立的新项目，不读取旧配置、不复用旧数据库表，也不提供历史接口兼容层。
 
-Currently supported venues:
+## 为什么重做
 
-- `hyperliquid`
-- `lighter`
-- `risex`
-- `01`
-- `perpl`
-- `ondo`
+旧项目把市场发现、WebSocket 采集、标准化、存储、查询兼容和页面状态堆叠在同一条演进路径上：
 
-By default, Hyperliquid, Lighter, RiseX, 01, Perpl, and Ondo are enabled in `config.example.toml`. The archived Ethereal source is intentionally excluded from compilation and runtime discovery.
+- 单条事件通道后接同步存储，数据库抖动会向上游传播；
+- 前端直接承担查询拼接、旧数据兼容和展示逻辑，页面体积与状态复杂度持续增长；
+- Python 配置生成器、Rust 采集器、ClickHouse 查询和前端各自理解一份市场语义；
+- 报价币种转换与旧字段回退会掩盖数据是否真的可比；
+- 页面一次拉取和处理过多原始数据，长时间区间难以快速打开。
 
-## Project Structure
+v2 只保留已经由测试覆盖的交易所消息解析和订单簿算法，其余边界重新设计。
 
-```text
-.
-|-- Cargo.toml              # Rust package metadata and dependencies
-|-- Cargo.lock              # Locked dependency versions
-|-- config.example.toml     # Example runtime configuration
-`-- src
-    |-- main.rs             # CLI entrypoint
-    |-- lib.rs              # Library module exports
-    |-- app/runner.rs       # Application orchestration and shutdown handling
-    |-- config/             # TOML config model and defaults
-    |-- domain/             # BBO tick, market catalog, fixed decimal, quality models
-    |-- exchange/           # Exchange adapters and message parsers
-    |   |-- ethereal/       # archived; module entry is intentionally disabled
-    |   |-- hyperliquid/
-    |   |-- lighter/
-    |   |-- ondo/
-    |   |-- perpl/
-    |   |-- risex/
-    |   `-- zero_one/
-    |-- ingest/             # WebSocket connection, retry/backoff, time helpers
-    |-- pipeline/           # Normalize, dedupe, update state, write sinks
-    |-- state.rs            # Shared latest-BBO state for the TUI
-    |-- storage/            # JSONL, ClickHouse, fan-out, and no-op storage sinks
-    |-- telemetry/          # tracing/logging initialization
-    `-- tui.rs              # Ratatui terminal interface
+## 新架构
+
+```mermaid
+flowchart LR
+    M["真实 REST 元数据"] --> C["严格市场目录"]
+    W["7 个交易所 WebSocket"] --> N["标准化 + 质量校验"]
+    C --> N
+    N --> L["内存最新状态"]
+    N --> Q["SQLite WAL"]
+    Q --> P["异步投影器"]
+    P --> R["ClickHouse 原始 BBO<br/>6 小时精确回放"]
+    R --> A["1s / 1m / 5m / 15m / 1h 状态表"]
+    L --> API["Axum API + SSE"]
+    A --> API
+    API --> UI["Svelte 市场示波器"]
 ```
 
-## Requirements
+关键约束：
 
-- Rust toolchain with Cargo and Rust 2024 edition support
-- Network access to the configured WebSocket endpoints
+- 市场目录优先从真实 API 发现，成功结果原子写入本地缓存；单个目录暂时不可用时保留该交易所的 last-known-good 计划；
+- 运行中按固定周期刷新目录，只重启订阅计划发生变化的交易所；可显式禁用故障交易所；
+- 市场集合以 Lighter 为锚，只有同时出现在 Lighter 和至少一个其他交易所的 `base_asset` 才会订阅；
+- USD、USDC、USDT、AUSD 的 1:1 关系作为显式报价规则参与计算，不把换算隐藏在 symbol 归一化里；
+- 事件先落本地 SQLite WAL，再更新内存视图，ClickHouse 故障不会丢失已经接收的数据；
+- 缺档、过期、交叉盘或不一致的数据不会进入可交易价差；
+- 实时展示走内存与 SSE，历史展示按时间跨度自动选预聚合表；
+- 原始事件保留 6 小时；1 秒到 1 小时的分层状态分别保留 1、1、4、11、35 天。
 
-Check the local toolchain:
+## 大流量写入策略
+
+实时订阅全部可比较市场时，BBO 变化可能达到每秒数百至数千条。v2 对三个目标分别处理：
+
+- 页面实时性：每条合格事件立即更新内存，SSE 不等待远程数据库；
+- 故障安全：标准化事件按接收顺序批量提交到 SQLite WAL，ClickHouse 不可用时保留积压；
+- 运行时隔离：SQLite 的批量写入、projector 读取和 checkpoint 提交都在 blocking 线程池执行，不占用 WebSocket 的异步调度线程；
+- 行情背压隔离：所有交易所都按 instrument 合并尚未落盘的中间 BBO，只保留最新状态，WebSocket 读取与协议心跳不会被存储队列阻塞；
+- Perpl 协议：与官方网页客户端一致，订阅 `heartbeat@<chain_id>` 并校验服务端序列；不再发送会计入请求额度的应用层心跳；
+- 写入吞吐：投影器连续读取最多 5,000 条事件，使用 `JSONEachRow` 大批写入，成功后才推进 checkpoint。
+
+ClickHouse 不长期复制每一条高频原始事件。原始流仅用于近期排错和精确回放，长历史由物化视图生成的分层状态表承担。这样最长仍能查询 31 天，同时避免按当前市场规模累积十亿级原始行。
+
+当前接入：
+
+- Hyperliquid
+- Lighter
+- RiseX
+- 01
+- Perpl
+- Ondo
+
+Ethereal 源码仅作为归档保留，模块入口、目录发现和适配器工厂均已注释，不参与编译或运行。
+
+## 订阅队列如何生成
+
+交易对不是手工配置，也不是从历史数据库推断。collector 启动及运行中定期并发请求各交易所的公开市场目录：
+
+| 交易所 | 市场目录 | 进入候选目录的条件 | WebSocket 订阅键 |
+|---|---|---|---|
+| Hyperliquid | `POST https://api.hyperliquid.xyz/info`，`type=allPerpMetas` + `spotMeta` | `isDelisted != true`，且 `collateralToken` 能映射到已配置换算的 quote | `universe[].name` |
+| Lighter | `GET https://mainnet.zklighter.elliot.ai/api/v1/orderBooks` | `market_type=perp` 且 `status=active` | `market_id` |
+| RiseX | `GET https://api.rise.trade/v1/markets` | `active != false` 且 `config.unlocked != false` | `market_id` |
+| 01 | `GET https://zo-mainnet.n1.xyz/info` | 能解析出 `marketId` 和以 `USD` 结尾的 `symbol` | `symbol` |
+| Perpl | `GET https://app.perpl.xyz/api/v1/pub/context` | `config.is_open=true` | `id` |
+| Ondo | `GET https://api.ondoperps.xyz/v1/markets` | `disabled != true` | `market` |
+
+候选目录随后按照原版已经验证过的 Lighter 锚定规则生成真正的监控队列：
+
+1. 每个原始市场先标准化为 `venue + instrument_id + base_asset + quote_asset`；
+2. Hyperliquid 使用 `allPerpMetas.collateralToken` 与 `spotMeta.tokens` 确定每个 perp DEX 的真实 quote；因此默认永续和 HIP-3 市场都会参与匹配，但 USDH、USDE、USDT0 等没有显式换算规则的市场会被排除；
+3. Lighter 的 active perp 按 base 去重后作为锚点，与其他五个交易所的 base 并集取交集；
+4. 每个交易所只保留交集中的真实 instrument；同一交易所、相同 base 的重复合约只选一个；
+5. `/v1/markets` 也按 base 分组，所以 `BTC/USD`、`BTC/USDC`、`BTC/AUSD` 会出现在同一个 BTC 市场中；
+6. 价差计算前使用显式报价规则把两腿价格换算到共同 quote；当前规则与原版一致：`USDC→USD=1`、`USDT→USD=1`、`AUSD→USD=1`。
+
+这种设计保证每个订阅市场都有 Lighter 作为共同基准，同时仍保留每家交易所真实的 instrument id、feed symbol 和 quote asset。若未来不再接受固定 1:1 报价规则，应把稳定币现货/预言机价格作为新的数据源接入，而不是修改 symbol。
+
+## 启动
+
+要求 Rust 1.94+、Node.js 20+；容器构建已固定为 Rust 1.94 和 Node.js 22。
 
 ```bash
-cargo --version
+cp .env.example .env
+# 填写 ClickHouse 连接信息
+cd web
+npm ci
+npm run build
+cd ..
+cargo run --release
 ```
 
-## Configuration
+打开 `http://localhost:8080`。服务启动后，后台投影器会重试 ClickHouse 连接并执行幂等 migration；远端短暂不可用不会阻塞 WebSocket、WAL 和实时 API 启动。
 
-Create a local config from the example:
+也可以把采集/API 与前端作为两个独立容器部署，不需要 Docker Compose。
 
 ```bash
-cp config.example.toml config.toml
+docker build -f Dockerfile.collector -t exchange-spread-collector .
+docker build -f Dockerfile.frontend -t exchange-spread-frontend .
 ```
 
-You can also print the built-in default config:
+Collector 需要 ClickHouse 环境变量和持久化的 `/app/data`：
 
 ```bash
-cargo run -- --print-default-config
+docker run -d \
+  --name spread-collector \
+  --env-file .env \
+  -v spread-wal:/app/data \
+  -p 8081:8080 \
+  exchange-spread-collector
 ```
 
-Generate a config for active Lighter perp markets that are also available on at least one other supported venue:
+前端只需要知道 collector 的 HTTP 地址。`COLLECTOR_UPSTREAM` 在容器启动时写入 Nginx 配置，不会重新构建前端；地址末尾不要带 `/`：
 
 ```bash
-uv run python scripts/generate_config_from_lighter.py --output config.generated.toml
-cargo run -- --config config.generated.toml
+docker run -d \
+  --name spread-frontend \
+  -e COLLECTOR_UPSTREAM=http://your-collector-service:8080 \
+  -p 8080:8080 \
+  exchange-spread-frontend
 ```
 
-By default the generator takes the deduplicated union of the Hyperliquid, RiseX, 01, Perpl, and Ondo catalogs, intersects it with Lighter's active perp catalog, and subscribes every resulting Lighter market. A positive `--limit` can still be used as an optional capacity cap; it is applied by `daily_quote_token_volume` only after the intersection is calculated:
+在 Zeabur 中分别创建两个服务并选择对应 Dockerfile。Collector 暴露 `8080`、挂载 `/app/data` 并配置 `.env.example` 中的变量；Frontend 暴露 `8080`，将 `COLLECTOR_UPSTREAM` 设置成 Collector 的内部 HTTP 地址。Nginx 会代理 `/v1/*`、`/metrics` 和长连接 SSE，浏览器无需跨域访问。
+
+## API
+
+| 路径 | 用途 |
+|---|---|
+| `GET /v1/markets` | 当前可比较市场、交易所腿和数据新鲜度 |
+| `GET /v1/live/spread?leg_a=...&leg_b=...` | 当前价差与持续 SSE 更新 |
+| `GET /v1/spreads?leg_a=...&leg_b=...&range_ms=...` | 由服务端时钟锚定、最长 31 天的对齐历史价差 |
+| `GET /v1/health` | ClickHouse、WAL 与采集计数 |
+| `GET /metrics` | Prometheus 文本指标 |
+
+历史查询分辨率：
+
+| 查询跨度 | 使用状态表 |
+|---|---|
+| ≤ 15 分钟 | 1 秒 |
+| ≤ 12 小时 | 1 分钟 |
+| ≤ 3 天 | 5 分钟 |
+| ≤ 10 天 | 15 分钟 |
+| ≤ 31 天 | 1 小时 |
+
+## 数据模型
+
+- `instrument_catalog`：真实 API 返回的市场身份与规则；
+- `bbo_events`：不可变的标准化 BBO 事件，保留 6 小时；
+- `venue_state_events`：重连/失联边界；
+- `bbo_state_*`：用于页面快速查询的多分辨率最新状态，最长保留 35 天；
+- `data/wal.sqlite3`：尚未确认写入 ClickHouse 的本地事件。
+
+数据库凭据只放在未跟踪的 `.env` 中。`.env.example` 只保留占位符。
+
+目录与运行控制：
+
+- `CATALOG_CACHE_PATH`：last-known-good 订阅计划，默认 `data/catalog.json`；
+- `CATALOG_REFRESH_SECONDS`：在线目录刷新周期，默认 `3600`；
+- `DISABLED_VENUES`：逗号分隔的 venue id，例如 `01,ondo`。Lighter 是目录锚点，禁用后服务会拒绝生成不可比较的订阅计划。
+
+## 验证
 
 ```bash
-uv run python scripts/generate_config_from_lighter.py --limit 30 --output config.generated.toml
-```
-
-The generated config uses Lighter as the comparison anchor but does not subscribe Lighter-only markets. A market is included only when its normalized base asset exists on Lighter and at least one other supported venue. Each venue then receives only its exact matches from that selected set. For example, Lighter market `BTC` maps to Lighter feed `1`, Hyperliquid feed `BTC`, RiseX feed `1`, 01 feed `BTCUSD`, and Ondo feed `BTC-USD.P` when those markets exist in the corresponding metadata.
-
-Generated configs enable automatic subscription refresh at `00:05` UTC every day. At that time the collector runs the same generator, validates the new TOML, compares each venue's subscription plan, and restarts only venues whose settings or instruments changed. Removed markets are cleared from the live TUI state; historical storage is retained. Generation or validation failures leave the current subscriptions running.
-
-On every collector startup, the configured venue set is reconciled with the latest ClickHouse instrument catalog. Previously active instruments that are no longer part of the startup subscription plan are written back as inactive before adapters start. Empty generated venues remain in TOML with `enabled = false`, which keeps their ownership explicit and allows all of their old instruments to be retired without subscribing to an empty feed.
-
-Configure the schedule and market count in the generated TOML:
-
-```toml
-[subscription_refresh]
-enabled = true
-daily_at_utc = "00:05"
-generator_script = "scripts/generate_config_from_lighter.py"
-market_limit = 0
-```
-
-`market_limit = 0` means the full Lighter/other-venue intersection; a positive value applies the optional volume-ranked cap after matching. `daily_at_utc` uses `HH:MM` in UTC. Set `enabled = false` to disable in-process refresh. The runtime needs `uv`, Python, the generator script, network access, and write access to the active config path. The Docker image includes these dependencies; its entrypoint performs the initial generation before starting the collector, and the collector handles later daily refreshes.
-
-`config.example.toml` leaves refresh disabled so running directly against the tracked example cannot overwrite it. Configs produced by the generator enable refresh by default.
-
-For Hyperliquid, the generator joins `allPerpMetas.collateralToken` with `spotMeta.tokens`, so default perp markets and HIP-3 markets retain their real quote/collateral asset. Markets whose quote has no explicit conversion rule (currently USDH, USDE, USDT0, and any unknown future token) are excluded instead of being mislabeled as USDC. If a base asset exists in default Hyperliquid perps, that default coin is preferred; otherwise an exact supported-quote HIP-3 match such as `xyz:SPCX` can be used for Lighter `SPCX`. The script still does not guess UI remaps or aliases, so `XAU` will not be guessed as `GOLD`, and `1000BONK` will not be guessed as `kBONK`.
-
-01 can reject oversized combined-stream WebSockets without publishing a fixed stream limit. The adapter starts with the current catalog, detects the exchange's `too many subscriptions` response, reduces the per-connection batch size, and caches the learned capacity for later reconnects. Larger future catalogs therefore create as many connections as needed without relying on a hard-coded stream count.
-
-Important config sections:
-
-- `pipeline.channel_capacity`: internal tick channel size.
-- `pipeline.stale_after_ms`: marks ticks stale when exchange timestamps lag local receive time by more than this threshold. Set to `0` to disable stale marking.
-- `subscription_refresh`: optional daily regeneration and live replacement of venue subscriptions.
-- `storage.mode`: storage target. Supported values are `none`, `jsonl`, `clickhouse`, and `both`.
-- `storage.jsonl_dir`: base output directory, default `data/bbo`.
-- `storage.clickhouse.url`: ClickHouse HTTP endpoint.
-- `storage.clickhouse.database`: ClickHouse database name. The collector creates it when `create_table = true`.
-- `storage.clickhouse.table`: raw BBO tick table name. The collector creates it when `create_table = true`.
-- `storage.clickhouse.catalog_table`: instrument catalog table name.
-- `storage.clickhouse.username`: ClickHouse HTTP username.
-- `storage.clickhouse.password_env`: environment variable holding the ClickHouse password.
-- `storage.clickhouse.accept_invalid_certs`: explicitly allow a self-signed ClickHouse TLS certificate. Keep this disabled for endpoints with a valid certificate.
-- `storage.clickhouse.candle_mode`: frontend aggregate-table mode: `off`, `auto`, or `force`.
-- `storage.clickhouse.max_stale_ms`: maximum age of either carried BBO leg; defaults to 120 seconds.
-- `storage.clickhouse.batch_size`: number of rows buffered before each HTTP insert.
-- `tui.enabled`: enable or disable the terminal UI.
-- `tui.refresh_ms`: terminal UI refresh interval.
-- `quote_rates`: optional direct quote conversion rates used by the TUI for cross-quote spread display.
-- `venues`: adapter settings plus default quote/settle/margin assets.
-- `venues.instruments`: the explicit instrument catalog for that venue instance.
-
-Example ClickHouse storage config for the Zeabur service:
-
-```toml
-[storage]
-mode = "clickhouse"
-jsonl_dir = "data/bbo"
-
-[storage.clickhouse]
-url = "https://manyexchanges.zeabur.app/"
-database = "zeabur"
-table = "bbo_ticks"
-catalog_table = "instrument_catalog"
-username = "zeabur"
-password_env = "CLICKHOUSE_PASSWORD"
-accept_invalid_certs = true
-candle_mode = "auto"
-max_stale_ms = 120000
-create_table = true
-batch_size = 100
-```
-
-Set the password before running:
-
-```bash
-export CLICKHOUSE_PASSWORD='your-clickhouse-password'
-```
-
-Example venue entries:
-
-```toml
-[[quote_rates]]
-from = "USDC"
-to = "USD"
-rate = "1"
-
-[[venues]]
-venue_instance_id = "lighter"
-adapter = "lighter"
-enabled = true
-url = "wss://mainnet.zklighter.elliot.ai/stream?readonly=true"
-channel = "ticker"
-default_quote_asset = "USDC"
-default_settle_asset = "USDC"
-default_margin_asset = "USDC"
-
-[[venues.instruments]]
-instrument_id = "0"
-raw_symbol = "ETH"
-feed_symbol = "0"
-product_type = "perp"
-base_asset = "ETH"
-status = "active"
-
-[[venues.instruments]]
-instrument_id = "1"
-raw_symbol = "BTC"
-feed_symbol = "1"
-product_type = "perp"
-base_asset = "BTC"
-status = "active"
-```
-
-`venue_instance_id` is the pricing domain, not just the adapter name. If a protocol exposes independent domains such as HIP3 markets, configure them as separate venue instances. `instrument_id` is the exchange/internal market ID; `feed_symbol` is the subscription key when it differs. Quote, settle, and margin assets default from the venue and can be overridden per instrument.
-
-## Running
-
-Run with the default `config.toml` path:
-
-```bash
-cargo run
-```
-
-Run with an explicit config:
-
-```bash
-cargo run -- --config config.toml
-```
-
-The `--storage` flag overrides `[storage].mode` for that run. Use these commands for the common modes:
-
-1. TUI only, no local or ClickHouse writes:
-
-```bash
-cargo run -- --config config.toml --storage none
-```
-
-2. TUI plus local JSONL storage:
-
-```bash
-cargo run -- --config config.toml --storage jsonl
-```
-
-3. TUI plus ClickHouse storage:
-
-```bash
-CLICKHOUSE_PASSWORD='your-clickhouse-password' cargo run -- --config config.toml --storage clickhouse
-```
-
-4. ClickHouse only, no TUI and no local JSONL storage:
-
-```bash
-CLICKHOUSE_PASSWORD='your-clickhouse-password' cargo run -- --config config.toml --storage clickhouse --no-tui
-```
-
-If `config.toml` contains `storage.clickhouse.password`, you can omit the `CLICKHOUSE_PASSWORD=...` prefix. Prefer the environment variable for shared or committed configs.
-
-Set log verbosity with `RUST_LOG`:
-
-```bash
-RUST_LOG=info cargo run -- --config config.toml --no-tui
-RUST_LOG=debug,exchangespreadlog=trace cargo run -- --config config.toml
-```
-
-Stop the collector with `Ctrl-C`. When the TUI is enabled, `q` or `Esc` also exits.
-
-## TUI Controls
-
-- `q` / `Esc`: quit.
-- `Tab`: switch focus between BBO and spread panels.
-- `Left` / `Right`: switch selected base asset.
-- `Up` / `Down`: switch selected instrument row.
-- `1` / `2`: choose the first or second instrument leg in the spread panel.
-
-## Output
-
-When `storage.mode = "jsonl"` or `storage.mode = "both"`, ticks are written under:
-
-```text
-data/bbo/catalog/YYYY-MM-DD/<venue_instance_id>.jsonl
-data/bbo/bbo/YYYY-MM-DD/<venue_instance_id>.jsonl
-```
-
-Catalog lines contain static instrument metadata such as base/quote assets and trading rules. BBO lines are narrow `BboTick` JSON objects. Common tick fields include:
-
-- `instrument`: `catalog_id`, `venue_instance_id`, and `instrument_id`.
-- `recv_ts_ns`: local receive timestamp in nanoseconds.
-- `exchange_ts_ms`: exchange timestamp when provided by the feed.
-- `sequence`: feed sequence/nonce when provided.
-- `bid` / `ask`: best price, size, and optional order count.
-- `spread`: `ask.price - bid.price`.
-- `mid`: midpoint between bid and ask.
-- `source`: source feed type such as `bbo`, `ticker`, or `l2_book`.
-- `quality`: quality flags, including `inconsistent` for negative spread, `stale` for delayed exchange timestamps, and `gap` for refreshed orderbook gaps.
-
-When `storage.mode = "clickhouse"` or `storage.mode = "both"`, catalog rows are inserted into `storage.clickhouse.catalog_table` and ticks into `storage.clickhouse.table`. The tick table includes:
-
-- identifiers and timestamps: `catalog_id`, `venue_instance_id`, `instrument_id`, `recv_ts_ns`, `recv_time`, `exchange_ts_ms`, `sequence`, `source`.
-- bid/ask values as both Float64 and exact text fields, for example `bid_price` and `bid_price_text`.
-- derived `spread` and `mid` values as both Float64 and exact text fields.
-- quality flags: `quality_gap`, `quality_stale`, `quality_inconsistent`, `quality_note`.
-
-## Build and Test
-
-Run tests:
-
-```bash
+cargo fmt --all -- --check
 cargo test
-```
-
-Build a release binary:
-
-```bash
-cargo build --release
-```
-
-Run the release binary:
-
-```bash
-./target/release/exchangespreadlog --config config.toml
-```
-
-Show CLI help:
-
-```bash
-cargo run -- --help
-```
-
-Current CLI options:
-
-```text
-Usage: exchangespreadlog [OPTIONS]
-
-Options:
-  -c, --config <CONFIG>       [default: config.toml]
-      --no-tui
-      --storage <MODE>        Override storage mode: none, jsonl, clickhouse, or both
-      --print-default-config
-  -h, --help                  Print help
-  -V, --version               Print version
+cargo clippy --all-targets -- -D warnings
+cd web
+npm run check
+npm run build
+npm audit --omit=dev
 ```

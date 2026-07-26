@@ -23,10 +23,15 @@ impl BestLevel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BboTick {
     pub instrument: InstrumentRef,
+    #[serde(with = "super::integer::i128_string")]
     pub recv_ts_ns: i128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exchange_ts_ms: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "super::integer::option_i128_string"
+    )]
     pub sequence: Option<i128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bid: Option<BestLevel>,

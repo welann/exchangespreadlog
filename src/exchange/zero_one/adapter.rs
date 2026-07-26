@@ -20,7 +20,9 @@ use tracing::{debug, info, warn};
 use crate::{
     config::VenueConfig,
     domain::{BboTick, InstrumentCatalog, MarketEvent},
-    exchange::{CatalogIndex, ExchangeAdapter, run_with_reconnect},
+    exchange::{
+        CatalogIndex, ExchangeAdapter, LatestTickQueue, TICK_FLUSH_INTERVAL, run_with_reconnect,
+    },
     ingest::ws,
 };
 
@@ -123,6 +125,7 @@ impl ZeroOneAdapter {
         let ws_url = build_ws_url(&self.url, &self.channel, markets);
         let (stream, _) = ws::connect(&ws_url).await?;
         let (mut write, mut read) = stream.split();
+        let mut pending_ticks = LatestTickQueue::default();
 
         for market in markets {
             let recv_ts_ns = crate::ingest::time::unix_time_ns();
@@ -130,9 +133,7 @@ impl ZeroOneAdapter {
                 .fetch_snapshot_tick(&client, &mut books, market, recv_ts_ns)
                 .await
                 .with_context(|| format!("fetch initial 01 snapshot {}", market.feed_key()))?;
-            tx.send(MarketEvent::Tick { tick })
-                .await
-                .context("send initial 01 tick")?;
+            pending_ticks.push(&tx, tick)?;
         }
 
         info!(
@@ -143,6 +144,8 @@ impl ZeroOneAdapter {
             "subscribed"
         );
         let mut heartbeat = time::interval(Duration::from_secs(30));
+        let mut pending_flush = time::interval(TICK_FLUSH_INTERVAL);
+        pending_flush.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -154,6 +157,9 @@ impl ZeroOneAdapter {
                 }
                 _ = heartbeat.tick() => {
                     write.send(Message::Ping(Vec::new())).await?;
+                }
+                _ = pending_flush.tick(), if !pending_ticks.is_empty() => {
+                    pending_ticks.flush(&tx)?;
                 }
                 maybe_msg = read.next() => {
                     let Some(msg) = maybe_msg else {
@@ -167,7 +173,7 @@ impl ZeroOneAdapter {
                                     let market_symbol = delta.market_symbol.clone();
                                     match books.apply_delta(delta, recv_ts_ns) {
                                         ApplyResult::Tick(tick) => {
-                                            tx.send(MarketEvent::Tick { tick: *tick }).await.context("send 01 tick")?;
+                                            pending_ticks.push(&tx, *tick)?;
                                         }
                                         ApplyResult::Skipped => {}
                                         ApplyResult::Gap { expected_last_update_id, received_last_update_id, .. } => {
@@ -185,7 +191,7 @@ impl ZeroOneAdapter {
                                                     .with_context(|| format!("refresh 01 snapshot {market_symbol}"))?;
                                                 tick.quality.gap = true;
                                                 tick.quality.add_note("orderbook delta gap; snapshot refreshed");
-                                                tx.send(MarketEvent::Tick { tick }).await.context("send refreshed 01 tick")?;
+                                                pending_ticks.push(&tx, tick)?;
                                             }
                                         }
                                     }

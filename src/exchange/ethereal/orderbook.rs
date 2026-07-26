@@ -19,7 +19,7 @@ struct MarketBook {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyResult {
-    Tick(BboTick),
+    Tick(Box<BboTick>),
     Gap {
         symbol: String,
         expected_previous_ts_ms: i64,
@@ -45,7 +45,7 @@ impl EtherealBooks {
             book.asks.clear();
             replace_side(&mut book.bids, update.bids);
             replace_side(&mut book.asks, update.asks);
-            return ApplyResult::Tick(build_tick(recv_ts_ns, instrument, book));
+            return ApplyResult::Tick(Box::new(build_tick(recv_ts_ns, instrument, book)));
         }
 
         let Some(current_ts_ms) = book.timestamp_ms else {
@@ -70,7 +70,7 @@ impl EtherealBooks {
         apply_side(&mut book.asks, update.asks);
         book.timestamp_ms = Some(update.exchange_ts_ms);
 
-        ApplyResult::Tick(build_tick(recv_ts_ns, instrument, book))
+        ApplyResult::Tick(Box::new(build_tick(recv_ts_ns, instrument, book)))
     }
 }
 

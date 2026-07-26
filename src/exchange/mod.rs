@@ -9,14 +9,17 @@ pub mod risex;
 pub mod zero_one;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use tokio::{
-    sync::{mpsc::Sender, watch},
+    sync::{
+        mpsc::{Sender, error::TrySendError},
+        watch,
+    },
     time,
 };
 use tracing::{info, warn};
@@ -30,6 +33,64 @@ const STABLE_CONNECTION_RESET_AFTER: Duration = Duration::from_secs(30);
 const TRANSIENT_WS_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const TRANSIENT_WS_RECONNECT_CAP: Duration = Duration::from_secs(5);
 const RATE_LIMIT_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+pub const TICK_FLUSH_INTERVAL: Duration = Duration::from_millis(5);
+
+/// BBO is state, not an append-only fact stream. When durable storage is
+/// temporarily slower than a venue, retain the newest state per instrument
+/// while continuing to consume every WebSocket frame.
+#[derive(Debug, Default)]
+pub struct LatestTickQueue {
+    pending: HashMap<String, BboTick>,
+    order: VecDeque<String>,
+}
+
+impl LatestTickQueue {
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub fn push(&mut self, tx: &Sender<MarketEvent>, tick: BboTick) -> anyhow::Result<()> {
+        let key = tick.instrument.catalog_id.clone();
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.pending.entry(key.clone())
+        {
+            entry.insert(tick);
+            return Ok(());
+        }
+        match tx.try_send(MarketEvent::Tick { tick }) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(MarketEvent::Tick { tick })) => {
+                let order_key = key.clone();
+                self.pending.insert(key, tick);
+                self.order.push_back(order_key);
+                Ok(())
+            }
+            Err(TrySendError::Closed(_)) => anyhow::bail!("event pipeline is closed"),
+            Err(TrySendError::Full(_)) => unreachable!("only tick events are queued"),
+        }
+    }
+
+    pub fn flush(&mut self, tx: &Sender<MarketEvent>) -> anyhow::Result<()> {
+        while let Some(key) = self.order.pop_front() {
+            let tick = self
+                .pending
+                .remove(&key)
+                .expect("pending tick order and map stay in sync");
+            match tx.try_send(MarketEvent::Tick { tick }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(MarketEvent::Tick { tick })) => {
+                    let order_key = key.clone();
+                    self.pending.insert(key, tick);
+                    self.order.push_back(order_key);
+                    break;
+                }
+                Err(TrySendError::Closed(_)) => anyhow::bail!("event pipeline is closed"),
+                Err(TrySendError::Full(_)) => unreachable!("only tick events are queued"),
+            }
+        }
+        Ok(())
+    }
+}
 
 #[async_trait]
 pub trait ExchangeAdapter: Send + Sync {
@@ -71,6 +132,11 @@ where
             Err(err) => {
                 let uptime = started_at.elapsed();
                 let decision = reconnect_decision(&mut backoff, &err, uptime);
+                let _ = tx
+                    .send(MarketEvent::VenueReset {
+                        venue_instance_id: venue.to_string(),
+                    })
+                    .await;
                 log_adapter_restart(venue, &err, decision, uptime);
                 tokio::select! {
                     _ = time::sleep(decision.sleep) => {}
@@ -104,6 +170,9 @@ fn reconnect_decision(
     err: &anyhow::Error,
     uptime: Duration,
 ) -> ReconnectDecision {
+    // A venue-level limit can outlive the socket that hit it. Do not reset the
+    // backoff just because that socket had been healthy for a while, and wait
+    // long enough for a rolling request window to drain before reconnecting.
     if is_rate_limited(err) {
         let sleep = backoff.next_delay().max(RATE_LIMIT_RECONNECT_DELAY);
         return ReconnectDecision {
@@ -172,17 +241,6 @@ fn log_adapter_restart(
     }
 }
 
-fn error_chain_text(err: &anyhow::Error) -> String {
-    let mut text = String::new();
-    for cause in err.chain() {
-        if !text.is_empty() {
-            text.push_str(": ");
-        }
-        text.push_str(&cause.to_string());
-    }
-    text.to_ascii_lowercase()
-}
-
 fn is_rate_limited(err: &anyhow::Error) -> bool {
     let text = error_chain_text(err);
     text.contains("too many requests")
@@ -200,6 +258,17 @@ fn is_transient_websocket_disconnect(err: &anyhow::Error) -> bool {
         || text.contains("broken pipe")
         || text.contains("reason: \"expired\"")
         || text.contains("reason: \"ping timeout\"")
+}
+
+fn error_chain_text(err: &anyhow::Error) -> String {
+    let mut text = String::new();
+    for cause in err.chain() {
+        if !text.is_empty() {
+            text.push_str(": ");
+        }
+        text.push_str(&cause.to_string());
+    }
+    text.to_ascii_lowercase()
 }
 
 #[derive(Debug, Clone)]
@@ -344,11 +413,12 @@ fn catalog_keys(instrument: &InstrumentCatalog) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CatalogIndex, RATE_LIMIT_RECONNECT_DELAY, ReconnectDecision, ReconnectKind,
-        TRANSIENT_WS_RECONNECT_DELAY, decimal_tick, is_rate_limited,
+        CatalogIndex, LatestTickQueue, RATE_LIMIT_RECONNECT_DELAY, ReconnectDecision,
+        ReconnectKind, TRANSIENT_WS_RECONNECT_DELAY, decimal_tick, is_rate_limited,
         is_transient_websocket_disconnect, merge_configured_catalog, reconnect_decision,
     };
     use std::time::Duration;
+    use tokio::sync::mpsc;
 
     use crate::{
         domain::{BboTick, BestLevel, InstrumentCatalog, ProductType, SourceKind},
@@ -372,6 +442,53 @@ mod tests {
             "active",
             None,
         )
+    }
+
+    fn tick(id: &str, sequence: i128) -> BboTick {
+        BboTick::new(
+            catalog(id, id, id, None).instrument_ref(),
+            sequence,
+            None,
+            Some(sequence),
+            None::<BestLevel>,
+            None::<BestLevel>,
+            SourceKind::Ticker,
+        )
+    }
+
+    #[test]
+    fn latest_tick_queue_coalesces_and_rotates_pending_instruments() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(crate::domain::MarketEvent::Tick {
+            tick: tick("filler", 0),
+        })
+        .unwrap();
+        let mut queue = LatestTickQueue::default();
+
+        queue.push(&tx, tick("BTC", 1)).unwrap();
+        queue.push(&tx, tick("BTC", 2)).unwrap();
+        queue.push(&tx, tick("ETH", 3)).unwrap();
+        let _ = rx.try_recv().unwrap();
+
+        queue.flush(&tx).unwrap();
+        queue.push(&tx, tick("BTC", 4)).unwrap();
+        let crate::domain::MarketEvent::Tick { tick } = rx.try_recv().unwrap() else {
+            panic!("expected BTC tick");
+        };
+        assert_eq!(tick.sequence, Some(2));
+
+        queue.flush(&tx).unwrap();
+        let crate::domain::MarketEvent::Tick { tick } = rx.try_recv().unwrap() else {
+            panic!("expected ETH tick");
+        };
+        assert_eq!(tick.sequence, Some(3));
+
+        queue.flush(&tx).unwrap();
+        let crate::domain::MarketEvent::Tick { tick } = rx.try_recv().unwrap() else {
+            panic!("expected latest BTC tick");
+        };
+        assert_eq!(tick.sequence, Some(4));
+        assert!(queue.is_empty());
     }
 
     #[test]
@@ -444,15 +561,29 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_after_a_stable_connection_still_cools_down() {
+    fn classifies_exchange_too_many_requests_close_as_rate_limited() {
+        let err = anyhow::anyhow!(
+            "Perpl websocket closed: Some(CloseFrame {{ code: Policy, reason: \"too many requests\" }})"
+        );
+
+        assert!(is_rate_limited(&err));
+        assert!(!is_transient_websocket_disconnect(&err));
+
+        let err = anyhow::anyhow!("websocket exception: RATE_LIMIT");
+        assert!(is_rate_limited(&err));
+    }
+
+    #[test]
+    fn cools_down_after_rate_limit_even_when_connection_was_stable() {
         let err = anyhow::anyhow!(
             "Perpl websocket closed: Some(CloseFrame {{ code: Policy, reason: \"too many requests\" }})"
         );
         let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
 
-        assert!(is_rate_limited(&err));
+        let decision = reconnect_decision(&mut backoff, &err, Duration::from_secs(245));
+
         assert_eq!(
-            reconnect_decision(&mut backoff, &err, Duration::from_secs(245)),
+            decision,
             ReconnectDecision {
                 sleep: RATE_LIMIT_RECONNECT_DELAY,
                 kind: ReconnectKind::RateLimited,

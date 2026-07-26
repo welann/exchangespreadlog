@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -107,11 +107,11 @@ fn parse_socket_io_event(payload: &str) -> Result<ParsedMessage> {
     let event_name = event
         .first()
         .and_then(Value::as_str)
-        .context("Ethereal Socket.IO event is missing its name")?;
+        .ok_or_else(|| anyhow!("Ethereal Socket.IO event is missing its name"))?;
     let data = event
         .get(1)
         .cloned()
-        .context("Ethereal Socket.IO event is missing its payload")?;
+        .ok_or_else(|| anyhow!("Ethereal Socket.IO event is missing its payload"))?;
     match event_name {
         "BookDepth" => parse_book_depth(data).map(ParsedMessage::L2Book),
         "exception" => bail!("Ethereal Socket.IO exception: {data}"),

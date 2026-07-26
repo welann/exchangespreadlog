@@ -1,4 +1,5 @@
 pub mod bbo;
+pub(crate) mod integer;
 pub mod market;
 pub mod number;
 pub mod quality;

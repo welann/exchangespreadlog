@@ -14,7 +14,9 @@ use tracing::{debug, info, warn};
 use crate::{
     config::VenueConfig,
     domain::MarketEvent,
-    exchange::{CatalogIndex, ExchangeAdapter, run_with_reconnect},
+    exchange::{
+        CatalogIndex, ExchangeAdapter, LatestTickQueue, TICK_FLUSH_INTERVAL, run_with_reconnect,
+    },
     ingest::ws,
 };
 
@@ -87,6 +89,9 @@ impl RisexAdapter {
         );
         let mut books = RisexBooks::default();
         let mut heartbeat = time::interval(Duration::from_secs(15));
+        let mut pending_flush = time::interval(TICK_FLUSH_INTERVAL);
+        let mut pending_ticks = LatestTickQueue::default();
+        pending_flush.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -98,6 +103,9 @@ impl RisexAdapter {
                 }
                 _ = heartbeat.tick() => {
                     write.send(Message::Text(json!({"op":"ping"}).to_string())).await?;
+                }
+                _ = pending_flush.tick(), if !pending_ticks.is_empty() => {
+                    pending_ticks.flush(&tx)?;
                 }
                 maybe_msg = read.next() => {
                     let Some(msg) = maybe_msg else {
@@ -113,7 +121,7 @@ impl RisexAdapter {
                                     let missing_catalog = configured_instrument.is_none();
                                     match books.apply(delta, recv_ts_ns, configured_instrument) {
                                         Ok(Some(tick)) => {
-                                            tx.send(MarketEvent::Tick { tick }).await.context("send RiseX tick")?;
+                                            pending_ticks.push(&tx, tick)?;
                                         }
                                         Ok(None) if missing_catalog => {
                                             warn!(

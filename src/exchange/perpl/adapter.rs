@@ -16,8 +16,8 @@ use crate::{
     config::VenueConfig,
     domain::{Fixed, InstrumentCatalog, InstrumentRef, MarketEvent, ProductType},
     exchange::{
-        CatalogIndex, ExchangeAdapter, decimal_tick, merge_configured_catalog, run_with_reconnect,
-        warn_catalog_miss,
+        CatalogIndex, ExchangeAdapter, LatestTickQueue, TICK_FLUSH_INTERVAL, decimal_tick,
+        merge_configured_catalog, run_with_reconnect, warn_catalog_miss,
     },
     ingest::ws,
 };
@@ -131,8 +131,11 @@ impl PerplAdapter {
         let connected_at = time::Instant::now();
         let mut last_heartbeat_at = None;
         let mut books = PerplBooks::default();
+        let mut pending_ticks = LatestTickQueue::default();
         let mut heartbeat_check = time::interval(HEARTBEAT_CHECK_INTERVAL);
+        let mut pending_flush = time::interval(TICK_FLUSH_INTERVAL);
         heartbeat_check.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        pending_flush.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -150,6 +153,9 @@ impl PerplAdapter {
                             last_seen.elapsed()
                         );
                     }
+                }
+                _ = pending_flush.tick(), if !pending_ticks.is_empty() => {
+                    pending_ticks.flush(&tx)?;
                 }
                 maybe_msg = read.next() => {
                     let Some(msg) = maybe_msg else {
@@ -218,10 +224,17 @@ impl PerplAdapter {
 
                                     match books.apply(update, target.instrument, target.scale, recv_ts_ns) {
                                         ApplyResult::Tick(tick) => {
-                                            tx.send(MarketEvent::Tick { tick: *tick }).await.context("send Perpl tick")?;
+                                            pending_ticks.push(&tx, *tick)?;
                                         }
                                         ApplyResult::Skipped => {}
                                     }
+                                }
+                                Ok(ParsedMessage::ClientHeartbeatAck { sent_ts_ms }) => {
+                                    debug!(
+                                        venue = %self.venue_instance_id,
+                                        ?sent_ts_ms,
+                                        "unexpected legacy Perpl client heartbeat ack"
+                                    );
                                 }
                                 Ok(ParsedMessage::Ignore) => {}
                                 Err(err) => {
@@ -233,6 +246,11 @@ impl PerplAdapter {
                             anyhow::bail!("Perpl websocket closed: {frame:?}");
                         }
                         Message::Ping(payload) => {
+                            debug!(
+                                venue = %self.venue_instance_id,
+                                bytes = payload.len(),
+                                "Perpl protocol ping received"
+                            );
                             write.send(Message::Pong(payload)).await?;
                         }
                         _ => {}
