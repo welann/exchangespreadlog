@@ -84,7 +84,8 @@ AS SELECT
     argMaxMergeState(final_book) AS final_book,
     sumMergeState(tick_count) AS tick_count
 FROM {database}.{table}_candle_1s
-GROUP BY venue_instance_id, instrument_id, toStartOfMinute(bucket_time);
+GROUP BY venue_instance_id, instrument_id, toStartOfMinute(bucket_time)
+SETTINGS prefer_column_name_to_alias = 1;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.{table}_candle_5m_mv
 TO {database}.{table}_candle_5m
@@ -99,7 +100,8 @@ AS SELECT
     argMaxMergeState(final_book) AS final_book,
     sumMergeState(tick_count) AS tick_count
 FROM {database}.{table}_candle_1m
-GROUP BY venue_instance_id, instrument_id, toStartOfFiveMinutes(bucket_time);
+GROUP BY venue_instance_id, instrument_id, toStartOfFiveMinutes(bucket_time)
+SETTINGS prefer_column_name_to_alias = 1;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.{table}_candle_15m_mv
 TO {database}.{table}_candle_15m
@@ -114,7 +116,8 @@ AS SELECT
     argMaxMergeState(final_book) AS final_book,
     sumMergeState(tick_count) AS tick_count
 FROM {database}.{table}_candle_5m
-GROUP BY venue_instance_id, instrument_id, toStartOfFifteenMinutes(bucket_time);
+GROUP BY venue_instance_id, instrument_id, toStartOfFifteenMinutes(bucket_time)
+SETTINGS prefer_column_name_to_alias = 1;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.{table}_candle_1h_mv
 TO {database}.{table}_candle_1h
@@ -129,7 +132,8 @@ AS SELECT
     argMaxMergeState(final_book) AS final_book,
     sumMergeState(tick_count) AS tick_count
 FROM {database}.{table}_candle_15m
-GROUP BY venue_instance_id, instrument_id, toStartOfHour(bucket_time);
+GROUP BY venue_instance_id, instrument_id, toStartOfHour(bucket_time)
+SETTINGS prefer_column_name_to_alias = 1;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.{table}_candle_1s_mv
 TO {database}.{table}_candle_1s
@@ -137,10 +141,10 @@ AS SELECT
     venue_instance_id,
     instrument_id,
     toStartOfSecond(recv_time) AS bucket_time,
-    argMinState((bid_price + ask_price) / 2, recv_ts_ns) AS open_mid,
-    maxState((bid_price + ask_price) / 2) AS high_mid,
-    minState((bid_price + ask_price) / 2) AS low_mid,
-    argMaxState((bid_price + ask_price) / 2, recv_ts_ns) AS close_mid,
+    argMinState(assumeNotNull((bid_price + ask_price) / 2), recv_ts_ns) AS open_mid,
+    maxState(assumeNotNull((bid_price + ask_price) / 2)) AS high_mid,
+    minState(assumeNotNull((bid_price + ask_price) / 2)) AS low_mid,
+    argMaxState(assumeNotNull((bid_price + ask_price) / 2), recv_ts_ns) AS close_mid,
     argMaxState(
         tuple(
             bid_price,
@@ -149,7 +153,7 @@ AS SELECT
             ask_size,
             bid_order_count,
             ask_order_count,
-            (bid_price + ask_price) / 2,
+            assumeNotNull((bid_price + ask_price) / 2),
             recv_ts_ns
         ),
         recv_ts_ns

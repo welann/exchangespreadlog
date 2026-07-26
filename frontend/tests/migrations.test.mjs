@@ -19,6 +19,12 @@ test('candle schema uses mergeable aggregate states for all five layers', async 
   assert.match(sql, /argMinMergeState\(open_mid\)/);
   assert.match(sql, /argMaxMergeState\(final_book\)/);
   assert.match(sql, /sumMergeState\(tick_count\)/);
+  assert.equal(
+    sql.match(/SETTINGS prefer_column_name_to_alias = 1/g)?.length,
+    4,
+    'every cascading view must avoid ClickHouse 24.10 alias shadowing'
+  );
+  assert.match(sql, /assumeNotNull\(\(bid_price \+ ask_price\) \/ 2\)/);
   assert.doesNotMatch(sql, /SimpleAggregateFunction/);
   assert.doesNotMatch(sql, /\bFINAL\b/);
   assert.doesNotMatch(sql, /\btick_table\b/);
@@ -32,6 +38,8 @@ test('live and backfill paths are separated by the cutover watermark', async () 
 
   assert.match(schema, /recv_ts_ns > \{cutover_recv_ts_ns\}/);
   assert.match(backfill, /recv_ts_ns <= \{cutover_recv_ts_ns\}/);
+  assert.match(backfill, /assumeNotNull\(\(bid_price \+ ask_price\) \/ 2\)/);
   assert.match(backfill, /max_threads = 2/);
   assert.match(backfill, /max_insert_threads = 1/);
+  assert.match(backfill, /max_bytes_before_external_group_by = 1073741824/);
 });

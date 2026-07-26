@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { convertCandleRowsToSpreadPoints } from '../src/lib/spread/candle-conversion.ts';
+import { candleRangeIsCovered } from '../src/lib/spread/candle-coverage.ts';
 
 const instrument = {
   catalogId: 'catalog',
@@ -77,4 +78,50 @@ test('rejects incomplete candle snapshots instead of converting null to zero', (
     1
   );
   assert.deepEqual(points, []);
+});
+
+test('allows a current request while cached live coverage remains fresh', () => {
+  const nowMs = 100_000_000;
+  const coverage = {
+    ready: true,
+    coverageFromMs: 0,
+    coverageToMs: nowMs - 60_000
+  };
+
+  assert.equal(
+    candleRangeIsCovered(coverage, nowMs - 86_400_000, nowMs, nowMs, 120_000),
+    true
+  );
+});
+
+test('does not extend stale or historical coverage optimistically', () => {
+  const nowMs = 1_000_000;
+  assert.equal(
+    candleRangeIsCovered(
+      {
+        ready: true,
+        coverageFromMs: 0,
+        coverageToMs: nowMs - 181_000
+      },
+      0,
+      nowMs,
+      nowMs,
+      120_000
+    ),
+    false
+  );
+  assert.equal(
+    candleRangeIsCovered(
+      {
+        ready: true,
+        coverageFromMs: 500_000,
+        coverageToMs: nowMs
+      },
+      499_999,
+      nowMs,
+      nowMs,
+      120_000
+    ),
+    false
+  );
 });

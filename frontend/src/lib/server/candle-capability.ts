@@ -1,4 +1,5 @@
 import type { SpreadGranularity } from '$lib/types';
+import { candleRangeIsCovered } from '$lib/spread/candle-coverage';
 import {
   clickHouseConfig,
   configuredTable,
@@ -119,11 +120,11 @@ FORMAT JSONEachRow
 export function candleCoversRange(
   capability: CandleCapability,
   fromMs: number,
-  toMs: number
+  toMs: number,
+  nowMs = Date.now(),
+  maxStaleMs = clickHouseConfig().maxStaleMs
 ): boolean {
-  if (!capability.ready || capability.coverageFromMs === null) return false;
-  if (fromMs < capability.coverageFromMs) return false;
-  return capability.coverageToMs !== null && toMs <= capability.coverageToMs;
+  return candleRangeIsCovered(capability, fromMs, toMs, nowMs, maxStaleMs);
 }
 
 function capabilityBase(mode: CandleCapability['mode']): CandleCapability {

@@ -127,17 +127,11 @@ export function clickHouseConfig(): ClickHouseConfig {
 export function clickHouseConfigSummary() {
   const config = clickHouseConfig();
   return {
-    url: config.url,
     database: config.database,
     table: config.table,
     catalogTable: config.catalogTable,
-    username: config.username || null,
-    hasPassword: Boolean(config.password),
-    acceptInvalidCerts: config.acceptInvalidCerts,
     candleMode: config.candleMode,
-    maxStaleMs: config.maxStaleMs,
-    redirectedLegacyUrl: config.redirectedLegacyUrl,
-    source: config.source
+    maxStaleMs: config.maxStaleMs
   };
 }
 

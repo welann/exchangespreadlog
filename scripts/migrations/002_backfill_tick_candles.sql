@@ -1,6 +1,8 @@
 -- Backfill one bounded time slice after the activation watermark has passed.
--- Run newest day first and never overlap ranges. Inserting into the 1s table
--- automatically feeds all coarser views.
+-- Production default: one UTC hour at a time, newest first, with no overlaps.
+-- Inserting into the 1s table automatically feeds all coarser views. The
+-- external GROUP BY threshold keeps high-cardinality 1s states below the
+-- per-query memory ceiling.
 --
 -- Required substitutions: {database}, {table}, {from_ms}, {to_ms},
 -- {cutover_recv_ts_ns}
@@ -10,10 +12,10 @@ SELECT
     venue_instance_id,
     instrument_id,
     toStartOfSecond(recv_time) AS bucket_time,
-    argMinState((bid_price + ask_price) / 2, recv_ts_ns) AS open_mid,
-    maxState((bid_price + ask_price) / 2) AS high_mid,
-    minState((bid_price + ask_price) / 2) AS low_mid,
-    argMaxState((bid_price + ask_price) / 2, recv_ts_ns) AS close_mid,
+    argMinState(assumeNotNull((bid_price + ask_price) / 2), recv_ts_ns) AS open_mid,
+    maxState(assumeNotNull((bid_price + ask_price) / 2)) AS high_mid,
+    minState(assumeNotNull((bid_price + ask_price) / 2)) AS low_mid,
+    argMaxState(assumeNotNull((bid_price + ask_price) / 2), recv_ts_ns) AS close_mid,
     argMaxState(
         tuple(
             bid_price,
@@ -22,7 +24,7 @@ SELECT
             ask_size,
             bid_order_count,
             ask_order_count,
-            (bid_price + ask_price) / 2,
+            assumeNotNull((bid_price + ask_price) / 2),
             recv_ts_ns
         ),
         recv_ts_ns
@@ -45,7 +47,11 @@ WHERE recv_time >= fromUnixTimestamp64Milli({from_ms})
   AND venue_instance_id != ''
   AND instrument_id != ''
 GROUP BY venue_instance_id, instrument_id, bucket_time
-SETTINGS max_threads = 2, max_insert_threads = 1, max_memory_usage = 2147483648;
+SETTINGS
+    max_threads = 2,
+    max_insert_threads = 1,
+    max_bytes_before_external_group_by = 1073741824,
+    max_memory_usage = 2147483648;
 
 INSERT INTO {database}.{table}_latest_valid
 SELECT
@@ -70,4 +76,8 @@ WHERE recv_time >= fromUnixTimestamp64Milli({from_ms})
   AND venue_instance_id != ''
   AND instrument_id != ''
 GROUP BY venue_instance_id, instrument_id
-SETTINGS max_threads = 2, max_insert_threads = 1, max_memory_usage = 2147483648;
+SETTINGS
+    max_threads = 2,
+    max_insert_threads = 1,
+    max_bytes_before_external_group_by = 1073741824,
+    max_memory_usage = 2147483648;

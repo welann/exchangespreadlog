@@ -101,8 +101,8 @@ python3 scripts/render_candle_migration.py \
 
 For an online rollout, choose `cutover-recv-ts-ns` several minutes in the
 future, apply all of `001` before that watermark, and wait for the watermark to
-pass. Then backfill non-overlapping daily ranges with `002`, validate raw/candle
-parity, and apply `003` to publish the validated coverage. If a future
+pass. Then backfill non-overlapping UTC-hour ranges with `002`, newest first,
+validate raw/candle parity, and apply `003` to publish the validated coverage. If a future
 watermark cannot be guaranteed, briefly pause raw-table writes while capturing
 the watermark and installing the views. Keep `CLICKHOUSE_CANDLE_MODE=off` as
 the rollback switch. The templates never contain a ClickHouse password.
