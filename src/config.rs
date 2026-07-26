@@ -103,8 +103,8 @@ impl RuntimeConfig {
             http_addr: SocketAddr::new(host, port),
             clickhouse: ClickHouseConfig {
                 url: clickhouse_url,
-                database: env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "zeabur".to_string()),
-                username: required("CLICKHOUSE_USERNAME")?,
+                database: env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "zeabur".to_string()),
+                username: required("CLICKHOUSE_USER")?,
                 password: required("CLICKHOUSE_PASSWORD")?,
             },
             wal_path: PathBuf::from(
