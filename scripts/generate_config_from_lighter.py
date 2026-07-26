@@ -26,12 +26,14 @@ LIGHTER_DETAILS_URL = "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetai
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 RISEX_MARKETS_URL = "https://api.rise.trade/v1/markets"
 ZERO_ONE_INFO_URL = "https://zo-mainnet.n1.xyz/info"
-ETHEREAL_PRODUCTS_URL = "https://api.ethereal.trade/v1/product"
+# Ethereal is intentionally disabled.
+# ETHEREAL_PRODUCTS_URL = "https://api.ethereal.trade/v1/product"
 PERPL_CONTEXT_URL = "https://app.perpl.xyz/api/v1/pub/context"
 ONDO_MARKETS_URL = "https://api.ondoperps.xyz/v1/markets"
 
 USER_AGENT = "exchangespreadlog-config-generator/0.1"
 DETAIL_DELAY_SECONDS = 0.2
+SUPPORTED_QUOTE_ASSETS = {"USD", "USDC", "USDT", "AUSD"}
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,7 @@ class Instrument:
     raw_symbol: str
     feed_symbol: str
     base_asset: str
+    quote_asset: Optional[str] = None
     status: str = "active"
     price_tick: Optional[str] = None
     size_tick: Optional[str] = None
@@ -119,6 +122,7 @@ def instrument(
     raw_symbol: object,
     feed_symbol: object,
     base_asset: object,
+    quote_asset: Optional[str] = None,
     status: str = "active",
     price_tick: Optional[str] = None,
     size_tick: Optional[str] = None,
@@ -128,6 +132,7 @@ def instrument(
         raw_symbol=str(raw_symbol),
         feed_symbol=str(feed_symbol),
         base_asset=normalize_base(base_asset),
+        quote_asset=quote_asset,
         status=status,
         price_tick=price_tick,
         size_tick=size_tick,
@@ -266,6 +271,14 @@ def fetch_hyperliquid_instruments(
     lighter_markets: list[LighterMarket],
 ) -> list[Instrument]:
     data = post_json(HYPERLIQUID_INFO_URL, {"type": "allPerpMetas"})
+    spot_meta = post_json(HYPERLIQUID_INFO_URL, {"type": "spotMeta"})
+    if not isinstance(spot_meta, dict) or not isinstance(spot_meta.get("tokens"), list):
+        raise RuntimeError("Hyperliquid spotMeta returned an unsupported payload")
+    quote_by_index = {
+        token["index"]: str(token["name"]).upper()
+        for token in spot_meta["tokens"]
+        if isinstance(token, dict) and "index" in token and token.get("name")
+    }
     if isinstance(data, dict):
         metas = [data]
     elif isinstance(data, list):
@@ -275,6 +288,23 @@ def fetch_hyperliquid_instruments(
 
     by_base: dict[str, Instrument] = {}
     for meta in metas:
+        collateral_token = meta.get("collateralToken")
+        if collateral_token is None:
+            raise RuntimeError(
+                "Hyperliquid allPerpMetas entry is missing collateralToken"
+            )
+        quote_asset = quote_by_index.get(collateral_token)
+        if quote_asset is None:
+            raise RuntimeError(
+                f"Hyperliquid collateralToken {collateral_token} is absent from spotMeta"
+            )
+        if quote_asset not in SUPPORTED_QUOTE_ASSETS:
+            print(
+                "excluding Hyperliquid perp dex with unsupported quote "
+                f"{quote_asset} (collateralToken={collateral_token})",
+                file=sys.stderr,
+            )
+            continue
         universe = meta.get("universe")
         if not isinstance(universe, list):
             continue
@@ -285,7 +315,10 @@ def fetch_hyperliquid_instruments(
             if not name:
                 continue
             base = normalize_base(name)
-            by_base.setdefault(base, instrument(name, name, name, base))
+            by_base.setdefault(
+                base,
+                instrument(name, name, name, base, quote_asset=quote_asset),
+            )
     return select_in_lighter_order(by_base, lighter_markets)
 
 
@@ -346,32 +379,7 @@ def fetch_zero_one_instruments(lighter_markets: list[LighterMarket]) -> list[Ins
     return select_in_lighter_order(by_base, lighter_markets)
 
 
-def fetch_ethereal_instruments(lighter_markets: list[LighterMarket]) -> list[Instrument]:
-    data = get_json(ETHEREAL_PRODUCTS_URL)
-    products = None
-    if isinstance(data, dict):
-        products = data.get("data") or data.get("products")
-    else:
-        products = data
-    if not isinstance(products, list):
-        raise RuntimeError("Ethereal product payload is missing products")
-
-    by_base: dict[str, Instrument] = {}
-    for product in products:
-        if not isinstance(product, dict):
-            continue
-        status = str(product.get("status", "")).upper()
-        if status and status != "ACTIVE":
-            continue
-        ticker = product.get("ticker")
-        if not ticker:
-            continue
-        raw_symbol = product.get("displayTicker") or ticker
-        base = normalize_base(product.get("baseTokenName") or ticker)
-        by_base.setdefault(base, instrument(ticker, raw_symbol, ticker, base))
-    return select_in_lighter_order(by_base, lighter_markets)
-
-
+# Ethereal instrument discovery is intentionally disabled together with its adapter.
 def fetch_perpl_instruments(lighter_markets: list[LighterMarket]) -> list[Instrument]:
     data = get_json(PERPL_CONTEXT_URL)
     if not isinstance(data, dict) or not isinstance(data.get("markets"), list):
@@ -448,7 +456,8 @@ def build_venues(
         "hyperliquid": fetch_hyperliquid_instruments(lighter_markets),
         "risex": fetch_risex_instruments(lighter_markets),
         "01": fetch_zero_one_instruments(lighter_markets),
-        "ethereal": fetch_ethereal_instruments(lighter_markets),
+        # Ethereal discovery is intentionally disabled.
+        # "ethereal": fetch_ethereal_instruments(lighter_markets),
         "perpl": fetch_perpl_instruments(lighter_markets),
         "ondo": fetch_ondo_instruments(lighter_markets),
     }
@@ -514,18 +523,7 @@ def build_venues(
             default_margin_asset="USD",
             instruments=selected_instruments("01"),
         ),
-        Venue(
-            venue_instance_id="ethereal",
-            adapter="ethereal",
-            url="wss://ws2.ethereal.trade/v1/stream",
-            channel="L2Book",
-            catalog_source="exchange",
-            metadata_url=ETHEREAL_PRODUCTS_URL,
-            default_quote_asset="USD",
-            default_settle_asset="USD",
-            default_margin_asset="USD",
-            instruments=selected_instruments("ethereal"),
-        ),
+        # Ethereal venue generation is intentionally disabled.
         Venue(
             venue_instance_id="perpl",
             adapter="perpl",
@@ -664,6 +662,21 @@ def render_config(
                     toml_key_value("feed_symbol", inst.feed_symbol),
                     'product_type = "perp"',
                     toml_key_value("base_asset", inst.base_asset),
+                    *(
+                        [toml_key_value("quote_asset", inst.quote_asset)]
+                        if inst.quote_asset
+                        else []
+                    ),
+                    *(
+                        [toml_key_value("settle_asset", inst.quote_asset)]
+                        if inst.quote_asset
+                        else []
+                    ),
+                    *(
+                        [toml_key_value("margin_asset", inst.quote_asset)]
+                        if inst.quote_asset
+                        else []
+                    ),
                     *(
                         [toml_key_value("price_tick", inst.price_tick)]
                         if inst.price_tick

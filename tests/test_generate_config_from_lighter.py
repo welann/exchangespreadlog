@@ -28,7 +28,7 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertEqual(generator.normalize_base(raw), expected)
 
-    def test_fetch_lighter_markets_honors_a_positive_volume_limit(self):
+    def test_fetch_active_lighter_markets_ranks_and_deduplicates(self):
         original = generator.fetch_lighter_details
         generator.fetch_lighter_details = lambda: [
             {
@@ -68,7 +68,7 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
             },
         ]
         try:
-            top = generator.fetch_lighter_markets(2)
+            top = generator.fetch_active_lighter_markets()
         finally:
             generator.fetch_lighter_details = original
 
@@ -109,7 +109,7 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
             },
         ]
         try:
-            selected = generator.fetch_lighter_markets(0)
+            selected = generator.fetch_active_lighter_markets()
         finally:
             generator.fetch_lighter_details = original
 
@@ -123,26 +123,32 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
         generator.fetch_lighter_details = lambda: []
         try:
             with self.assertRaisesRegex(RuntimeError, "no active Lighter perp markets"):
-                generator.fetch_lighter_markets()
+                generator.fetch_active_lighter_markets()
         finally:
             generator.fetch_lighter_details = original
 
     def test_fetch_hyperliquid_instruments_includes_hip3_fallback(self):
         original = generator.post_json
-        generator.post_json = lambda _url, payload: [
-            {
-                "universe": [
-                    {"name": "BTC", "szDecimals": 5},
-                    {"name": "OLD", "isDelisted": True},
-                ]
-            },
-            {
-                "universe": [
-                    {"name": "xyz:SPCX", "szDecimals": 3},
-                    {"name": "hyna:BTC", "szDecimals": 5},
-                ]
-            },
-        ]
+        generator.post_json = lambda _url, payload: (
+            {"tokens": [{"index": 0, "name": "USDC"}]}
+            if payload["type"] == "spotMeta"
+            else [
+                {
+                    "collateralToken": 0,
+                    "universe": [
+                        {"name": "BTC", "szDecimals": 5},
+                        {"name": "OLD", "isDelisted": True},
+                    ],
+                },
+                {
+                    "collateralToken": 0,
+                    "universe": [
+                        {"name": "xyz:SPCX", "szDecimals": 3},
+                        {"name": "hyna:BTC", "szDecimals": 5},
+                    ],
+                },
+            ]
+        )
         try:
             instruments = generator.fetch_hyperliquid_instruments(
                 [
@@ -156,6 +162,7 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
         self.assertEqual([item.instrument_id for item in instruments], ["BTC", "xyz:SPCX"])
         self.assertEqual([item.feed_symbol for item in instruments], ["BTC", "xyz:SPCX"])
         self.assertEqual([item.base_asset for item in instruments], ["BTC", "SPCX"])
+        self.assertEqual([item.quote_asset for item in instruments], ["USDC", "USDC"])
 
     def test_render_config_writes_expected_venue_and_instrument_fields(self):
         top_markets = [
@@ -220,35 +227,7 @@ class GenerateConfigFromLighterTest(unittest.TestCase):
         self.assertIn('venue_instance_id = "empty"', rendered)
         self.assertIn("enabled = false", rendered)
 
-    def test_fetch_ethereal_instruments_accepts_data_payload(self):
-        original = generator.get_json
-        generator.get_json = lambda _url: {
-            "data": [
-                {
-                    "ticker": "BTCUSD",
-                    "displayTicker": "BTC-USD",
-                    "baseTokenName": "BTC",
-                    "status": "ACTIVE",
-                },
-                {
-                    "ticker": "ETHUSD",
-                    "displayTicker": "ETH-USD",
-                    "baseTokenName": "ETH",
-                    "status": "DISABLED",
-                },
-            ]
-        }
-        try:
-            instruments = generator.fetch_ethereal_instruments(
-                [generator.LighterMarket("1", "BTC", "BTC", Decimal("100"))]
-            )
-        finally:
-            generator.get_json = original
-
-        self.assertEqual(len(instruments), 1)
-        self.assertEqual(instruments[0].instrument_id, "BTCUSD")
-        self.assertEqual(instruments[0].feed_symbol, "BTCUSD")
-
+    # Ethereal generator coverage is intentionally disabled with the adapter.
     def test_fetch_risex_instruments_accepts_current_active_market_payload(self):
         original = generator.get_json
         generator.get_json = lambda _url: {

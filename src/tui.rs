@@ -346,9 +346,7 @@ fn draw_spread_panel(
 }
 
 fn spread_summary_height(inner_h: u16) -> u16 {
-    if inner_h >= 18 {
-        5
-    } else if inner_h >= 12 {
+    if inner_h >= 12 {
         5
     } else if inner_h >= 8 {
         4
@@ -1113,7 +1111,7 @@ mod tests {
             .find(|row| row.tick.instrument.venue_instance_id == "binance")
             .unwrap();
 
-        assert_eq!(cross_spread(&snapshot, &first, &second), "0.600500");
+        assert_eq!(cross_spread(&snapshot, first, second), "0.600500");
     }
 
     #[test]

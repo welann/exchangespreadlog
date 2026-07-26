@@ -302,9 +302,7 @@ fn parse_exchange_catalog(
 }
 
 fn parse_optional_fixed(value: Option<&str>) -> anyhow::Result<Option<Fixed>> {
-    value
-        .map(|value| Fixed::from_str(value).map_err(anyhow::Error::from))
-        .transpose()
+    value.map(Fixed::from_str).transpose()
 }
 
 fn base_from_market(market: &str) -> String {

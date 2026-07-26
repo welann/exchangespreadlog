@@ -8,11 +8,10 @@ Currently supported venues:
 - `lighter`
 - `risex`
 - `01`
-- `ethereal`
 - `perpl`
 - `ondo`
 
-By default, Hyperliquid, Lighter, RiseX, 01, Ethereal, Perpl, and Ondo are enabled in `config.example.toml`.
+By default, Hyperliquid, Lighter, RiseX, 01, Perpl, and Ondo are enabled in `config.example.toml`. The archived Ethereal source is intentionally excluded from compilation and runtime discovery.
 
 ## Project Structure
 
@@ -28,7 +27,7 @@ By default, Hyperliquid, Lighter, RiseX, 01, Ethereal, Perpl, and Ondo are enabl
     |-- config/             # TOML config model and defaults
     |-- domain/             # BBO tick, market catalog, fixed decimal, quality models
     |-- exchange/           # Exchange adapters and message parsers
-    |   |-- ethereal/
+    |   |-- ethereal/       # archived; module entry is intentionally disabled
     |   |-- hyperliquid/
     |   |-- lighter/
     |   |-- ondo/
@@ -75,13 +74,13 @@ uv run python scripts/generate_config_from_lighter.py --output config.generated.
 cargo run -- --config config.generated.toml
 ```
 
-By default the generator takes the deduplicated union of the Hyperliquid, RiseX, 01, Ethereal, Perpl, and Ondo catalogs, intersects it with Lighter's active perp catalog, and subscribes every resulting Lighter market. A positive `--limit` can still be used as an optional capacity cap; it is applied by `daily_quote_token_volume` only after the intersection is calculated:
+By default the generator takes the deduplicated union of the Hyperliquid, RiseX, 01, Perpl, and Ondo catalogs, intersects it with Lighter's active perp catalog, and subscribes every resulting Lighter market. A positive `--limit` can still be used as an optional capacity cap; it is applied by `daily_quote_token_volume` only after the intersection is calculated:
 
 ```bash
 uv run python scripts/generate_config_from_lighter.py --limit 30 --output config.generated.toml
 ```
 
-The generated config uses Lighter as the comparison anchor but does not subscribe Lighter-only markets. A market is included only when its normalized base asset exists on Lighter and at least one other supported venue. Each venue then receives only its exact matches from that selected set. For example, Lighter market `BTC` maps to Lighter feed `1`, Hyperliquid feed `BTC`, RiseX feed `1`, 01 feed `BTCUSD`, Ethereal feed `BTCUSD`, and Ondo feed `BTC-USD.P` when those markets exist in the corresponding metadata.
+The generated config uses Lighter as the comparison anchor but does not subscribe Lighter-only markets. A market is included only when its normalized base asset exists on Lighter and at least one other supported venue. Each venue then receives only its exact matches from that selected set. For example, Lighter market `BTC` maps to Lighter feed `1`, Hyperliquid feed `BTC`, RiseX feed `1`, 01 feed `BTCUSD`, and Ondo feed `BTC-USD.P` when those markets exist in the corresponding metadata.
 
 Generated configs enable automatic subscription refresh at `00:05` UTC every day. At that time the collector runs the same generator, validates the new TOML, compares each venue's subscription plan, and restarts only venues whose settings or instruments changed. Removed markets are cleared from the live TUI state; historical storage is retained. Generation or validation failures leave the current subscriptions running.
 
@@ -101,7 +100,7 @@ market_limit = 0
 
 `config.example.toml` leaves refresh disabled so running directly against the tracked example cannot overwrite it. Configs produced by the generator enable refresh by default.
 
-For Hyperliquid, the generator reads `allPerpMetas`, so default perp markets and HIP-3 markets are both considered. If a base asset exists in default Hyperliquid perps, that default coin is preferred; otherwise an exact HIP-3 match such as `xyz:SPCX` can be used for Lighter `SPCX`. The script still does not guess UI remaps or aliases, so `XAU` will not be guessed as `GOLD`, and `1000BONK` will not be guessed as `kBONK`.
+For Hyperliquid, the generator joins `allPerpMetas.collateralToken` with `spotMeta.tokens`, so default perp markets and HIP-3 markets retain their real quote/collateral asset. Markets whose quote has no explicit conversion rule (currently USDH, USDE, USDT0, and any unknown future token) are excluded instead of being mislabeled as USDC. If a base asset exists in default Hyperliquid perps, that default coin is preferred; otherwise an exact supported-quote HIP-3 match such as `xyz:SPCX` can be used for Lighter `SPCX`. The script still does not guess UI remaps or aliases, so `XAU` will not be guessed as `GOLD`, and `1000BONK` will not be guessed as `kBONK`.
 
 01 can reject oversized combined-stream WebSockets without publishing a fixed stream limit. The adapter starts with the current catalog, detects the exchange's `too many subscriptions` response, reduces the per-connection batch size, and caches the learned capacity for later reconnects. Larger future catalogs therefore create as many connections as needed without relying on a hard-coded stream count.
 

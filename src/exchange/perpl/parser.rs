@@ -5,6 +5,11 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedMessage {
     SubscriptionResponse(Vec<SubscriptionAck>),
+    ServerHeartbeat {
+        sid: u64,
+        sequence: i128,
+        height: i128,
+    },
     L2Book(PerplBookUpdate),
     Ignore,
 }
@@ -40,6 +45,8 @@ struct Envelope {
     sid: Option<u64>,
     #[serde(default)]
     sn: Option<i128>,
+    #[serde(default)]
+    h: Option<i128>,
     #[serde(default)]
     at: Option<BlockTimestamp>,
     #[serde(default)]
@@ -84,11 +91,26 @@ pub fn parse_message(text: &str) -> Result<ParsedMessage> {
     let envelope: Envelope = serde_json::from_str(text)?;
 
     match envelope.mt {
-        2 | 3 | 7 | 8 | 9 | 10 | 11 | 12 | 17 | 18 | 100 => Ok(ParsedMessage::Ignore),
+        2 | 3 | 7 | 8 | 9 | 10 | 11 | 12 | 17 | 18 => Ok(ParsedMessage::Ignore),
         6 => parse_subscription_response(envelope).map(ParsedMessage::SubscriptionResponse),
         15 | 16 => parse_l2_book(envelope).map(ParsedMessage::L2Book),
+        100 => parse_server_heartbeat(envelope),
         other => Err(anyhow!("unsupported Perpl websocket message type {other}")),
     }
+}
+
+fn parse_server_heartbeat(envelope: Envelope) -> Result<ParsedMessage> {
+    Ok(ParsedMessage::ServerHeartbeat {
+        sid: envelope
+            .sid
+            .ok_or_else(|| anyhow!("Perpl server heartbeat missing sid"))?,
+        sequence: envelope
+            .sn
+            .ok_or_else(|| anyhow!("Perpl server heartbeat missing sn"))?,
+        height: envelope
+            .h
+            .ok_or_else(|| anyhow!("Perpl server heartbeat missing h"))?,
+    })
 }
 
 fn parse_subscription_response(envelope: Envelope) -> Result<Vec<SubscriptionAck>> {
@@ -210,10 +232,14 @@ mod tests {
     }
 
     #[test]
-    fn ignores_heartbeat() {
+    fn parses_server_heartbeat() {
         assert_eq!(
-            parse_message(r#"{"mt":100,"sn":123}"#).unwrap(),
-            ParsedMessage::Ignore
+            parse_message(r#"{"mt":100,"sid":5000,"sn":90500970,"h":90500970}"#).unwrap(),
+            ParsedMessage::ServerHeartbeat {
+                sid: 5000,
+                sequence: 90_500_970,
+                height: 90_500_970,
+            }
         );
     }
 }

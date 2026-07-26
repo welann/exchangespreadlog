@@ -1,6 +1,6 @@
-use std::{str::FromStr, time::Duration};
+use std::{collections::HashMap, str::FromStr, time::Duration};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -10,15 +10,12 @@ use tokio::{
     time,
 };
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{
     config::{CatalogSource, VenueConfig},
     domain::{Fixed, InstrumentCatalog, MarketEvent, ProductType},
-    exchange::{
-        CatalogIndex, ExchangeAdapter, merge_configured_catalog, run_with_reconnect,
-        warn_catalog_miss,
-    },
+    exchange::{CatalogIndex, ExchangeAdapter, run_with_reconnect, warn_catalog_miss},
     ingest::ws,
 };
 
@@ -44,14 +41,13 @@ impl EtherealAdapter {
     pub fn from_config(config: &VenueConfig) -> Self {
         Self {
             venue_instance_id: config.venue_instance_id.clone(),
-            url: config
-                .url
-                .clone()
-                .unwrap_or_else(|| "wss://ws2.ethereal.trade/v1/stream".to_string()),
+            url: config.url.clone().unwrap_or_else(|| {
+                "wss://ws.ethereal.trade/socket.io/?EIO=4&transport=websocket".to_string()
+            }),
             channel: config
                 .channel
                 .clone()
-                .unwrap_or_else(|| "L2Book".to_string()),
+                .unwrap_or_else(|| "BookDepth".to_string()),
             configured_catalog: config.catalog(),
             catalog_source: config.catalog_source,
             metadata_url: config.metadata_url.clone(),
@@ -78,6 +74,37 @@ impl EtherealAdapter {
         let (stream, _) = ws::connect(&self.url).await?;
         let (mut write, mut read) = stream.split();
 
+        time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = read
+                    .next()
+                    .await
+                    .context("Ethereal websocket closed during Socket.IO handshake")??;
+                match message {
+                    Message::Text(text) => match parser::parse_message(&text)? {
+                        ParsedMessage::EngineOpen => {
+                            write
+                                .send(Message::Text("40/v1/stream,".to_string()))
+                                .await
+                                .context("connect Ethereal Socket.IO namespace")?;
+                        }
+                        ParsedMessage::NamespaceConnected => return Ok::<_, anyhow::Error>(()),
+                        ParsedMessage::EnginePing => {
+                            write.send(Message::Text("3".to_string())).await?;
+                        }
+                        ParsedMessage::L2Book(_) | ParsedMessage::Ignore => {}
+                    },
+                    Message::Ping(payload) => write.send(Message::Pong(payload)).await?,
+                    Message::Close(frame) => {
+                        bail!("Ethereal websocket closed during handshake: {frame:?}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .context("Ethereal Socket.IO namespace handshake timed out")??;
+
         for instrument in catalog.instruments() {
             let feed_key = instrument.feed_key();
             let payload = build_subscription_payload(&self.channel, feed_key);
@@ -90,10 +117,9 @@ impl EtherealAdapter {
         info!(
             venue = %self.venue_instance_id,
             instruments = catalog.instruments().len(),
-            "subscribed"
+            "Socket.IO subscription requests sent"
         );
         let mut books = EtherealBooks::default();
-        let mut heartbeat = time::interval(Duration::from_secs(30));
 
         loop {
             tokio::select! {
@@ -102,9 +128,6 @@ impl EtherealAdapter {
                         debug!(venue = "ethereal", "shutdown received");
                         return Ok(());
                     }
-                }
-                _ = heartbeat.tick() => {
-                    write.send(Message::Ping(Vec::new())).await?;
                 }
                 maybe_msg = read.next() => {
                     let Some(msg) = maybe_msg else {
@@ -144,9 +167,13 @@ impl EtherealAdapter {
                                         }
                                     }
                                 }
+                                Ok(ParsedMessage::EnginePing) => {
+                                    write.send(Message::Text("3".to_string())).await?;
+                                }
+                                Ok(ParsedMessage::EngineOpen | ParsedMessage::NamespaceConnected) => {}
                                 Ok(ParsedMessage::Ignore) => {}
                                 Err(err) => {
-                                    warn!(venue = "ethereal", error = %err, payload = %text, "failed to parse websocket message");
+                                    anyhow::bail!("Ethereal protocol error: {err}; payload={text}");
                                 }
                             }
                         }
@@ -168,7 +195,10 @@ impl EtherealAdapter {
         if self.catalog_source == CatalogSource::Exchange {
             match self.fetch_exchange_catalog().await {
                 Ok(fetched) => {
-                    let merged = merge_configured_catalog(configured, fetched);
+                    let merged = merge_ethereal_catalog(configured, fetched);
+                    if merged.is_empty() {
+                        bail!("Ethereal metadata contains none of the configured products");
+                    }
                     info!(
                         venue = %self.venue_instance_id,
                         instruments = merged.len(),
@@ -177,10 +207,8 @@ impl EtherealAdapter {
                     return Ok(CatalogIndex::new(merged));
                 }
                 Err(err) => {
-                    warn!(
-                        venue = %self.venue_instance_id,
-                        error = %err,
-                        "failed to load Ethereal exchange catalog; falling back to configured instruments"
+                    return Err(err).context(
+                        "Ethereal metadata is required because mainnet subscriptions use product UUIDs",
                     );
                 }
             }
@@ -230,14 +258,16 @@ impl ExchangeAdapter for EtherealAdapter {
 }
 
 fn build_subscription_payload(channel: &str, symbol: &str) -> String {
-    json!({
-        "event": "subscribe",
-        "data": {
+    format!(
+        "42/v1/stream,{}",
+        json!([
+            "subscribe",
+            {
             "type": channel,
-            "symbol": symbol,
+            "productId": symbol,
         }
-    })
-    .to_string()
+        ])
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,6 +277,7 @@ struct ProductResponse {
 
 #[derive(Debug, Deserialize)]
 struct Product {
+    id: String,
     ticker: String,
     #[serde(rename = "displayTicker")]
     display_ticker: String,
@@ -301,7 +332,7 @@ fn parse_exchange_catalog(
                 venue_instance_id,
                 product.ticker.clone(),
                 product.display_ticker,
-                Some(product.ticker),
+                Some(product.id),
                 ProductType::Perp,
                 base_asset,
                 quote_asset,
@@ -321,6 +352,43 @@ fn parse_exchange_catalog(
         .collect()
 }
 
+fn merge_ethereal_catalog(
+    configured: Vec<InstrumentCatalog>,
+    fetched: Vec<InstrumentCatalog>,
+) -> Vec<InstrumentCatalog> {
+    if configured.is_empty() {
+        return fetched;
+    }
+    let fetched_by_instrument = fetched
+        .into_iter()
+        .map(|instrument| (instrument.instrument_id.clone(), instrument))
+        .collect::<HashMap<_, _>>();
+    configured
+        .into_iter()
+        .filter_map(|configured| {
+            let fetched = fetched_by_instrument.get(&configured.instrument_id)?;
+            Some(InstrumentCatalog::new_with_units(
+                configured.venue_instance_id,
+                configured.instrument_id,
+                configured.raw_symbol,
+                fetched.feed_symbol.clone(),
+                configured.product_type,
+                configured.base_asset,
+                fetched.quote_asset.clone(),
+                fetched.settle_asset.clone(),
+                fetched.margin_asset.clone(),
+                configured.price_convention,
+                configured.size_unit,
+                fetched.price_tick.or(configured.price_tick),
+                fetched.size_tick.or(configured.size_tick),
+                fetched.min_size.or(configured.min_size),
+                fetched.status.clone(),
+                fetched.source_raw_json.clone(),
+            ))
+        })
+        .collect()
+}
+
 fn base_from_ticker(ticker: &str, quote_asset: &str) -> String {
     ticker
         .strip_suffix(quote_asset)
@@ -332,22 +400,13 @@ fn base_from_ticker(ticker: &str, quote_asset: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{base_from_ticker, build_subscription_payload, parse_exchange_catalog};
-    use serde_json::json;
-
     #[test]
     fn builds_l2_book_subscription_payload() {
-        let payload = build_subscription_payload("L2Book", "BTCUSD");
-        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let payload = build_subscription_payload("BookDepth", "product-1");
 
         assert_eq!(
-            value,
-            json!({
-                "event": "subscribe",
-                "data": {
-                    "type": "L2Book",
-                    "symbol": "BTCUSD",
-                }
-            })
+            payload,
+            r#"42/v1/stream,["subscribe",{"productId":"product-1","type":"BookDepth"}]"#
         );
     }
 
@@ -355,6 +414,7 @@ mod tests {
     fn parses_product_catalog() {
         let raw = r#"{
             "data": [{
+                "id": "bc7d5575-3711-4532-a000-312bfacfb767",
                 "ticker": "BTCUSD",
                 "displayTicker": "BTC-USD",
                 "baseTokenName": "BTC",
@@ -369,7 +429,10 @@ mod tests {
         let catalog = parse_exchange_catalog(raw, "ethereal", "USD", "USD", "USD").unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].instrument_id, "BTCUSD");
-        assert_eq!(catalog[0].feed_key(), "BTCUSD");
+        assert_eq!(
+            catalog[0].feed_key(),
+            "bc7d5575-3711-4532-a000-312bfacfb767"
+        );
         assert_eq!(catalog[0].raw_symbol, "BTC-USD");
         assert_eq!(catalog[0].base_asset, "BTC");
         assert_eq!(catalog[0].price_tick.unwrap().to_string(), "1");

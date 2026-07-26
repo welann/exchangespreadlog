@@ -1,0 +1,28 @@
+FROM rust:1.94-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY migrations/ migrations/
+COPY src/ src/
+RUN cargo build --locked --release
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 spread
+WORKDIR /app
+COPY --from=builder /build/target/release/exchange-spread-v2 /usr/local/bin/exchange-spread-v2
+RUN mkdir -p /app/data /app/empty \
+    && chown -R spread:spread /app
+USER spread
+ENV HTTP_HOST=0.0.0.0 \
+    HTTP_PORT=8080 \
+    WAL_PATH=/app/data/wal.sqlite3 \
+    WEB_DIR=/app/empty \
+    RUST_LOG=info
+EXPOSE 8080
+VOLUME ["/app/data"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["curl", "--fail", "--silent", "http://127.0.0.1:8080/v1/health"]
+ENTRYPOINT ["exchange-spread-v2"]
+

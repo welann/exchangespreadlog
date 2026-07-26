@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -9,6 +9,9 @@ use crate::domain::{BestLevel, Fixed};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedMessage {
     L2Book(L2BookUpdate),
+    EngineOpen,
+    NamespaceConnected,
+    EnginePing,
     Ignore,
 }
 
@@ -39,6 +42,10 @@ struct Envelope {
     message: Option<String>,
     #[serde(default)]
     data: Option<Value>,
+    #[serde(default)]
+    ok: Option<bool>,
+    #[serde(default)]
+    code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,8 +63,27 @@ struct L2BookData {
 }
 
 pub fn parse_message(text: &str) -> Result<ParsedMessage> {
+    if text == "2" {
+        return Ok(ParsedMessage::EnginePing);
+    }
+    if text.starts_with("0{") {
+        return Ok(ParsedMessage::EngineOpen);
+    }
+    if text.starts_with("40/v1/stream,") {
+        return Ok(ParsedMessage::NamespaceConnected);
+    }
+    if let Some(payload) = text.strip_prefix("42/v1/stream,") {
+        return parse_socket_io_event(payload);
+    }
+
     let envelope: Envelope = serde_json::from_str(text)?;
 
+    if envelope.ok == Some(false) {
+        bail!(
+            "Ethereal subscription rejected: {}",
+            envelope.code.unwrap_or_else(|| text.to_string())
+        );
+    }
     if envelope.event.as_deref() == Some("error") {
         bail!(
             "Ethereal websocket error: {}",
@@ -74,6 +100,48 @@ pub fn parse_message(text: &str) -> Result<ParsedMessage> {
         }
         _ => Ok(ParsedMessage::Ignore),
     }
+}
+
+fn parse_socket_io_event(payload: &str) -> Result<ParsedMessage> {
+    let event: Vec<Value> = serde_json::from_str(payload)?;
+    let event_name = event
+        .first()
+        .and_then(Value::as_str)
+        .context("Ethereal Socket.IO event is missing its name")?;
+    let data = event
+        .get(1)
+        .cloned()
+        .context("Ethereal Socket.IO event is missing its payload")?;
+    match event_name {
+        "BookDepth" => parse_book_depth(data).map(ParsedMessage::L2Book),
+        "exception" => bail!("Ethereal Socket.IO exception: {data}"),
+        _ => Ok(ParsedMessage::Ignore),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BookDepthData {
+    #[serde(rename = "productId")]
+    product_id: String,
+    timestamp: i64,
+    #[serde(default, rename = "previousTimestamp")]
+    previous_timestamp: Option<i64>,
+    #[serde(default)]
+    bids: Vec<[Value; 2]>,
+    #[serde(default)]
+    asks: Vec<[Value; 2]>,
+}
+
+fn parse_book_depth(data: Value) -> Result<L2BookUpdate> {
+    let payload: BookDepthData = serde_json::from_value(data)?;
+    Ok(L2BookUpdate {
+        symbol: payload.product_id,
+        exchange_ts_ms: payload.timestamp,
+        previous_ts_ms: payload.previous_timestamp,
+        is_snapshot: payload.previous_timestamp.is_none(),
+        bids: parse_levels(payload.bids)?,
+        asks: parse_levels(payload.asks)?,
+    })
 }
 
 fn parse_l2_book(data: Value) -> Result<L2BookUpdate> {
@@ -177,5 +245,33 @@ mod tests {
     fn ignores_subscription_ack() {
         let raw = r#"{"event":"subscribed","data":{"type":"L2Book","symbol":"BTCUSD"}}"#;
         assert_eq!(parse_message(raw).unwrap(), ParsedMessage::Ignore);
+    }
+
+    #[test]
+    fn rejects_documented_native_subscription_error() {
+        let raw = r#"{"ok":false,"code":"UNKNOWN_PRODUCT"}"#;
+        assert!(
+            parse_message(raw)
+                .unwrap_err()
+                .to_string()
+                .contains("UNKNOWN_PRODUCT")
+        );
+    }
+
+    #[test]
+    fn parses_mainnet_socket_io_book_depth() {
+        let raw = r#"42/v1/stream,["BookDepth",{"productId":"product-1","timestamp":1760000000200,"previousTimestamp":1760000000100,"asks":[["3001","0"]],"bids":[["3000","2"]],"t":1760000000201}]"#;
+        let ParsedMessage::L2Book(update) = parse_message(raw).unwrap() else {
+            panic!("expected Socket.IO BookDepth");
+        };
+        assert_eq!(update.symbol, "product-1");
+        assert_eq!(update.previous_ts_ms, Some(1_760_000_000_100));
+        assert_eq!(update.bids[0].level.size.to_string(), "2");
+    }
+
+    #[test]
+    fn surfaces_socket_io_exception() {
+        let raw = r#"42/v1/stream,["exception",{"pattern":"subscribe","status":"BadRequest"}]"#;
+        assert!(parse_message(raw).is_err());
     }
 }

@@ -1,0 +1,627 @@
+// Ethereal is intentionally disabled. Keep the adapter source archived under
+// `exchange/ethereal`, but do not compile or expose it.
+// pub mod ethereal;
+pub mod hyperliquid;
+pub mod lighter;
+pub mod ondo;
+pub mod perpl;
+pub mod risex;
+pub mod zero_one;
+
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
+use tokio::{
+    sync::{
+        mpsc::{Sender, error::TrySendError},
+        watch,
+    },
+    time,
+};
+use tracing::{info, warn};
+
+use crate::{
+    domain::{BboTick, Fixed, InstrumentCatalog, InstrumentRef, MarketEvent},
+    ingest::supervisor::Backoff,
+};
+
+const STABLE_CONNECTION_RESET_AFTER: Duration = Duration::from_secs(30);
+const TRANSIENT_WS_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const TRANSIENT_WS_RECONNECT_CAP: Duration = Duration::from_secs(5);
+const RATE_LIMIT_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+pub const TICK_FLUSH_INTERVAL: Duration = Duration::from_millis(5);
+
+/// BBO is state, not an append-only fact stream. When durable storage is
+/// temporarily slower than a venue, retain the newest state per instrument
+/// while continuing to consume every WebSocket frame.
+#[derive(Debug, Default)]
+pub struct LatestTickQueue {
+    pending: HashMap<String, BboTick>,
+    order: VecDeque<String>,
+}
+
+impl LatestTickQueue {
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub fn push(&mut self, tx: &Sender<MarketEvent>, tick: BboTick) -> anyhow::Result<()> {
+        let key = tick.instrument.catalog_id.clone();
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.pending.entry(key.clone())
+        {
+            entry.insert(tick);
+            return Ok(());
+        }
+        match tx.try_send(MarketEvent::Tick { tick }) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(MarketEvent::Tick { tick })) => {
+                let order_key = key.clone();
+                self.pending.insert(key, tick);
+                self.order.push_back(order_key);
+                Ok(())
+            }
+            Err(TrySendError::Closed(_)) => anyhow::bail!("event pipeline is closed"),
+            Err(TrySendError::Full(_)) => unreachable!("only tick events are queued"),
+        }
+    }
+
+    pub fn flush(&mut self, tx: &Sender<MarketEvent>) -> anyhow::Result<()> {
+        while let Some(key) = self.order.pop_front() {
+            let tick = self
+                .pending
+                .remove(&key)
+                .expect("pending tick order and map stay in sync");
+            match tx.try_send(MarketEvent::Tick { tick }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(MarketEvent::Tick { tick })) => {
+                    let order_key = key.clone();
+                    self.pending.insert(key, tick);
+                    self.order.push_back(order_key);
+                    break;
+                }
+                Err(TrySendError::Closed(_)) => anyhow::bail!("event pipeline is closed"),
+                Err(TrySendError::Full(_)) => unreachable!("only tick events are queued"),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+pub trait ExchangeAdapter: Send + Sync {
+    async fn run(
+        &self,
+        tx: Sender<MarketEvent>,
+        shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()>;
+}
+
+pub async fn run_with_reconnect<F, Fut>(
+    venue: &'static str,
+    tx: Sender<MarketEvent>,
+    shutdown: watch::Receiver<bool>,
+    run_once: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(Sender<MarketEvent>, watch::Receiver<bool>) -> Fut + Send,
+    Fut: Future<Output = anyhow::Result<()>> + Send,
+{
+    run_with_reconnect_backoff(venue, tx, shutdown, Backoff::default(), run_once).await
+}
+
+pub async fn run_with_reconnect_backoff<F, Fut>(
+    venue: &'static str,
+    tx: Sender<MarketEvent>,
+    mut shutdown: watch::Receiver<bool>,
+    mut backoff: Backoff,
+    mut run_once: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(Sender<MarketEvent>, watch::Receiver<bool>) -> Fut + Send,
+    Fut: Future<Output = anyhow::Result<()>> + Send,
+{
+    while !*shutdown.borrow() {
+        let started_at = Instant::now();
+        match run_once(tx.clone(), shutdown.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let uptime = started_at.elapsed();
+                let decision = reconnect_decision(&mut backoff, &err, uptime);
+                let _ = tx
+                    .send(MarketEvent::VenueReset {
+                        venue_instance_id: venue.to_string(),
+                    })
+                    .await;
+                log_adapter_restart(venue, &err, decision, uptime);
+                tokio::select! {
+                    _ = time::sleep(decision.sleep) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_ok() && *shutdown.borrow() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconnectDecision {
+    sleep: Duration,
+    kind: ReconnectKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectKind {
+    TransientWebsocketDisconnect,
+    RateLimited,
+    Error,
+}
+
+fn reconnect_decision(
+    backoff: &mut Backoff,
+    err: &anyhow::Error,
+    uptime: Duration,
+) -> ReconnectDecision {
+    // A venue-level limit can outlive the socket that hit it. Do not reset the
+    // backoff just because that socket had been healthy for a while, and wait
+    // long enough for a rolling request window to drain before reconnecting.
+    if is_rate_limited(err) {
+        let sleep = backoff.next_delay().max(RATE_LIMIT_RECONNECT_DELAY);
+        return ReconnectDecision {
+            sleep,
+            kind: ReconnectKind::RateLimited,
+        };
+    }
+
+    let was_stable_connection = uptime >= STABLE_CONNECTION_RESET_AFTER;
+    if was_stable_connection {
+        backoff.reset();
+    }
+
+    if is_transient_websocket_disconnect(err) {
+        let sleep = if was_stable_connection {
+            TRANSIENT_WS_RECONNECT_DELAY
+        } else {
+            backoff.next_delay().min(TRANSIENT_WS_RECONNECT_CAP)
+        };
+        return ReconnectDecision {
+            sleep,
+            kind: ReconnectKind::TransientWebsocketDisconnect,
+        };
+    }
+
+    ReconnectDecision {
+        sleep: backoff.next_delay(),
+        kind: ReconnectKind::Error,
+    }
+}
+
+fn log_adapter_restart(
+    venue: &str,
+    err: &anyhow::Error,
+    decision: ReconnectDecision,
+    uptime: Duration,
+) {
+    match decision.kind {
+        ReconnectKind::TransientWebsocketDisconnect => {
+            info!(
+                venue,
+                reason = %err,
+                sleep = ?decision.sleep,
+                ?uptime,
+                "adapter reconnecting after transient websocket disconnect"
+            );
+        }
+        ReconnectKind::RateLimited => {
+            warn!(
+                venue,
+                error = %err,
+                sleep = ?decision.sleep,
+                ?uptime,
+                "adapter rate limited; cooling down before reconnect"
+            );
+        }
+        ReconnectKind::Error => {
+            warn!(
+                venue,
+                error = %err,
+                sleep = ?decision.sleep,
+                ?uptime,
+                "adapter restarting"
+            );
+        }
+    }
+}
+
+fn is_rate_limited(err: &anyhow::Error) -> bool {
+    let text = error_chain_text(err);
+    text.contains("too many requests")
+        || text.contains("rate_limit")
+        || text.contains("rate limit")
+        || text.contains("rate-limited")
+}
+
+fn is_transient_websocket_disconnect(err: &anyhow::Error) -> bool {
+    let text = error_chain_text(err);
+
+    text.contains("without closing handshake")
+        || text.contains("connection reset without closing handshake")
+        || text.contains("connection reset by peer")
+        || text.contains("broken pipe")
+        || text.contains("reason: \"expired\"")
+        || text.contains("reason: \"ping timeout\"")
+}
+
+fn error_chain_text(err: &anyhow::Error) -> String {
+    let mut text = String::new();
+    for cause in err.chain() {
+        if !text.is_empty() {
+            text.push_str(": ");
+        }
+        text.push_str(&cause.to_string());
+    }
+    text.to_ascii_lowercase()
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogIndex {
+    instruments: Vec<InstrumentCatalog>,
+    refs_by_feed_key: HashMap<String, InstrumentRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogLookupMiss {
+    pub venue_instance_id: String,
+    pub feed_key: String,
+}
+
+impl CatalogIndex {
+    pub fn new(instruments: Vec<InstrumentCatalog>) -> Self {
+        let mut refs_by_feed_key = HashMap::new();
+        for instrument in &instruments {
+            let instrument_ref = instrument.instrument_ref();
+            for key in catalog_keys(instrument) {
+                refs_by_feed_key
+                    .entry(key)
+                    .or_insert_with(|| instrument_ref.clone());
+            }
+        }
+
+        Self {
+            instruments,
+            refs_by_feed_key,
+        }
+    }
+
+    pub fn instruments(&self) -> &[InstrumentCatalog] {
+        &self.instruments
+    }
+
+    pub fn resolve(&self, feed_key: &str) -> Option<InstrumentRef> {
+        self.refs_by_feed_key.get(feed_key).cloned()
+    }
+
+    pub fn retarget_tick(&self, mut tick: BboTick) -> Result<BboTick, CatalogLookupMiss> {
+        let feed_key = tick.instrument.instrument_id.clone();
+        let instrument = self.resolve(&feed_key).ok_or_else(|| CatalogLookupMiss {
+            venue_instance_id: tick.instrument.venue_instance_id.clone(),
+            feed_key,
+        })?;
+        tick.instrument = instrument;
+        Ok(tick)
+    }
+}
+
+pub fn warn_catalog_miss(adapter: &str, miss: CatalogLookupMiss) {
+    warn!(
+        venue = %miss.venue_instance_id,
+        adapter,
+        feed_key = %miss.feed_key,
+        "tick skipped because feed key is missing from instrument catalog"
+    );
+}
+
+pub fn merge_configured_catalog(
+    configured: Vec<InstrumentCatalog>,
+    fetched: Vec<InstrumentCatalog>,
+) -> Vec<InstrumentCatalog> {
+    if configured.is_empty() {
+        return fetched;
+    }
+
+    // Configured instruments define the subscription set; exchange metadata only enriches rules.
+    let fetched_by_key = catalog_lookup(fetched);
+    configured
+        .into_iter()
+        .map(|instrument| {
+            lookup_catalog(&fetched_by_key, &instrument)
+                .map(|fetched| enrich_configured_catalog(instrument.clone(), fetched))
+                .unwrap_or(instrument)
+        })
+        .collect()
+}
+
+fn enrich_configured_catalog(
+    configured: InstrumentCatalog,
+    fetched: InstrumentCatalog,
+) -> InstrumentCatalog {
+    InstrumentCatalog::new_with_units(
+        configured.venue_instance_id,
+        configured.instrument_id,
+        configured.raw_symbol,
+        configured.feed_symbol,
+        configured.product_type,
+        configured.base_asset,
+        configured.quote_asset,
+        configured.settle_asset,
+        configured.margin_asset,
+        configured.price_convention,
+        configured.size_unit,
+        fetched.price_tick.or(configured.price_tick),
+        fetched.size_tick.or(configured.size_tick),
+        fetched.min_size.or(configured.min_size),
+        fetched.status,
+        fetched.source_raw_json.or(configured.source_raw_json),
+    )
+}
+
+pub fn decimal_tick(decimals: u32) -> Option<Fixed> {
+    Some(Fixed::new(1, decimals))
+}
+
+fn catalog_lookup(instruments: Vec<InstrumentCatalog>) -> HashMap<String, InstrumentCatalog> {
+    let mut lookup = HashMap::new();
+    for instrument in instruments {
+        for key in catalog_keys(&instrument) {
+            lookup.entry(key).or_insert_with(|| instrument.clone());
+        }
+    }
+    lookup
+}
+
+fn lookup_catalog(
+    lookup: &HashMap<String, InstrumentCatalog>,
+    instrument: &InstrumentCatalog,
+) -> Option<InstrumentCatalog> {
+    catalog_keys(instrument)
+        .into_iter()
+        .find_map(|key| lookup.get(&key).cloned())
+}
+
+fn catalog_keys(instrument: &InstrumentCatalog) -> Vec<String> {
+    let mut keys = vec![
+        instrument.instrument_id.clone(),
+        instrument.raw_symbol.clone(),
+        instrument.display_symbol().to_string(),
+    ];
+    if let Some(feed_symbol) = &instrument.feed_symbol {
+        keys.push(feed_symbol.clone());
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CatalogIndex, LatestTickQueue, RATE_LIMIT_RECONNECT_DELAY, ReconnectDecision,
+        ReconnectKind, TRANSIENT_WS_RECONNECT_DELAY, decimal_tick, is_rate_limited,
+        is_transient_websocket_disconnect, merge_configured_catalog, reconnect_decision,
+    };
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    use crate::{
+        domain::{BboTick, BestLevel, InstrumentCatalog, ProductType, SourceKind},
+        ingest::supervisor::Backoff,
+    };
+
+    fn catalog(id: &str, raw: &str, feed: &str, price_tick: Option<&str>) -> InstrumentCatalog {
+        InstrumentCatalog::new(
+            "lighter",
+            id,
+            raw,
+            Some(feed.to_string()),
+            ProductType::Perp,
+            raw,
+            "USDC",
+            "USDC",
+            "USDC",
+            price_tick.map(|value| value.parse().unwrap()),
+            None,
+            None,
+            "active",
+            None,
+        )
+    }
+
+    fn tick(id: &str, sequence: i128) -> BboTick {
+        BboTick::new(
+            catalog(id, id, id, None).instrument_ref(),
+            sequence,
+            None,
+            Some(sequence),
+            None::<BestLevel>,
+            None::<BestLevel>,
+            SourceKind::Ticker,
+        )
+    }
+
+    #[test]
+    fn latest_tick_queue_coalesces_and_rotates_pending_instruments() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(crate::domain::MarketEvent::Tick {
+            tick: tick("filler", 0),
+        })
+        .unwrap();
+        let mut queue = LatestTickQueue::default();
+
+        queue.push(&tx, tick("BTC", 1)).unwrap();
+        queue.push(&tx, tick("BTC", 2)).unwrap();
+        queue.push(&tx, tick("ETH", 3)).unwrap();
+        let _ = rx.try_recv().unwrap();
+
+        queue.flush(&tx).unwrap();
+        queue.push(&tx, tick("BTC", 4)).unwrap();
+        let crate::domain::MarketEvent::Tick { tick } = rx.try_recv().unwrap() else {
+            panic!("expected BTC tick");
+        };
+        assert_eq!(tick.sequence, Some(2));
+
+        queue.flush(&tx).unwrap();
+        let crate::domain::MarketEvent::Tick { tick } = rx.try_recv().unwrap() else {
+            panic!("expected ETH tick");
+        };
+        assert_eq!(tick.sequence, Some(3));
+
+        queue.flush(&tx).unwrap();
+        let crate::domain::MarketEvent::Tick { tick } = rx.try_recv().unwrap() else {
+            panic!("expected latest BTC tick");
+        };
+        assert_eq!(tick.sequence, Some(4));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn retarget_tick_reports_missing_catalog_key() {
+        let index = CatalogIndex::new(vec![catalog("1", "BTC", "1", None)]);
+        let tick = BboTick::new(
+            crate::domain::InstrumentRef::unchecked("lighter", "999"),
+            123,
+            None,
+            None,
+            None::<BestLevel>,
+            None::<BestLevel>,
+            SourceKind::Ticker,
+        );
+
+        let miss = index.retarget_tick(tick).unwrap_err();
+        assert_eq!(miss.venue_instance_id, "lighter");
+        assert_eq!(miss.feed_key, "999");
+    }
+
+    #[test]
+    fn merge_configured_catalog_keeps_subscription_order_and_uses_fetched_rules() {
+        let configured = vec![
+            catalog("1", "BTC", "1", None),
+            catalog("2", "ETH", "2", None),
+        ];
+        let fetched = vec![catalog("2", "ETH", "2", Some("0.01"))];
+
+        let merged = merge_configured_catalog(configured, fetched);
+
+        assert_eq!(merged[0].instrument_id, "1");
+        assert_eq!(merged[0].price_tick, None);
+        assert_eq!(merged[1].instrument_id, "2");
+        assert_eq!(merged[1].price_tick, decimal_tick(2));
+    }
+
+    #[test]
+    fn merge_configured_catalog_preserves_normalized_asset_identity() {
+        let mut configured = catalog("96", "EURUSD", "96", None);
+        configured.base_asset = "EUR".to_string();
+        let fetched = vec![catalog("96", "EURUSD", "96", Some("0.00001"))];
+
+        let merged = merge_configured_catalog(vec![configured], fetched);
+
+        assert_eq!(merged[0].base_asset, "EUR");
+        assert_eq!(merged[0].price_tick, decimal_tick(5));
+    }
+
+    #[test]
+    fn classifies_connection_reset_as_transient_disconnect() {
+        let err =
+            anyhow::anyhow!("WebSocket protocol error: Connection reset without closing handshake");
+        assert!(is_transient_websocket_disconnect(&err));
+
+        let err = anyhow::anyhow!("order-book sequence gap for BTCUSD");
+        assert!(!is_transient_websocket_disconnect(&err));
+    }
+
+    #[test]
+    fn classifies_exchange_close_reasons_as_transient_disconnects() {
+        let err = anyhow::anyhow!(
+            "Hyperliquid websocket closed: Some(CloseFrame {{ code: Normal, reason: \"Expired\" }})"
+        );
+        assert!(is_transient_websocket_disconnect(&err));
+
+        let err = anyhow::anyhow!(
+            "Perpl websocket closed: Some(CloseFrame {{ code: Policy, reason: \"ping timeout\" }})"
+        );
+        assert!(is_transient_websocket_disconnect(&err));
+    }
+
+    #[test]
+    fn classifies_exchange_too_many_requests_close_as_rate_limited() {
+        let err = anyhow::anyhow!(
+            "Perpl websocket closed: Some(CloseFrame {{ code: Policy, reason: \"too many requests\" }})"
+        );
+
+        assert!(is_rate_limited(&err));
+        assert!(!is_transient_websocket_disconnect(&err));
+
+        let err = anyhow::anyhow!("websocket exception: RATE_LIMIT");
+        assert!(is_rate_limited(&err));
+    }
+
+    #[test]
+    fn cools_down_after_rate_limit_even_when_connection_was_stable() {
+        let err = anyhow::anyhow!(
+            "Perpl websocket closed: Some(CloseFrame {{ code: Policy, reason: \"too many requests\" }})"
+        );
+        let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
+
+        let decision = reconnect_decision(&mut backoff, &err, Duration::from_secs(245));
+
+        assert_eq!(
+            decision,
+            ReconnectDecision {
+                sleep: RATE_LIMIT_RECONNECT_DELAY,
+                kind: ReconnectKind::RateLimited,
+            }
+        );
+    }
+
+    #[test]
+    fn reconnects_quickly_after_stable_transient_websocket_disconnect() {
+        let err =
+            anyhow::anyhow!("WebSocket protocol error: Connection reset without closing handshake");
+        let mut backoff = Backoff::new(Duration::from_secs(15), Duration::from_secs(300));
+
+        let decision = reconnect_decision(&mut backoff, &err, Duration::from_secs(120));
+
+        assert_eq!(
+            decision,
+            ReconnectDecision {
+                sleep: TRANSIENT_WS_RECONNECT_DELAY,
+                kind: ReconnectKind::TransientWebsocketDisconnect,
+            }
+        );
+    }
+
+    #[test]
+    fn caps_rapid_transient_websocket_disconnect_backoff() {
+        let err =
+            anyhow::anyhow!("WebSocket protocol error: Connection reset without closing handshake");
+        let mut backoff = Backoff::new(Duration::from_secs(15), Duration::from_secs(300));
+
+        let decision = reconnect_decision(&mut backoff, &err, Duration::from_secs(1));
+
+        assert_eq!(
+            decision,
+            ReconnectDecision {
+                sleep: Duration::from_secs(5),
+                kind: ReconnectKind::TransientWebsocketDisconnect,
+            }
+        );
+    }
+}

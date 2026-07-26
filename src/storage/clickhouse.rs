@@ -297,13 +297,13 @@ impl BboSink for ClickHouseSink {
             }
         }
 
-        if let Some(mut rows) = ready {
-            if let Err(err) = self.insert_tick_rows(&rows).await {
-                let mut buffer = self.buffer.lock().await;
-                rows.append(&mut *buffer);
-                *buffer = rows;
-                return Err(err);
-            }
+        if let Some(mut rows) = ready
+            && let Err(err) = self.insert_tick_rows(&rows).await
+        {
+            let mut buffer = self.buffer.lock().await;
+            rows.append(&mut *buffer);
+            *buffer = rows;
+            return Err(err);
         }
 
         Ok(())
@@ -448,15 +448,15 @@ impl BboClickHouseRow {
     }
 }
 
-fn best_level_fields(
-    level: Option<&BestLevel>,
-) -> (
+type BestLevelFields = (
     Option<f64>,
     Option<String>,
     Option<f64>,
     Option<String>,
     Option<u32>,
-) {
+);
+
+fn best_level_fields(level: Option<&BestLevel>) -> BestLevelFields {
     let Some(level) = level else {
         return (None, None, None, None, None);
     };
@@ -481,18 +481,18 @@ fn source_kind_as_str(source: SourceKind) -> &'static str {
 }
 
 fn resolve_password(config: &ClickHouseConfig) -> anyhow::Result<Option<String>> {
-    if let Some(password) = config.password.as_deref() {
-        if !password.is_empty() {
-            return Ok(Some(password.to_string()));
-        }
+    if let Some(password) = config.password.as_deref()
+        && !password.is_empty()
+    {
+        return Ok(Some(password.to_string()));
     }
 
-    if let Some(env_name) = config.password_env.as_deref().map(str::trim) {
-        if !env_name.is_empty() {
-            let password = std::env::var(env_name)
-                .with_context(|| format!("read ClickHouse password from ${env_name}"))?;
-            return Ok(Some(password));
-        }
+    if let Some(env_name) = config.password_env.as_deref().map(str::trim)
+        && !env_name.is_empty()
+    {
+        let password = std::env::var(env_name)
+            .with_context(|| format!("read ClickHouse password from ${env_name}"))?;
+        return Ok(Some(password));
     }
 
     Ok(None)

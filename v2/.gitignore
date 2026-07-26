@@ -1,0 +1,8 @@
+/target
+/data
+/.env
+/.playwright-cli
+/output/playwright
+/web/node_modules
+/web/.svelte-kit
+/web/build

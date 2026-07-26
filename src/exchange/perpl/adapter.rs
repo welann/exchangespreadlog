@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::{CatalogSource, VenueConfig},
+    config::VenueConfig,
     domain::{Fixed, InstrumentCatalog, InstrumentRef, MarketEvent, ProductType},
     exchange::{
         CatalogIndex, ExchangeAdapter, decimal_tick, merge_configured_catalog, run_with_reconnect,
@@ -27,7 +27,8 @@ use super::{
     parser::{self, ParsedMessage},
 };
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const SERVER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+const HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct PerplAdapter {
@@ -35,7 +36,6 @@ pub struct PerplAdapter {
     url: String,
     channel: String,
     configured_catalog: Vec<InstrumentCatalog>,
-    catalog_source: CatalogSource,
     metadata_url: Option<String>,
     default_quote_asset: String,
     default_settle_asset: String,
@@ -61,7 +61,6 @@ impl PerplAdapter {
                 .clone()
                 .unwrap_or_else(|| "order-book".to_string()),
             configured_catalog: config.catalog(),
-            catalog_source: config.catalog_source,
             metadata_url: config.metadata_url.clone(),
             default_quote_asset: config.default_quote_asset.clone(),
             default_settle_asset: config.default_settle_asset.clone(),
@@ -74,7 +73,9 @@ impl PerplAdapter {
         tx: Sender<MarketEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let catalog = self.bootstrap_catalog().await?;
+        let bootstrap = self.bootstrap_catalog().await?;
+        let catalog = bootstrap.catalog;
+        let heartbeat_stream = bootstrap.heartbeat_stream;
         for instrument in catalog.instruments() {
             tx.send(MarketEvent::Catalog {
                 instrument: instrument.clone(),
@@ -87,19 +88,25 @@ impl PerplAdapter {
         let (mut write, mut read) = stream.split();
         let mut streams = HashMap::new();
 
-        let subscriptions = catalog
-            .instruments()
-            .iter()
-            .map(|instrument| {
-                let feed_key = instrument.feed_key();
-                let stream = format!("{}@{feed_key}", self.channel);
-                streams.insert(stream.clone(), instrument.clone());
-                json!({
-                    "stream": stream,
-                    "subscribe": true,
+        let mut subscriptions = vec![json!({
+            "stream": heartbeat_stream.clone(),
+            "subscribe": true,
+        })];
+        subscriptions.extend(
+            catalog
+                .instruments()
+                .iter()
+                .map(|instrument| {
+                    let feed_key = instrument.feed_key();
+                    let stream = format!("{}@{feed_key}", self.channel);
+                    streams.insert(stream.clone(), instrument.clone());
+                    json!({
+                        "stream": stream,
+                        "subscribe": true,
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>(),
+        );
 
         write
             .send(Message::Text(
@@ -119,8 +126,13 @@ impl PerplAdapter {
         );
 
         let mut sid_targets = HashMap::<u64, SidTarget>::new();
+        let mut heartbeat_sid = None;
+        let mut last_heartbeat_sequence = None;
+        let connected_at = time::Instant::now();
+        let mut last_heartbeat_at = None;
         let mut books = PerplBooks::default();
-        let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
+        let mut heartbeat_check = time::interval(HEARTBEAT_CHECK_INTERVAL);
+        heartbeat_check.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -130,8 +142,14 @@ impl PerplAdapter {
                         return Ok(());
                     }
                 }
-                _ = heartbeat.tick() => {
-                    write.send(Message::Text(json!({"mt": 1, "t": crate::ingest::time::unix_time_ns() / 1_000_000}).to_string())).await?;
+                _ = heartbeat_check.tick() => {
+                    let last_seen = last_heartbeat_at.unwrap_or(connected_at);
+                    if last_seen.elapsed() > SERVER_HEARTBEAT_TIMEOUT {
+                        anyhow::bail!(
+                            "Perpl server heartbeat timed out after {:?}",
+                            last_seen.elapsed()
+                        );
+                    }
                 }
                 maybe_msg = read.next() => {
                     let Some(msg) = maybe_msg else {
@@ -145,6 +163,10 @@ impl PerplAdapter {
                                     for ack in acks {
                                         if let Some(error) = ack.error {
                                             anyhow::bail!("Perpl subscription failed for {}: {error}", ack.stream);
+                                        }
+                                        if ack.stream == heartbeat_stream {
+                                            heartbeat_sid = Some(ack.sid);
+                                            continue;
                                         }
                                         let Some(instrument) = streams.get(&ack.stream) else {
                                             warn!(
@@ -164,6 +186,24 @@ impl PerplAdapter {
                                         );
                                     }
                                 }
+                                Ok(ParsedMessage::ServerHeartbeat { sid, sequence, height }) => {
+                                    if heartbeat_sid != Some(sid) {
+                                        anyhow::bail!(
+                                            "Perpl heartbeat sid mismatch: subscribed={heartbeat_sid:?}, received={sid}"
+                                        );
+                                    }
+                                    accept_heartbeat_sequence(
+                                        &mut last_heartbeat_sequence,
+                                        sequence,
+                                    )?;
+                                    last_heartbeat_at = Some(time::Instant::now());
+                                    debug!(
+                                        venue = %self.venue_instance_id,
+                                        sequence,
+                                        height,
+                                        "Perpl server heartbeat received"
+                                    );
+                                }
                                 Ok(ParsedMessage::L2Book(update)) => {
                                     let Some(target) = sid_targets.get(&update.sid).cloned() else {
                                         warn_catalog_miss(
@@ -178,14 +218,14 @@ impl PerplAdapter {
 
                                     match books.apply(update, target.instrument, target.scale, recv_ts_ns) {
                                         ApplyResult::Tick(tick) => {
-                                            tx.send(MarketEvent::Tick { tick }).await.context("send Perpl tick")?;
+                                            tx.send(MarketEvent::Tick { tick: *tick }).await.context("send Perpl tick")?;
                                         }
                                         ApplyResult::Skipped => {}
                                     }
                                 }
                                 Ok(ParsedMessage::Ignore) => {}
                                 Err(err) => {
-                                    warn!(venue = "perpl", error = %err, payload = %text, "failed to parse websocket message");
+                                    anyhow::bail!("Perpl protocol error: {err}; payload={text}");
                                 }
                             }
                         }
@@ -202,33 +242,28 @@ impl PerplAdapter {
         }
     }
 
-    async fn bootstrap_catalog(&self) -> anyhow::Result<CatalogIndex> {
+    async fn bootstrap_catalog(&self) -> anyhow::Result<PerplBootstrap> {
         let configured = self.configured_catalog.clone();
-        if self.catalog_source == CatalogSource::Exchange {
-            match self.fetch_exchange_catalog().await {
-                Ok(fetched) => {
-                    let merged = merge_configured_catalog(configured, fetched);
-                    info!(
-                        venue = %self.venue_instance_id,
-                        instruments = merged.len(),
-                        "loaded Perpl instrument catalog from exchange metadata"
-                    );
-                    return Ok(CatalogIndex::new(merged));
-                }
-                Err(err) => {
-                    warn!(
-                        venue = %self.venue_instance_id,
-                        error = %err,
-                        "failed to load Perpl exchange catalog; falling back to configured instruments"
-                    );
-                }
-            }
+        let fetched = self.fetch_exchange_context().await.context(
+            "Perpl context is required to discover the official server heartbeat stream",
+        )?;
+        let merged = merge_configured_catalog(configured, fetched.catalog);
+        if merged.is_empty() {
+            bail!("Perpl metadata contains none of the configured products");
         }
-
-        Ok(CatalogIndex::new(configured))
+        info!(
+            venue = %self.venue_instance_id,
+            instruments = merged.len(),
+            chain_id = fetched.chain_id,
+            "loaded Perpl catalog and heartbeat stream from exchange metadata"
+        );
+        Ok(PerplBootstrap {
+            catalog: CatalogIndex::new(merged),
+            heartbeat_stream: format!("heartbeat@{}", fetched.chain_id),
+        })
     }
 
-    async fn fetch_exchange_catalog(&self) -> anyhow::Result<Vec<InstrumentCatalog>> {
+    async fn fetch_exchange_context(&self) -> anyhow::Result<PerplContext> {
         let url = self
             .metadata_url
             .as_deref()
@@ -244,7 +279,7 @@ impl PerplAdapter {
             .await
             .with_context(|| format!("read Perpl context {url}"))?;
 
-        parse_exchange_catalog(
+        parse_exchange_context(
             &text,
             &self.venue_instance_id,
             &self.default_quote_asset,
@@ -254,9 +289,38 @@ impl PerplAdapter {
     }
 }
 
+struct PerplBootstrap {
+    catalog: CatalogIndex,
+    heartbeat_stream: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ContextResponse {
+    chain: PerplChain,
     markets: Vec<PerplMarket>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PerplChain {
+    chain_id: u64,
+}
+
+struct PerplContext {
+    chain_id: u64,
+    catalog: Vec<InstrumentCatalog>,
+}
+
+fn accept_heartbeat_sequence(previous: &mut Option<i128>, sequence: i128) -> anyhow::Result<()> {
+    if let Some(previous) = *previous
+        && sequence != previous + 1
+    {
+        bail!(
+            "Perpl heartbeat sequence gap: expected {}, received {sequence}",
+            previous + 1
+        );
+    }
+    *previous = Some(sequence);
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,13 +342,13 @@ struct PerplMarketConfig {
     size_decimals: u32,
 }
 
-fn parse_exchange_catalog(
+fn parse_exchange_context(
     text: &str,
     venue_instance_id: &str,
     quote_asset: &str,
     settle_asset: &str,
     margin_asset: &str,
-) -> anyhow::Result<Vec<InstrumentCatalog>> {
+) -> anyhow::Result<PerplContext> {
     let response: ContextResponse = serde_json::from_str(text)?;
     let raw_value: serde_json::Value = serde_json::from_str(text)?;
     let raw_markets = raw_value
@@ -293,7 +357,7 @@ fn parse_exchange_catalog(
         .cloned()
         .unwrap_or_default();
 
-    response
+    let catalog = response
         .markets
         .into_iter()
         .enumerate()
@@ -334,7 +398,11 @@ fn parse_exchange_catalog(
                 raw_markets.get(index).cloned(),
             ))
         })
-        .collect()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(PerplContext {
+        chain_id: response.chain.chain_id,
+        catalog,
+    })
 }
 
 fn scale_from_catalog(instrument: &InstrumentCatalog) -> MarketScale {
@@ -360,11 +428,21 @@ impl ExchangeAdapter for PerplAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_exchange_catalog, scale_from_catalog};
+    use super::{accept_heartbeat_sequence, parse_exchange_context, scale_from_catalog};
+
+    #[test]
+    fn rejects_perpl_server_heartbeat_gap() {
+        let mut previous = None;
+        accept_heartbeat_sequence(&mut previous, 100).unwrap();
+        accept_heartbeat_sequence(&mut previous, 101).unwrap();
+        let error = accept_heartbeat_sequence(&mut previous, 103).unwrap_err();
+        assert!(error.to_string().contains("expected 102"));
+    }
 
     #[test]
     fn parses_perpl_exchange_catalog() {
         let raw = r#"{
+            "chain": {"chain_id": 143},
             "markets": [{
                 "id": 1,
                 "symbol": "",
@@ -388,8 +466,10 @@ mod tests {
             }]
         }"#;
 
-        let catalog = parse_exchange_catalog(raw, "perpl", "AUSD", "AUSD", "AUSD").unwrap();
+        let context = parse_exchange_context(raw, "perpl", "AUSD", "AUSD", "AUSD").unwrap();
+        let catalog = context.catalog;
 
+        assert_eq!(context.chain_id, 143);
         assert_eq!(catalog.len(), 2);
         assert_eq!(catalog[0].instrument_id, "1");
         assert_eq!(catalog[0].feed_key(), "1");

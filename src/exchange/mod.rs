@@ -1,4 +1,6 @@
-pub mod ethereal;
+// Ethereal is intentionally disabled. Keep the adapter source archived under
+// `exchange/ethereal`, but do not compile or expose it.
+// pub mod ethereal;
 pub mod hyperliquid;
 pub mod lighter;
 pub mod ondo;
@@ -27,6 +29,7 @@ use crate::{
 const STABLE_CONNECTION_RESET_AFTER: Duration = Duration::from_secs(30);
 const TRANSIENT_WS_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const TRANSIENT_WS_RECONNECT_CAP: Duration = Duration::from_secs(5);
+const RATE_LIMIT_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 
 #[async_trait]
 pub trait ExchangeAdapter: Send + Sync {
@@ -92,6 +95,7 @@ struct ReconnectDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReconnectKind {
     TransientWebsocketDisconnect,
+    RateLimited,
     Error,
 }
 
@@ -100,6 +104,14 @@ fn reconnect_decision(
     err: &anyhow::Error,
     uptime: Duration,
 ) -> ReconnectDecision {
+    if is_rate_limited(err) {
+        let sleep = backoff.next_delay().max(RATE_LIMIT_RECONNECT_DELAY);
+        return ReconnectDecision {
+            sleep,
+            kind: ReconnectKind::RateLimited,
+        };
+    }
+
     let was_stable_connection = uptime >= STABLE_CONNECTION_RESET_AFTER;
     if was_stable_connection {
         backoff.reset();
@@ -129,26 +141,38 @@ fn log_adapter_restart(
     decision: ReconnectDecision,
     uptime: Duration,
 ) {
-    if decision.kind == ReconnectKind::TransientWebsocketDisconnect {
-        info!(
-            venue,
-            reason = %err,
-            sleep = ?decision.sleep,
-            ?uptime,
-            "adapter reconnecting after transient websocket disconnect"
-        );
-    } else {
-        warn!(
-            venue,
-            error = %err,
-            sleep = ?decision.sleep,
-            ?uptime,
-            "adapter restarting"
-        );
+    match decision.kind {
+        ReconnectKind::TransientWebsocketDisconnect => {
+            info!(
+                venue,
+                reason = %err,
+                sleep = ?decision.sleep,
+                ?uptime,
+                "adapter reconnecting after transient websocket disconnect"
+            );
+        }
+        ReconnectKind::RateLimited => {
+            warn!(
+                venue,
+                error = %err,
+                sleep = ?decision.sleep,
+                ?uptime,
+                "adapter rate limited; cooling down before reconnect"
+            );
+        }
+        ReconnectKind::Error => {
+            warn!(
+                venue,
+                error = %err,
+                sleep = ?decision.sleep,
+                ?uptime,
+                "adapter restarting"
+            );
+        }
     }
 }
 
-fn is_transient_websocket_disconnect(err: &anyhow::Error) -> bool {
+fn error_chain_text(err: &anyhow::Error) -> String {
     let mut text = String::new();
     for cause in err.chain() {
         if !text.is_empty() {
@@ -156,7 +180,19 @@ fn is_transient_websocket_disconnect(err: &anyhow::Error) -> bool {
         }
         text.push_str(&cause.to_string());
     }
-    let text = text.to_ascii_lowercase();
+    text.to_ascii_lowercase()
+}
+
+fn is_rate_limited(err: &anyhow::Error) -> bool {
+    let text = error_chain_text(err);
+    text.contains("too many requests")
+        || text.contains("rate_limit")
+        || text.contains("rate limit")
+        || text.contains("rate-limited")
+}
+
+fn is_transient_websocket_disconnect(err: &anyhow::Error) -> bool {
+    let text = error_chain_text(err);
 
     text.contains("without closing handshake")
         || text.contains("connection reset without closing handshake")
@@ -308,7 +344,8 @@ fn catalog_keys(instrument: &InstrumentCatalog) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CatalogIndex, ReconnectDecision, ReconnectKind, TRANSIENT_WS_RECONNECT_DELAY, decimal_tick,
+        CatalogIndex, RATE_LIMIT_RECONNECT_DELAY, ReconnectDecision, ReconnectKind,
+        TRANSIENT_WS_RECONNECT_DELAY, decimal_tick, is_rate_limited,
         is_transient_websocket_disconnect, merge_configured_catalog, reconnect_decision,
     };
     use std::time::Duration;
@@ -389,7 +426,7 @@ mod tests {
             anyhow::anyhow!("WebSocket protocol error: Connection reset without closing handshake");
         assert!(is_transient_websocket_disconnect(&err));
 
-        let err = anyhow::anyhow!("Ethereal L2Book gap for BTCUSD");
+        let err = anyhow::anyhow!("order-book sequence gap for BTCUSD");
         assert!(!is_transient_websocket_disconnect(&err));
     }
 
@@ -404,6 +441,23 @@ mod tests {
             "Perpl websocket closed: Some(CloseFrame {{ code: Policy, reason: \"ping timeout\" }})"
         );
         assert!(is_transient_websocket_disconnect(&err));
+    }
+
+    #[test]
+    fn rate_limit_after_a_stable_connection_still_cools_down() {
+        let err = anyhow::anyhow!(
+            "Perpl websocket closed: Some(CloseFrame {{ code: Policy, reason: \"too many requests\" }})"
+        );
+        let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
+
+        assert!(is_rate_limited(&err));
+        assert_eq!(
+            reconnect_decision(&mut backoff, &err, Duration::from_secs(245)),
+            ReconnectDecision {
+                sleep: RATE_LIMIT_RECONNECT_DELAY,
+                kind: ReconnectKind::RateLimited,
+            }
+        );
     }
 
     #[test]

@@ -1,0 +1,9 @@
+.env
+.git
+.playwright-cli
+.svelte-kit
+data
+output
+target
+web/build
+web/node_modules

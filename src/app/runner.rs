@@ -15,9 +15,9 @@ use crate::{
     config::{Config, StorageMode, VenueConfig},
     domain::MarketEvent,
     exchange::{
-        ExchangeAdapter, ethereal::EtherealAdapter, hyperliquid::HyperliquidAdapter,
-        lighter::LighterAdapter, ondo::adapter::OndoAdapter, perpl::adapter::PerplAdapter,
-        risex::RisexAdapter, zero_one::ZeroOneAdapter,
+        ExchangeAdapter, hyperliquid::HyperliquidAdapter, lighter::LighterAdapter,
+        ondo::adapter::OndoAdapter, perpl::adapter::PerplAdapter, risex::RisexAdapter,
+        zero_one::ZeroOneAdapter,
     },
     pipeline::fanout,
     state::new_shared_state,
@@ -345,7 +345,8 @@ fn build_adapter(config: &VenueConfig) -> anyhow::Result<Box<dyn ExchangeAdapter
         "lighter" => Ok(Box::new(LighterAdapter::from_config(config))),
         "rise" | "risex" => Ok(Box::new(RisexAdapter::from_config(config))),
         "01" | "zero_one" | "zeroone" => Ok(Box::new(ZeroOneAdapter::from_config(config))),
-        "ethereal" => Ok(Box::new(EtherealAdapter::from_config(config))),
+        // Ethereal is intentionally disabled; its source is preserved but not compiled.
+        // "ethereal" => Ok(Box::new(EtherealAdapter::from_config(config))),
         "perpl" => Ok(Box::new(PerplAdapter::from_config(config))),
         "ondo" => Ok(Box::new(OndoAdapter::from_config(config))),
         other => Err(anyhow!("unsupported venue: {other}")),

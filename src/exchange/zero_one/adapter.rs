@@ -167,7 +167,7 @@ impl ZeroOneAdapter {
                                     let market_symbol = delta.market_symbol.clone();
                                     match books.apply_delta(delta, recv_ts_ns) {
                                         ApplyResult::Tick(tick) => {
-                                            tx.send(MarketEvent::Tick { tick }).await.context("send 01 tick")?;
+                                            tx.send(MarketEvent::Tick { tick: *tick }).await.context("send 01 tick")?;
                                         }
                                         ApplyResult::Skipped => {}
                                         ApplyResult::Gap { expected_last_update_id, received_last_update_id, .. } => {

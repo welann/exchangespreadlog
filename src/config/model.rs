@@ -250,19 +250,7 @@ impl Default for Config {
                     default_margin_asset: "USD".to_string(),
                     instruments: default_zero_one_instruments(),
                 },
-                VenueConfig {
-                    venue_instance_id: "ethereal".to_string(),
-                    adapter: "ethereal".to_string(),
-                    enabled: true,
-                    url: Some("wss://ws2.ethereal.trade/v1/stream".to_string()),
-                    channel: Some("L2Book".to_string()),
-                    catalog_source: CatalogSource::Exchange,
-                    metadata_url: Some("https://api.ethereal.trade/v1/product".to_string()),
-                    default_quote_asset: "USD".to_string(),
-                    default_settle_asset: "USD".to_string(),
-                    default_margin_asset: "USD".to_string(),
-                    instruments: default_ethereal_instruments(),
-                },
+                // Ethereal is intentionally disabled and omitted from the runtime defaults.
                 VenueConfig {
                     venue_instance_id: "perpl".to_string(),
                     adapter: "perpl".to_string(),
@@ -541,14 +529,6 @@ fn default_zero_one_instruments() -> Vec<InstrumentConfig> {
     ]
 }
 
-fn default_ethereal_instruments() -> Vec<InstrumentConfig> {
-    vec![
-        instrument("BTCUSD", "BTC-USD", Some("BTCUSD"), "BTC"),
-        instrument("ETHUSD", "ETH-USD", Some("ETHUSD"), "ETH"),
-        instrument("SOLUSD", "SOL-USD", Some("SOLUSD"), "SOL"),
-    ]
-}
-
 fn default_perpl_instruments() -> Vec<InstrumentConfig> {
     vec![
         instrument_with_ticks("1", "BTC", Some("1"), "BTC", "0.1", "0.00001"),
@@ -618,7 +598,7 @@ mod tests {
         );
         assert_eq!(config.quote_rates.len(), 3);
         assert_eq!(config.quote_rates[2].from, "AUSD");
-        assert_eq!(config.venues.len(), 7);
+        assert_eq!(config.venues.len(), 6);
         assert_eq!(config.venues[0].venue_instance_id, "hyperliquid");
         assert_eq!(config.venues[0].adapter, "hyperliquid");
         assert_eq!(config.venues[0].channel.as_deref(), Some("bbo"));
@@ -653,64 +633,52 @@ mod tests {
         );
         assert_eq!(config.venues[3].channel.as_deref(), Some("deltas"));
         assert_eq!(config.venues[3].catalog()[2].feed_key(), "SOLUSD");
-        assert_eq!(config.venues[4].venue_instance_id, "ethereal");
+        assert_eq!(config.venues[4].venue_instance_id, "perpl");
         assert_eq!(
             config.venues[4].url.as_deref(),
-            Some("wss://ws2.ethereal.trade/v1/stream")
+            Some("wss://app.perpl.xyz/ws/v1/market-data")
         );
-        assert_eq!(config.venues[4].channel.as_deref(), Some("L2Book"));
+        assert_eq!(config.venues[4].channel.as_deref(), Some("order-book"));
         assert_eq!(config.venues[4].catalog_source, CatalogSource::Exchange);
         assert_eq!(
             config.venues[4].metadata_url.as_deref(),
-            Some("https://api.ethereal.trade/v1/product")
-        );
-        assert_eq!(config.venues[4].catalog()[0].feed_key(), "BTCUSD");
-        assert_eq!(config.venues[5].venue_instance_id, "perpl");
-        assert_eq!(
-            config.venues[5].url.as_deref(),
-            Some("wss://app.perpl.xyz/ws/v1/market-data")
-        );
-        assert_eq!(config.venues[5].channel.as_deref(), Some("order-book"));
-        assert_eq!(config.venues[5].catalog_source, CatalogSource::Exchange);
-        assert_eq!(
-            config.venues[5].metadata_url.as_deref(),
             Some("https://app.perpl.xyz/api/v1/pub/context")
         );
-        assert_eq!(config.venues[5].catalog()[0].feed_key(), "1");
-        assert_eq!(config.venues[5].catalog()[0].quote_asset, "AUSD");
+        assert_eq!(config.venues[4].catalog()[0].feed_key(), "1");
+        assert_eq!(config.venues[4].catalog()[0].quote_asset, "AUSD");
         assert_eq!(
-            config.venues[5].catalog()[0]
+            config.venues[4].catalog()[0]
                 .price_tick
                 .unwrap()
                 .to_string(),
             "0.1"
         );
         assert_eq!(
-            config.venues[5].catalog()[0].size_tick.unwrap().to_string(),
+            config.venues[4].catalog()[0].size_tick.unwrap().to_string(),
             "0.00001"
         );
-        assert_eq!(config.venues[6].venue_instance_id, "ondo");
+        assert_eq!(config.venues[5].venue_instance_id, "ondo");
         assert_eq!(
-            config.venues[6].url.as_deref(),
+            config.venues[5].url.as_deref(),
             Some("wss://api.ondoperps.xyz/ws")
         );
-        assert_eq!(config.venues[6].channel.as_deref(), Some("topOfBooksPerps"));
-        assert_eq!(config.venues[6].catalog_source, CatalogSource::Exchange);
+        assert_eq!(config.venues[5].channel.as_deref(), Some("topOfBooksPerps"));
+        assert_eq!(config.venues[5].catalog_source, CatalogSource::Exchange);
         assert_eq!(
-            config.venues[6].metadata_url.as_deref(),
+            config.venues[5].metadata_url.as_deref(),
             Some("https://api.ondoperps.xyz/v1/markets")
         );
-        assert_eq!(config.venues[6].catalog()[0].feed_key(), "BTC-USD.P");
-        assert_eq!(config.venues[6].catalog()[0].quote_asset, "USD");
+        assert_eq!(config.venues[5].catalog()[0].feed_key(), "BTC-USD.P");
+        assert_eq!(config.venues[5].catalog()[0].quote_asset, "USD");
         assert_eq!(
-            config.venues[6].catalog()[0]
+            config.venues[5].catalog()[0]
                 .price_tick
                 .unwrap()
                 .to_string(),
             "0.01"
         );
         assert_eq!(
-            config.venues[6].catalog()[0].size_tick.unwrap().to_string(),
+            config.venues[5].catalog()[0].size_tick.unwrap().to_string(),
             "0.0001"
         );
     }
