@@ -33,6 +33,8 @@ pub struct ClickHouseConfig {
     pub database: String,
     pub username: String,
     pub password: String,
+    pub projector_batch_size: usize,
+    pub projector_linger: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +100,16 @@ impl RuntimeConfig {
         if catalog_refresh_seconds == 0 {
             bail!("CATALOG_REFRESH_SECONDS must be greater than zero");
         }
+        let clickhouse_projector_batch_size =
+            parse_env("CLICKHOUSE_PROJECTOR_BATCH_SIZE", 5_000_usize)?;
+        if clickhouse_projector_batch_size == 0 {
+            bail!("CLICKHOUSE_PROJECTOR_BATCH_SIZE must be greater than zero");
+        }
+        let clickhouse_projector_linger_ms =
+            parse_env("CLICKHOUSE_PROJECTOR_LINGER_MS", 5_000_u64)?;
+        if clickhouse_projector_linger_ms == 0 {
+            bail!("CLICKHOUSE_PROJECTOR_LINGER_MS must be greater than zero");
+        }
 
         Ok(Self {
             http_addr: SocketAddr::new(host, port),
@@ -106,6 +118,8 @@ impl RuntimeConfig {
                 database: env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "zeabur".to_string()),
                 username: required("CLICKHOUSE_USER")?,
                 password: required("CLICKHOUSE_PASSWORD")?,
+                projector_batch_size: clickhouse_projector_batch_size,
+                projector_linger: Duration::from_millis(clickhouse_projector_linger_ms),
             },
             wal_path: PathBuf::from(
                 env::var("WAL_PATH").unwrap_or_else(|_| "data/wal.sqlite3".to_string()),
@@ -130,6 +144,8 @@ impl RuntimeConfig {
                 database: "zeabur".to_string(),
                 username: "default".to_string(),
                 password: String::new(),
+                projector_batch_size: 5_000,
+                projector_linger: Duration::from_secs(5),
             },
             wal_path: PathBuf::from("data/wal.sqlite3"),
             web_dir: PathBuf::from("web/build"),

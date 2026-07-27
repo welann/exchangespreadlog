@@ -8,6 +8,7 @@ use anyhow::Context;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 
 use crate::{domain::MarketEvent, ingest::time::unix_time_ns};
 
@@ -30,6 +31,7 @@ pub struct WalRecord {
 #[derive(Clone)]
 pub struct DurableEventLog {
     connection: Arc<Mutex<Connection>>,
+    append_notify: Arc<Notify>,
 }
 
 impl DurableEventLog {
@@ -64,6 +66,7 @@ VALUES ('clickhouse', 0);
         )?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            append_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -74,13 +77,15 @@ VALUES ('clickhouse', 0);
             "INSERT OR IGNORE INTO event_log(event_id, payload, created_at_ns) VALUES (?1, ?2, ?3)",
             params![event_id, payload, recorded_ts_ns.to_string()],
         )?;
-        connection
+        let seq = connection
             .query_row(
                 "SELECT seq FROM event_log WHERE event_id = ?1",
                 params![event_id],
                 |row| row.get(0),
             )
-            .context("resolve appended WAL sequence")
+            .context("resolve appended WAL sequence")?;
+        self.append_notify.notify_one();
+        Ok(seq)
     }
 
     pub fn append_batch(&self, events: &[MarketEvent]) -> anyhow::Result<()> {
@@ -100,7 +105,12 @@ VALUES ('clickhouse', 0);
             }
         }
         transaction.commit()?;
+        self.append_notify.notify_one();
         Ok(())
+    }
+
+    pub async fn wait_for_append(&self) {
+        self.append_notify.notified().await;
     }
 
     pub fn read_projector_batch(&self, limit: usize) -> anyhow::Result<Vec<WalRecord>> {

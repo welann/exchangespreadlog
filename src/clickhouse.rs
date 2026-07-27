@@ -18,7 +18,6 @@ use crate::{
 };
 
 const MIGRATION: &str = include_str!("../migrations/001_init.sql");
-const PROJECTOR_BATCH_SIZE: usize = 5_000;
 
 #[derive(Clone)]
 pub struct ClickHouse {
@@ -127,6 +126,11 @@ impl ClickHouse {
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let mut schema_ready = false;
+        info!(
+            batch_size = self.config.projector_batch_size,
+            linger_ms = self.config.projector_linger.as_millis(),
+            "ClickHouse projector batching configured"
+        );
         while !*shutdown.borrow() {
             if !schema_ready {
                 match self
@@ -159,22 +163,16 @@ impl ClickHouse {
                 }
             }
 
-            let wal_reader = wal.clone();
-            let rows =
-                task::spawn_blocking(move || wal_reader.read_projector_batch(PROJECTOR_BATCH_SIZE))
-                    .await
-                    .context("join WAL projector read")??;
-            if rows.is_empty() {
-                tokio::select! {
-                    _ = time::sleep(Duration::from_millis(200)) => {}
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
+            let Some(rows) = next_projector_batch(
+                &wal,
+                self.config.projector_batch_size,
+                self.config.projector_linger,
+                &mut shutdown,
+            )
+            .await?
+            else {
+                break;
+            };
             match self.project_batch(&rows).await {
                 Ok(()) => {
                     let last_seq = rows.last().expect("batch is non-empty").seq;
@@ -379,6 +377,59 @@ FORMAT JSONEachRow
     }
 }
 
+async fn next_projector_batch(
+    wal: &DurableEventLog,
+    batch_size: usize,
+    linger: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> anyhow::Result<Option<Vec<WalRecord>>> {
+    loop {
+        let rows = read_projector_rows(wal.clone(), batch_size).await?;
+        if rows.is_empty() {
+            tokio::select! {
+                _ = wal.wait_for_append() => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(None);
+                    }
+                }
+            }
+            continue;
+        }
+        if rows.len() >= batch_size {
+            return Ok(Some(rows));
+        }
+
+        let deadline = time::Instant::now() + linger;
+        let mut rows = rows;
+        loop {
+            tokio::select! {
+                _ = time::sleep_until(deadline) => return Ok(Some(rows)),
+                _ = wal.wait_for_append() => {
+                    rows = read_projector_rows(wal.clone(), batch_size).await?;
+                    if rows.len() >= batch_size {
+                        return Ok(Some(rows));
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn read_projector_rows(
+    wal: DurableEventLog,
+    batch_size: usize,
+) -> anyhow::Result<Vec<WalRecord>> {
+    task::spawn_blocking(move || wal.read_projector_batch(batch_size))
+        .await
+        .context("join WAL projector read")?
+}
+
 fn catalog_row(catalog: &InstrumentCatalog, recorded_ts_ns: i128) -> anyhow::Result<Value> {
     Ok(json!({
         "instrument_key": catalog.catalog_id,
@@ -572,7 +623,14 @@ fn quote_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{HistoryRow, complete_bucket_bounds, resolution};
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+    use tokio::{sync::watch, time};
+
+    use crate::{domain::MarketEvent, wal::DurableEventLog};
+
+    use super::{HistoryRow, complete_bucket_bounds, next_projector_batch, resolution};
 
     #[test]
     fn chooses_bounded_history_resolutions() {
@@ -610,5 +668,101 @@ mod tests {
             complete_bucket_bounds(2_000, 5_000, 1_000),
             (2_000, 2_000, 5_000)
         );
+    }
+
+    #[tokio::test]
+    async fn projector_flushes_immediately_when_batch_is_full() {
+        let directory = tempdir().unwrap();
+        let wal = DurableEventLog::open(directory.path().join("wal.sqlite3")).unwrap();
+        wal.append_batch(&[
+            venue_reset("lighter"),
+            venue_reset("hyperliquid"),
+            venue_reset("perpl"),
+        ])
+        .unwrap();
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+
+        let rows = time::timeout(
+            Duration::from_millis(200),
+            next_projector_batch(&wal, 3, Duration::from_secs(5), &mut shutdown),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn projector_collects_new_rows_during_linger_window() {
+        let directory = tempdir().unwrap();
+        let wal = DurableEventLog::open(directory.path().join("wal.sqlite3")).unwrap();
+        wal.append(venue_reset("lighter")).unwrap();
+        let writer = wal.clone();
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+
+        let append = tokio::spawn(async move {
+            time::sleep(Duration::from_millis(20)).await;
+            writer.append(venue_reset("hyperliquid")).unwrap();
+        });
+        let rows = time::timeout(
+            Duration::from_millis(500),
+            next_projector_batch(&wal, 2, Duration::from_secs(5), &mut shutdown),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        append.await.unwrap();
+
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn projector_flushes_partial_batch_after_linger_window() {
+        let directory = tempdir().unwrap();
+        let wal = DurableEventLog::open(directory.path().join("wal.sqlite3")).unwrap();
+        wal.append(venue_reset("lighter")).unwrap();
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+
+        let rows = time::timeout(
+            Duration::from_millis(500),
+            next_projector_batch(&wal, 5_000, Duration::from_millis(20), &mut shutdown),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn projector_stops_waiting_when_shutdown_is_requested() {
+        let directory = tempdir().unwrap();
+        let wal = DurableEventLog::open(directory.path().join("wal.sqlite3")).unwrap();
+        let (shutdown_tx, mut shutdown) = watch::channel(false);
+
+        let stop = tokio::spawn(async move {
+            time::sleep(Duration::from_millis(20)).await;
+            shutdown_tx.send(true).unwrap();
+        });
+        let rows = time::timeout(
+            Duration::from_millis(500),
+            next_projector_batch(&wal, 5_000, Duration::from_secs(5), &mut shutdown),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        stop.await.unwrap();
+
+        assert!(rows.is_none());
+    }
+
+    fn venue_reset(venue: &str) -> MarketEvent {
+        MarketEvent::VenueReset {
+            venue_instance_id: venue.to_string(),
+        }
     }
 }

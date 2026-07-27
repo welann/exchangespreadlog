@@ -124,6 +124,11 @@ docker run -d \
   exchange-spread-collector
 ```
 
+ClickHouse 投影器默认在累计 `5000` 条 WAL 记录或等待 `5000ms` 后写入，
+以避免高频小 INSERT 产生大量 MergeTree parts。可通过
+`CLICKHOUSE_PROJECTOR_BATCH_SIZE` 和 `CLICKHOUSE_PROJECTOR_LINGER_MS` 调整；
+低延迟查询仍由内存实时视图提供，linger 只影响 ClickHouse 历史数据的可见延迟。
+
 前端只需要知道 collector 的 HTTP 地址。`COLLECTOR_UPSTREAM` 在容器启动时写入 Nginx 配置，不会重新构建前端；地址末尾不要带 `/`：
 
 ```bash
