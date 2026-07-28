@@ -8,8 +8,10 @@
     LineStyle,
     TickMarkType,
     createChart,
+    createSeriesMarkers,
     type IChartApi,
     type ISeriesApi,
+    type ISeriesMarkersPluginApi,
     type Time,
     type UTCTimestamp
   } from 'lightweight-charts';
@@ -17,25 +19,39 @@
 
   export let points: SpreadPoint[] = [];
 
-  type DisplayPoint = {
-    tsMs: number;
-    openBp: number;
-    closeBp: number;
-    netBp: number;
+  type CaptureStats = {
+    bestBp: number | null;
+    bestTsMs: number | null;
+    breakEvenTsMs: number | null;
   };
 
   let container: HTMLDivElement;
   let chart: IChartApi | null = null;
   let openSeries: ISeriesApi<'Line'> | null = null;
   let closeSeries: ISeriesApi<'Line'> | null = null;
-  let netSeries: ISeriesApi<'Baseline'> | null = null;
+  let captureSeries: ISeriesApi<'Baseline'> | null = null;
+  let entryMarkers: ISeriesMarkersPluginApi<Time> | null = null;
   let rendered: SpreadPoint[] | null = null;
-  let pointsBySecond = new Map<number, DisplayPoint>();
-  let latestPoint: DisplayPoint | null = null;
-  let activePoint: DisplayPoint | null = null;
+  let pointsBySecond = new Map<number, SpreadPoint>();
+  let latestPoint: SpreadPoint | null = null;
+  let activePoint: SpreadPoint | null = null;
   let crosshairSecond: number | null = null;
+  let entrySecond: number | null = null;
+  let entryPoint: SpreadPoint | null = null;
+  let captureStats: CaptureStats = {
+    bestBp: null,
+    bestTsMs: null,
+    breakEvenTsMs: null
+  };
   let localZone = '浏览器本地时区';
   let locale = 'zh-CN';
+
+  $: activeCaptureBp =
+    entryPoint && activePoint ? grossCaptureBp(entryPoint, activePoint) : null;
+  $: activeHoldingMs =
+    entryPoint && activePoint && activePoint.tsMs >= entryPoint.tsMs
+      ? activePoint.tsMs - entryPoint.tsMs
+      : null;
 
   onMount(() => {
     locale = navigator.language || 'zh-CN';
@@ -82,7 +98,7 @@
       priceLineVisible: false,
       lastValueVisible: true
     });
-    netSeries = chart.addSeries(BaselineSeries, {
+    captureSeries = chart.addSeries(BaselineSeries, {
       baseValue: { type: 'price', price: 0 },
       relativeGradient: true,
       topLineColor: '#287760',
@@ -92,24 +108,29 @@
       bottomFillColor1: 'rgba(161, 73, 66, 0.015)',
       bottomFillColor2: 'rgba(161, 73, 66, 0.12)',
       lineWidth: 3,
-      title: '总净收益',
+      title: '可平仓毛收益',
       priceLineVisible: false,
       lastValueVisible: true
     });
-    netSeries.createPriceLine({
+    captureSeries.createPriceLine({
       price: 0,
       color: '#8fa0ad',
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
       axisLabelVisible: true,
-      title: '零线'
+      title: '回本线'
     });
+    entryMarkers = createSeriesMarkers(openSeries, [], { autoScale: true });
     chart.subscribeCrosshairMove((parameter) => {
       crosshairSecond = timestampSeconds(parameter.time);
       activePoint =
         crosshairSecond === null
           ? latestPoint
           : pointsBySecond.get(crosshairSecond) ?? latestPoint;
+    });
+    chart.subscribeClick((parameter) => {
+      const second = timestampSeconds(parameter.time);
+      if (second !== null) selectEntry(second);
     });
     render();
     chart.timeScale().fitContent();
@@ -134,22 +155,17 @@
       }
     }
     const sorted = [...unique.entries()].sort(([left], [right]) => left - right);
-    pointsBySecond = new Map(
-      sorted.map(([time, point]) => [
-        time,
-        {
-          tsMs: time * 1_000,
-          openBp: point.bToABp,
-          closeBp: point.aToBBp,
-          netBp: point.bToABp + point.aToBBp
-        }
-      ])
-    );
+    pointsBySecond = new Map(sorted);
     latestPoint = sorted.length > 0 ? pointsBySecond.get(sorted.at(-1)![0]) ?? null : null;
     activePoint =
       crosshairSecond === null
         ? latestPoint
         : pointsBySecond.get(crosshairSecond) ?? latestPoint;
+
+    if (entrySecond !== null) {
+      entryPoint = pointsBySecond.get(entrySecond) ?? null;
+      if (!entryPoint) entrySecond = null;
+    }
 
     openSeries?.setData(
       sorted.map(([time, point]) => ({
@@ -163,12 +179,93 @@
         value: point.aToBBp
       }))
     );
-    netSeries?.setData(
-      sorted.map(([time, point]) => ({
-        time: time as UTCTimestamp,
-        value: point.bToABp + point.aToBBp
-      }))
-    );
+    renderCaptureSeries(sorted);
+    syncEntryMarker();
+  }
+
+  function renderCaptureSeries(sorted: Array<[number, SpreadPoint]>) {
+    if (!entryPoint || entrySecond === null) {
+      captureSeries?.setData([]);
+      captureStats = {
+        bestBp: null,
+        bestTsMs: null,
+        breakEvenTsMs: null
+      };
+      return;
+    }
+
+    let bestBp: number | null = null;
+    let bestTsMs: number | null = null;
+    let breakEvenTsMs: number | null = null;
+    const captureData: Array<{ time: UTCTimestamp; value: number }> = [];
+
+    for (const [time, point] of sorted) {
+      if (time < entrySecond) continue;
+      const value = grossCaptureBp(entryPoint, point);
+      if (value === null) continue;
+
+      captureData.push({ time: time as UTCTimestamp, value });
+      if (bestBp === null || value > bestBp) {
+        bestBp = value;
+        bestTsMs = point.tsMs;
+      }
+      if (breakEvenTsMs === null && value >= 0) {
+        breakEvenTsMs = point.tsMs;
+      }
+    }
+
+    captureSeries?.setData(captureData);
+    captureStats = { bestBp, bestTsMs, breakEvenTsMs };
+  }
+
+  function selectEntry(second: number) {
+    const point = pointsBySecond.get(second);
+    if (!point) return;
+
+    entrySecond = second;
+    entryPoint = point;
+    activePoint = point;
+    crosshairSecond = second;
+    renderCaptureSeries([...pointsBySecond.entries()].sort(([left], [right]) => left - right));
+    syncEntryMarker();
+  }
+
+  function clearEntry() {
+    entrySecond = null;
+    entryPoint = null;
+    captureSeries?.setData([]);
+    captureStats = {
+      bestBp: null,
+      bestTsMs: null,
+      breakEvenTsMs: null
+    };
+    entryMarkers?.setMarkers([]);
+  }
+
+  function syncEntryMarker() {
+    if (!entryPoint || entrySecond === null) {
+      entryMarkers?.setMarkers([]);
+      return;
+    }
+
+    entryMarkers?.setMarkers([
+      {
+        time: entrySecond as UTCTimestamp,
+        position: 'aboveBar',
+        shape: 'arrowDown',
+        color: '#9f572c',
+        text: '开仓',
+        size: 1.1
+      }
+    ]);
+  }
+
+  function grossCaptureBp(entry: SpreadPoint, close: SpreadPoint): number | null {
+    if (close.tsMs < entry.tsMs || !Number.isFinite(entry.aAsk) || entry.aAsk <= 0) {
+      return null;
+    }
+    const grossQuote = entry.bToA + close.aToB;
+    return Number.isFinite(grossQuote) ? grossQuote / entry.aAsk * 10_000 : null;
   }
 
   function timestampSeconds(time: Time | undefined): number | null {
@@ -241,28 +338,87 @@
     if (value === undefined || !Number.isFinite(value)) return '—';
     return `${value > 0 ? '+' : ''}${value.toFixed(2)} bp`;
   }
+
+  function formatDuration(value: number | null) {
+    if (value === null || value < 0 || !Number.isFinite(value)) return '—';
+    if (value === 0) return '0 分钟';
+    if (value < 60_000) return '< 1 分钟';
+    const totalMinutes = Math.floor(value / 60_000);
+    if (totalMinutes < 60) return `${totalMinutes} 分钟`;
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours < 24) return minutes > 0 ? `${hours} 小时 ${minutes} 分钟` : `${hours} 小时`;
+    const days = Math.floor(hours / 24);
+    const remainingHours = hours % 24;
+    return remainingHours > 0 ? `${days} 天 ${remainingHours} 小时` : `${days} 天`;
+  }
+
+  function observationNote(
+    entry: SpreadPoint | null,
+    active: SpreadPoint | null,
+    holdingMs: number | null
+  ) {
+    if (!entry) return '点击图表任一时刻，锁定橙线开仓报价';
+    if (!active || active.tsMs < entry.tsMs) return '开仓前报价，不计入收益';
+    return `已持仓 ${formatDuration(holdingMs)}`;
+  }
+
+  function captureSummary(entry: SpreadPoint | null, stats: CaptureStats) {
+    if (!entry) return '选择开仓点后计算';
+    const bestHoldingMs =
+      stats.bestTsMs === null ? null : stats.bestTsMs - entry.tsMs;
+    const breakEvenHoldingMs =
+      stats.breakEvenTsMs === null
+        ? null
+        : stats.breakEvenTsMs - entry.tsMs;
+    const best = `最佳出现在 ${formatDuration(bestHoldingMs)}`;
+    const breakEven =
+      breakEvenHoldingMs === null
+        ? '区间内尚未回本'
+        : `首次回本 ${formatDuration(breakEvenHoldingMs)}`;
+    return `${best} · ${breakEven}`;
+  }
 </script>
 
-<div class="readout">
+<div class:anchored={entryPoint !== null} class="readout">
   <div class="readout-time">
-    <span>
-      本地时间 · {localZone}
-      {activePoint ? ` · ${describeUtcOffset(activePoint.tsMs)}` : ''}
-    </span>
-    <strong>{activePoint ? formatLocalDateTime(activePoint.tsMs) : '—'}</strong>
+    <div>
+      <span>
+        观察时间 · {localZone}
+        {activePoint ? ` · ${describeUtcOffset(activePoint.tsMs)}` : ''}
+      </span>
+      <strong>{activePoint ? formatLocalDateTime(activePoint.tsMs) : '—'}</strong>
+      <small>{observationNote(entryPoint, activePoint, activeHoldingMs)}</small>
+    </div>
+    {#if entryPoint}
+      <button on:click={clearEntry}>清除开仓点</button>
+    {/if}
   </div>
   <dl>
     <div class="open">
-      <dt><i></i>开仓 · B → A</dt>
-      <dd>{formatBp(activePoint?.openBp)}</dd>
+      <dt><i></i>{entryPoint ? '固定开仓价差' : '候选开仓 · B → A'}</dt>
+      <dd>{formatBp((entryPoint ?? activePoint)?.bToABp)}</dd>
+      <small>
+        {entryPoint ? formatLocalDateTime(entryPoint.tsMs) : 'B bid − A ask'}
+      </small>
     </div>
     <div class="close">
-      <dt><i></i>平仓 · A → B</dt>
-      <dd>{formatBp(activePoint?.closeBp)}</dd>
+      <dt><i></i>观察点平仓 · A → B</dt>
+      <dd>{formatBp(activePoint?.aToBBp)}</dd>
+      <small>A bid − B ask</small>
     </div>
-    <div class:profitable={activePoint !== null && activePoint.netBp >= 0} class="net">
-      <dt><i></i>总净收益</dt>
-      <dd>{formatBp(activePoint?.netBp)}</dd>
+    <div
+      class:profitable={activeCaptureBp !== null && activeCaptureBp >= 0}
+      class="capture"
+    >
+      <dt><i></i>可平仓毛收益</dt>
+      <dd>{entryPoint ? formatBp(activeCaptureBp ?? undefined) : '等待选择'}</dd>
+      <small>未扣手续费、资金费和滑点</small>
+    </div>
+    <div class="best">
+      <dt><i></i>区间最佳毛收益</dt>
+      <dd>{formatBp(captureStats.bestBp ?? undefined)}</dd>
+      <small>{captureSummary(entryPoint, captureStats)}</small>
     </div>
   </dl>
 </div>
@@ -271,31 +427,45 @@
   class="chart"
   bind:this={container}
   role="img"
-  aria-label="开仓价差、平仓价差与总净收益时间序列，单位为基点，时间按浏览器本地时区显示"
+  aria-label="开仓价差、平仓价差与跨时点可平仓毛收益时间序列；点击图表可选择开仓时刻，单位为基点，时间按浏览器本地时区显示"
 ></div>
 
 <style>
   .readout {
-    min-height: 58px;
+    min-height: 76px;
     display: grid;
-    grid-template-columns: minmax(210px, 1.25fr) minmax(420px, 2fr);
+    grid-template-columns: minmax(245px, 1.2fr) minmax(0, 2.8fr);
     align-items: stretch;
     margin: 0 12px;
     border: 1px solid #d1dbe1;
     background: #f1f5f7;
   }
 
+  .readout.anchored {
+    border-color: #b9c8d1;
+    box-shadow: inset 3px 0 #c97842;
+  }
+
   .readout-time {
     min-width: 0;
-    display: grid;
-    align-content: center;
-    gap: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
     padding: 9px 12px;
     border-right: 1px solid #d1dbe1;
   }
 
+  .readout-time > div {
+    min-width: 0;
+    display: grid;
+    gap: 4px;
+  }
+
   .readout-time span,
-  dt {
+  dt,
+  dl small,
+  .readout-time small {
     color: #718392;
     font-size: 9px;
     letter-spacing: 0.02em;
@@ -314,10 +484,32 @@
     white-space: nowrap;
   }
 
+  .readout-time small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .readout-time button {
+    flex: 0 0 auto;
+    padding: 6px 8px;
+    color: #536878;
+    border: 1px solid #aebdc8;
+    border-radius: 2px;
+    background: #f8fafb;
+    cursor: pointer;
+    font-size: 9px;
+  }
+
+  .readout-time button:hover {
+    color: #823e28;
+    border-color: #c18a6a;
+  }
+
   dl {
     min-width: 0;
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     margin: 0;
   }
 
@@ -325,7 +517,7 @@
     min-width: 0;
     display: grid;
     align-content: center;
-    gap: 4px;
+    gap: 3px;
     padding: 8px 11px;
     border-right: 1px solid #d1dbe1;
   }
@@ -351,13 +543,18 @@
     background: #2e6f95;
   }
 
-  .net dt i {
+  .capture dt i {
     height: 3px;
     background: #a14942;
   }
 
-  .net.profitable dt i {
+  .capture.profitable dt i {
     background: #287760;
+  }
+
+  .best dt i {
+    height: 3px;
+    background: linear-gradient(90deg, #a14942 0 48%, #287760 52% 100%);
   }
 
   dd {
@@ -370,11 +567,23 @@
     white-space: nowrap;
   }
 
-  .net dd {
+  dl small {
+    overflow: hidden;
+    min-height: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .best small {
+    line-height: 1.25;
+    white-space: normal;
+  }
+
+  .capture dd {
     color: #a14942;
   }
 
-  .net.profitable dd {
+  .capture.profitable dd {
     color: #287760;
   }
 
@@ -402,9 +611,12 @@
       border-right: 0;
     }
 
-    .net {
-      grid-column: 1 / -1;
-      border-top: 1px solid #d1dbe1;
+    dl > div:nth-child(-n + 2) {
+      border-bottom: 1px solid #d1dbe1;
+    }
+
+    .best {
+      border-right: 0;
     }
 
     .chart {

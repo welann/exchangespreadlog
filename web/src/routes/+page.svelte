@@ -659,13 +659,14 @@
       <section class="chart-panel">
         <header>
           <div class="chart-title">
-            <strong>双向可执行价差 · bp</strong>
-            <span>总净收益 = 橙线开仓 + 蓝线平仓</span>
+            <strong>跨时点套利机会 · bp</strong>
+            <span>点击图表锁定橙线开仓时刻，收益线仅使用其后的蓝线平仓报价</span>
+            <em>毛收益，尚未扣除手续费、资金费和滑点</em>
           </div>
           <div class="legend">
-            <span><i class="copper"></i>开仓 · B → A</span>
-            <span><i class="blue"></i>平仓 · A → B</span>
-            <span><i class="net"></i>总净收益</span>
+            <span><i class="copper"></i>候选开仓 · B → A</span>
+            <span><i class="blue"></i>候选平仓 · A → B</span>
+            <span><i class="capture"></i>开仓后可平仓毛收益</span>
           </div>
         </header>
         {#if points.length > 0}
@@ -1458,6 +1459,12 @@
     font-size: 9px;
   }
 
+  .chart-title em {
+    color: #99603f;
+    font-size: 9px;
+    font-style: normal;
+  }
+
   .legend {
     display: flex;
     flex-wrap: wrap;
@@ -1483,7 +1490,7 @@
     background: #c97842;
   }
 
-  .legend .net {
+  .legend .capture {
     height: 3px;
     background: linear-gradient(90deg, #a14942 0 48%, #287760 52% 100%);
   }
