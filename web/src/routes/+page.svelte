@@ -594,6 +594,7 @@
         <div class="query-meta">
           <span>{loadingHistory ? '查询中…' : `${history?.points.length ?? 0} 个数据点`}</span>
           <span>{resolutionLabel(history?.resolutionMs)} 粒度</span>
+          <span>服务端时钟锚定</span>
           <button on:click={loadHistory} disabled={loadingHistory}>刷新历史</button>
         </div>
       </div>
@@ -657,12 +658,14 @@
 
       <section class="chart-panel">
         <header>
-          <div>
+          <div class="chart-title">
             <strong>双向可执行价差 · bp</strong>
+            <span>总净收益 = 橙线开仓 + 蓝线平仓</span>
           </div>
           <div class="legend">
-            <span><i class="blue"></i>A → B</span>
-            <span><i class="copper"></i>B → A</span>
+            <span><i class="copper"></i>开仓 · B → A</span>
+            <span><i class="blue"></i>平仓 · A → B</span>
+            <span><i class="net"></i>总净收益</span>
           </div>
         </header>
         {#if points.length > 0}
@@ -1435,8 +1438,9 @@
 
   .chart-panel > header {
     display: flex;
-    align-items: center;
+    align-items: flex-end;
     justify-content: space-between;
+    gap: 18px;
     padding: 13px 18px 8px;
   }
 
@@ -1444,8 +1448,20 @@
     font-size: 13px;
   }
 
+  .chart-title {
+    display: grid;
+    gap: 3px;
+  }
+
+  .chart-title span {
+    color: #718392;
+    font-size: 9px;
+  }
+
   .legend {
     display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 14px;
     color: #657789;
     font-size: 10px;
@@ -1465,6 +1481,11 @@
 
   .legend .copper {
     background: #c97842;
+  }
+
+  .legend .net {
+    height: 3px;
+    background: linear-gradient(90deg, #a14942 0 48%, #287760 52% 100%);
   }
 
   .chart-empty {
@@ -1705,6 +1726,15 @@
     .range-stats > header {
       align-items: flex-start;
       flex-direction: column;
+    }
+
+    .chart-panel > header {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
+    .legend {
+      justify-content: flex-start;
     }
 
     .stats-comparison {
