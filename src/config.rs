@@ -34,6 +34,9 @@ pub struct ClickHouseConfig {
     pub password: String,
     pub projector_batch_size: usize,
     pub projector_linger: Duration,
+    pub system_log_retention_days: u16,
+    pub detailed_log_retention_days: u16,
+    pub disable_detailed_logging: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +112,24 @@ impl RuntimeConfig {
         if clickhouse_projector_linger_ms == 0 {
             bail!("CLICKHOUSE_PROJECTOR_LINGER_MS must be greater than zero");
         }
+        let clickhouse_system_log_retention_days =
+            parse_env("CLICKHOUSE_SYSTEM_LOG_RETENTION_DAYS", 7_u16)?;
+        validate_retention_days(
+            "CLICKHOUSE_SYSTEM_LOG_RETENTION_DAYS",
+            clickhouse_system_log_retention_days,
+        )?;
+        let clickhouse_detailed_log_retention_days =
+            parse_env("CLICKHOUSE_DETAILED_LOG_RETENTION_DAYS", 3_u16)?;
+        validate_retention_days(
+            "CLICKHOUSE_DETAILED_LOG_RETENTION_DAYS",
+            clickhouse_detailed_log_retention_days,
+        )?;
+        if clickhouse_detailed_log_retention_days > clickhouse_system_log_retention_days {
+            bail!(
+                "CLICKHOUSE_DETAILED_LOG_RETENTION_DAYS cannot exceed \
+                 CLICKHOUSE_SYSTEM_LOG_RETENTION_DAYS"
+            );
+        }
 
         Ok(Self {
             http_addr: SocketAddr::new(host, port),
@@ -119,6 +140,9 @@ impl RuntimeConfig {
                 password: required("CLICKHOUSE_PASSWORD")?,
                 projector_batch_size: clickhouse_projector_batch_size,
                 projector_linger: Duration::from_millis(clickhouse_projector_linger_ms),
+                system_log_retention_days: clickhouse_system_log_retention_days,
+                detailed_log_retention_days: clickhouse_detailed_log_retention_days,
+                disable_detailed_logging: parse_env("CLICKHOUSE_DISABLE_DETAILED_LOGGING", true)?,
             },
             wal_path: PathBuf::from(
                 env::var("WAL_PATH").unwrap_or_else(|_| "data/wal.sqlite3".to_string()),
@@ -144,6 +168,9 @@ impl RuntimeConfig {
                 password: String::new(),
                 projector_batch_size: 5_000,
                 projector_linger: Duration::from_secs(5),
+                system_log_retention_days: 7,
+                detailed_log_retention_days: 3,
+                disable_detailed_logging: true,
             },
             wal_path: PathBuf::from("data/wal.sqlite3"),
             web_dir: PathBuf::from("web/build"),
@@ -229,4 +256,11 @@ where
         Ok(value) => value.parse().with_context(|| format!("parse {name}")),
         Err(_) => Ok(default),
     }
+}
+
+fn validate_retention_days(name: &str, days: u16) -> anyhow::Result<()> {
+    if !(1..=365).contains(&days) {
+        bail!("{name} must be between 1 and 365");
+    }
+    Ok(())
 }

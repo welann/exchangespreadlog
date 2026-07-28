@@ -18,6 +18,24 @@ use crate::{
 };
 
 const MIGRATION: &str = include_str!("../migrations/001_init.sql");
+const DISABLED_DETAILED_LOG_SETTINGS: [(&str, &str); 10] = [
+    ("log_processors_profiles", "0"),
+    ("log_query_views", "0"),
+    ("log_profile_events", "0"),
+    ("query_metric_log_interval", "0"),
+    ("query_profiler_real_time_period_ns", "0"),
+    ("query_profiler_cpu_time_period_ns", "0"),
+    ("memory_profiler_step", "0"),
+    ("memory_profiler_sample_probability", "0"),
+    ("opentelemetry_start_trace_probability", "0"),
+    ("trace_profile_events", "0"),
+];
+const DETAILED_SYSTEM_LOG_TABLES: [&str; 4] = [
+    "processors_profile_log",
+    "query_metric_log",
+    "query_views_log",
+    "trace_log",
+];
 
 #[derive(Clone)]
 pub struct ClickHouse {
@@ -54,6 +72,11 @@ struct VenueResetRow {
     venue: String,
     #[serde(deserialize_with = "deserialize_i64")]
     recv_ts_ns: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SystemLogTableRow {
+    name: String,
 }
 
 fn deserialize_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
@@ -124,7 +147,61 @@ impl ClickHouse {
                 .await
                 .with_context(|| format!("apply ClickHouse migration statement {}", index + 1))?;
         }
+        if let Err(error) = self.configure_system_log_retention().await {
+            warn!(
+                error = %format!("{error:#}"),
+                "could not configure ClickHouse system log TTL; application schema remains usable"
+            );
+        }
         info!("ClickHouse schema is ready");
+        Ok(())
+    }
+
+    async fn configure_system_log_retention(&self) -> anyhow::Result<()> {
+        let tables = self
+            .query_typed::<SystemLogTableRow>(
+                r#"
+SELECT DISTINCT t.name AS name
+FROM system.tables AS t
+INNER JOIN system.columns AS c
+    ON c.database = t.database AND c.table = t.name
+WHERE t.database = 'system'
+  AND endsWith(t.name, '_log')
+  AND endsWith(t.engine, 'MergeTree')
+  AND c.name = 'event_date'
+ORDER BY t.name
+FORMAT JSONEachRow
+"#,
+            )
+            .await
+            .context("discover ClickHouse system log tables")?;
+
+        let statements = system_log_ttl_statements(
+            tables.into_iter().map(|table| table.name),
+            self.config.system_log_retention_days,
+            self.config.detailed_log_retention_days,
+        )?;
+        let configured_tables = statements.len();
+        let mut failures = Vec::new();
+        for (table, sql) in statements {
+            if let Err(error) = self.execute(sql).await {
+                failures.push(format!("{table}: {error:#}"));
+            }
+        }
+        if !failures.is_empty() {
+            bail!(
+                "failed to configure TTL for {} system log table(s): {}",
+                failures.len(),
+                failures.join("; ")
+            );
+        }
+
+        info!(
+            configured_tables,
+            retention_days = self.config.system_log_retention_days,
+            detailed_retention_days = self.config.detailed_log_retention_days,
+            "ClickHouse system log TTL configured"
+        );
         Ok(())
     }
 
@@ -400,10 +477,14 @@ FORMAT JSONEachRow
     }
 
     async fn query_text(&self, sql: &str) -> anyhow::Result<String> {
+        let mut query_parameters = vec![("database", self.config.database.as_str())];
+        if self.config.disable_detailed_logging {
+            query_parameters.extend(DISABLED_DETAILED_LOG_SETTINGS);
+        }
         let response = self
             .client
             .post(&self.config.url)
-            .query(&[("database", self.config.database.as_str())])
+            .query(&query_parameters)
             .basic_auth(&self.config.username, Some(&self.config.password))
             .header("Content-Type", "text/plain; charset=utf-8")
             .body(sql.to_string())
@@ -422,6 +503,29 @@ FORMAT JSONEachRow
             )
         }
     }
+}
+
+fn system_log_ttl_statements(
+    tables: impl IntoIterator<Item = String>,
+    retention_days: u16,
+    detailed_retention_days: u16,
+) -> anyhow::Result<Vec<(String, String)>> {
+    tables
+        .into_iter()
+        .map(|table| {
+            validate_identifier(&table)?;
+            let days = if DETAILED_SYSTEM_LOG_TABLES.contains(&table.as_str()) {
+                detailed_retention_days
+            } else {
+                retention_days
+            };
+            let sql = format!(
+                "ALTER TABLE system.{} MODIFY TTL event_date + INTERVAL {days} DAY DELETE",
+                quote_identifier(&table)
+            );
+            Ok((table, sql))
+        })
+        .collect()
 }
 
 async fn next_projector_batch(
@@ -704,7 +808,7 @@ mod tests {
 
     use super::{
         HistoryRow, HistoryWindow, VenueResetRow, align_history, complete_bucket_bounds,
-        next_projector_batch, resolution,
+        next_projector_batch, resolution, system_log_ttl_statements,
     };
 
     #[test]
@@ -731,6 +835,55 @@ mod tests {
         .unwrap();
         assert_eq!(row.bucket_ms, 1_785_042_197_000);
         assert_eq!(row.recv_ts_ns, 1_785_042_197_203_406_000);
+    }
+
+    #[test]
+    fn assigns_shorter_ttl_to_detailed_clickhouse_logs() {
+        let statements = system_log_ttl_statements(
+            [
+                "part_log".to_string(),
+                "processors_profile_log".to_string(),
+                "query_views_log".to_string(),
+                "trace_log".to_string(),
+            ],
+            7,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                (
+                    "part_log".to_string(),
+                    "ALTER TABLE system.`part_log` MODIFY TTL event_date + INTERVAL 7 DAY DELETE"
+                        .to_string(),
+                ),
+                (
+                    "processors_profile_log".to_string(),
+                    "ALTER TABLE system.`processors_profile_log` MODIFY TTL event_date + INTERVAL 3 DAY DELETE"
+                        .to_string(),
+                ),
+                (
+                    "query_views_log".to_string(),
+                    "ALTER TABLE system.`query_views_log` MODIFY TTL event_date + INTERVAL 3 DAY DELETE"
+                        .to_string(),
+                ),
+                (
+                    "trace_log".to_string(),
+                    "ALTER TABLE system.`trace_log` MODIFY TTL event_date + INTERVAL 3 DAY DELETE"
+                        .to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_system_log_table_names() {
+        let error =
+            system_log_ttl_statements(["trace_log; DROP TABLE x".to_string()], 7, 3).unwrap_err();
+
+        assert!(error.to_string().contains("unsafe ClickHouse identifier"));
     }
 
     #[test]

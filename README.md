@@ -131,6 +131,21 @@ ClickHouse 投影器默认在累计 `5000` 条 WAL 记录或等待 `5000ms` 后�
 `CLICKHOUSE_PROJECTOR_BATCH_SIZE` 和 `CLICKHOUSE_PROJECTOR_LINGER_MS` 调整；
 低延迟查询仍由内存实时视图提供，linger 只影响 ClickHouse 历史数据的可见延迟。
 
+Collector 启动时会为 ClickHouse 的 MergeTree 系统日志表设置 TTL：普通日志默认保留
+`7` 天，`processors_profile_log`、`query_metric_log`、`query_views_log` 和
+`trace_log` 默认保留 `3` 天。Collector 发出的查询还会关闭 processor profile、
+query profiler、memory profiler、query-view 和 query-metric 等详细采样。对应配置为：
+
+```bash
+CLICKHOUSE_SYSTEM_LOG_RETENTION_DAYS=7
+CLICKHOUSE_DETAILED_LOG_RETENTION_DAYS=3
+CLICKHOUSE_DISABLE_DETAILED_LOGGING=true
+```
+
+TTL 设置需要 ClickHouse 用户具备 `ALTER` 权限；权限不足时只记录警告，不会阻塞
+WAL 和业务表投影。已有过期数据由 ClickHouse 后台 merge 逐步清理，启动过程不会执行
+`MATERIALIZE TTL` 或强制 `OPTIMIZE`。
+
 前端只需要知道 collector 的 HTTP 地址。`COLLECTOR_UPSTREAM` 在容器启动时写入 Nginx 配置，不会重新构建前端；地址末尾不要带 `/`：
 
 ```bash
