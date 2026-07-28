@@ -48,6 +48,14 @@ struct HistoryRow {
     ask_price: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VenueResetRow {
+    venue: String,
+    #[serde(deserialize_with = "deserialize_i64")]
+    recv_ts_ns: i64,
+}
+
 fn deserialize_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
 where
     D: Deserializer<'de>,
@@ -203,7 +211,8 @@ impl ClickHouse {
         leg_b: &str,
         from_ms: i64,
         to_ms: i64,
-        max_book_age_ms: i64,
+        venue_a: &str,
+        venue_b: &str,
         conversion: PairConversion,
     ) -> anyhow::Result<HistoryResponse> {
         if from_ms >= to_ms {
@@ -222,6 +231,7 @@ impl ClickHouse {
             quote_identifier(table)
         );
         let legs = format!("{}, {}", quote_string(leg_a), quote_string(leg_b));
+        let venues = format!("{}, {}", quote_string(venue_a), quote_string(venue_b));
         let range_sql = format!(
             r#"
 SELECT
@@ -254,22 +264,59 @@ GROUP BY instrument_key
 FORMAT JSONEachRow
 "#
         );
-        let (range, seed) = tokio::try_join!(
+        let reset_table = format!(
+            "{}.{}",
+            quote_identifier(&self.config.database),
+            quote_identifier("venue_state_events")
+        );
+        let resets_sql = format!(
+            r#"
+SELECT
+    venue,
+    recvTsNs
+FROM
+(
+    SELECT
+        venue,
+        max(recv_ts_ns) AS recvTsNs
+    FROM {reset_table}
+    WHERE venue IN ({venues})
+      AND recv_time < fromUnixTimestamp64Milli({from_ms})
+    GROUP BY venue
+
+    UNION ALL
+
+    SELECT
+        venue,
+        recv_ts_ns AS recvTsNs
+    FROM {reset_table}
+    WHERE venue IN ({venues})
+      AND recv_time >= fromUnixTimestamp64Milli({from_ms})
+      AND recv_time < fromUnixTimestamp64Milli({to_ms})
+)
+ORDER BY recvTsNs
+FORMAT JSONEachRow
+"#
+        );
+        let (range, seed, resets) = tokio::try_join!(
             self.query_typed::<HistoryRow>(&range_sql),
-            self.query_typed::<HistoryRow>(&seed_sql)
+            self.query_typed::<HistoryRow>(&seed_sql),
+            self.query_typed::<VenueResetRow>(&resets_sql)
         )?;
         let source_rows = range.len();
         let points = align_history(
             leg_a,
             leg_b,
+            venue_a,
+            venue_b,
             HistoryWindow {
                 from_ms,
                 to_ms,
                 resolution_ms,
-                max_book_age_ms,
             },
             seed,
             range,
+            resets,
             conversion.a_rate,
             conversion.b_rate,
         )?;
@@ -520,15 +567,17 @@ struct HistoryWindow {
     from_ms: i64,
     to_ms: i64,
     resolution_ms: i64,
-    max_book_age_ms: i64,
 }
 
 fn align_history(
     leg_a: &str,
     leg_b: &str,
+    venue_a: &str,
+    venue_b: &str,
     window: HistoryWindow,
     seed: Vec<HistoryRow>,
     range: Vec<HistoryRow>,
+    resets: Vec<VenueResetRow>,
     a_rate: f64,
     b_rate: f64,
 ) -> anyhow::Result<Vec<SpreadPoint>> {
@@ -538,6 +587,9 @@ fn align_history(
     for row in range {
         by_bucket.entry(row.bucket_ms).or_default().push(row);
     }
+    let mut resets = resets.into_iter().peekable();
+    let mut latest_reset_a_ns = None;
+    let mut latest_reset_b_ns = None;
 
     let mut bucket = window.from_ms.div_euclid(window.resolution_ms) * window.resolution_ms;
     let mut points = Vec::new();
@@ -552,16 +604,36 @@ fn align_history(
             }
         }
         let point_ms = (bucket + window.resolution_ms).min(window.to_ms);
+        while resets
+            .peek()
+            .is_some_and(|reset| reset.recv_ts_ns / 1_000_000 <= point_ms)
+        {
+            let reset = resets.next().expect("peeked reset must exist");
+            if reset.venue == venue_a {
+                latest_reset_a_ns = Some(reset.recv_ts_ns);
+            }
+            if reset.venue == venue_b {
+                latest_reset_b_ns = Some(reset.recv_ts_ns);
+            }
+        }
+        if latest_reset_a_ns.is_some_and(|reset_ns| {
+            state_a
+                .as_ref()
+                .is_some_and(|state| state.recv_ts_ns <= reset_ns)
+        }) {
+            state_a = None;
+        }
+        if latest_reset_b_ns.is_some_and(|reset_ns| {
+            state_b
+                .as_ref()
+                .is_some_and(|state| state.recv_ts_ns <= reset_ns)
+        }) {
+            state_b = None;
+        }
         if point_ms >= window.from_ms
             && let (Some(a), Some(b)) = (&state_a, &state_b)
         {
-            let a_state_ms = a.recv_ts_ns / 1_000_000;
-            let b_state_ms = b.recv_ts_ns / 1_000_000;
-            if point_ms - a_state_ms <= window.max_book_age_ms
-                && point_ms - b_state_ms <= window.max_book_age_ms
-            {
-                points.push(spread_from_history(a, b, point_ms, a_rate, b_rate)?);
-            }
+            points.push(spread_from_history(a, b, point_ms, a_rate, b_rate)?);
         }
         bucket += window.resolution_ms;
     }
@@ -630,7 +702,10 @@ mod tests {
 
     use crate::{domain::MarketEvent, wal::DurableEventLog};
 
-    use super::{HistoryRow, complete_bucket_bounds, next_projector_batch, resolution};
+    use super::{
+        HistoryRow, HistoryWindow, VenueResetRow, align_history, complete_bucket_bounds,
+        next_projector_batch, resolution,
+    };
 
     #[test]
     fn chooses_bounded_history_resolutions() {
@@ -668,6 +743,67 @@ mod tests {
             complete_bucket_bounds(2_000, 5_000, 1_000),
             (2_000, 2_000, 5_000)
         );
+    }
+
+    #[test]
+    fn carries_last_bbo_across_quiet_history_without_a_time_expiry() {
+        let points = align_history(
+            "venue-a:btc",
+            "venue-b:btc",
+            "venue-a",
+            "venue-b",
+            HistoryWindow {
+                from_ms: 0,
+                to_ms: 180_000,
+                resolution_ms: 60_000,
+            },
+            vec![
+                history_row("venue-a:btc", 0, 0, "100", "101"),
+                history_row("venue-b:btc", 0, 0, "102", "103"),
+            ],
+            vec![],
+            vec![],
+            1.0,
+            1.0,
+        )
+        .unwrap();
+
+        assert_eq!(points.len(), 3);
+        assert_eq!(points[2].a_state_ts_ms, 0);
+        assert_eq!(points[2].b_state_ts_ms, 0);
+    }
+
+    #[test]
+    fn venue_reset_invalidates_carried_state_until_a_new_bbo_arrives() {
+        let points = align_history(
+            "venue-a:btc",
+            "venue-b:btc",
+            "venue-a",
+            "venue-b",
+            HistoryWindow {
+                from_ms: 0,
+                to_ms: 180_000,
+                resolution_ms: 60_000,
+            },
+            vec![
+                history_row("venue-a:btc", 0, 0, "100", "101"),
+                history_row("venue-b:btc", 0, 0, "102", "103"),
+            ],
+            vec![history_row("venue-a:btc", 120_000, 130_000, "104", "105")],
+            vec![VenueResetRow {
+                venue: "venue-a".to_string(),
+                recv_ts_ns: 90_000_000_000,
+            }],
+            1.0,
+            1.0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            points.iter().map(|point| point.ts_ms).collect::<Vec<_>>(),
+            vec![60_000, 180_000]
+        );
+        assert_eq!(points[1].a_state_ts_ms, 130_000);
     }
 
     #[tokio::test]
@@ -763,6 +899,22 @@ mod tests {
     fn venue_reset(venue: &str) -> MarketEvent {
         MarketEvent::VenueReset {
             venue_instance_id: venue.to_string(),
+        }
+    }
+
+    fn history_row(
+        instrument_key: &str,
+        bucket_ms: i64,
+        recv_ms: i64,
+        bid_price: &str,
+        ask_price: &str,
+    ) -> HistoryRow {
+        HistoryRow {
+            instrument_key: instrument_key.to_string(),
+            bucket_ms,
+            recv_ts_ns: recv_ms * 1_000_000,
+            bid_price: bid_price.to_string(),
+            ask_price: ask_price.to_string(),
         }
     }
 }

@@ -47,6 +47,8 @@
   let error = '';
   let stream: EventSource | null = null;
   let healthTimer: ReturnType<typeof setInterval> | null = null;
+  let clockTimer: ReturnType<typeof setInterval> | null = null;
+  let clockNowMs = Date.now();
   let serverClockOffsetMs = 0;
   let topSharePercent = 30;
 
@@ -58,6 +60,10 @@
   $: legB =
     selectedMarket?.instruments.find((instrument) => instrument.instrumentKey === legBKey) ??
     null;
+  $: displayLegA =
+    live?.legA?.instrumentKey === legAKey ? live.legA : legA;
+  $: displayLegB =
+    live?.legB?.instrumentKey === legBKey ? live.legB : legB;
   $: venueOptions = buildVenueOptions(markets);
   $: counterVenueOptions = buildCounterVenueOptions(markets, primaryVenue);
   $: filteredMarkets = filterMarkets(
@@ -83,9 +89,13 @@
   onMount(() => {
     void boot();
     healthTimer = setInterval(() => void loadHealth(), 10_000);
+    clockTimer = setInterval(() => {
+      clockNowMs = Date.now();
+    }, 1_000);
     return () => {
       stream?.close();
       if (healthTimer) clearInterval(healthTimer);
+      if (clockTimer) clearInterval(clockTimer);
     };
   });
 
@@ -261,7 +271,9 @@
     const query = new URLSearchParams({ leg_a: legAKey, leg_b: legBKey });
     stream = new EventSource(`/v1/live/spread?${query}`);
     const receive = (event: MessageEvent<string>) => {
-      live = JSON.parse(event.data) as LiveSpread;
+      const next = JSON.parse(event.data) as LiveSpread;
+      live = next;
+      mergeLiveInstruments(next);
     };
     stream.addEventListener('snapshot', receive as EventListener);
     stream.addEventListener('spread', receive as EventListener);
@@ -272,6 +284,25 @@
     stream.onopen = () => {
       if (error.startsWith('实时连接')) error = '';
     };
+  }
+
+  function mergeLiveInstruments(next: LiveSpread) {
+    const updates = new Map<string, Instrument>();
+    for (const instrument of [next.legA, next.legB]) {
+      if (instrument?.instrumentKey) updates.set(instrument.instrumentKey, instrument);
+    }
+    if (updates.size === 0) return;
+
+    markets = markets.map((market) => {
+      let changed = false;
+      const instruments = market.instruments.map((instrument) => {
+        const update = updates.get(instrument.instrumentKey);
+        if (!update) return instrument;
+        changed = true;
+        return update;
+      });
+      return changed ? { ...market, instruments } : market;
+    });
   }
 
   function mergePoints(base: SpreadPoint[], point: SpreadPoint | null): SpreadPoint[] {
@@ -389,12 +420,25 @@
     });
   }
 
-  function formatAge(timestamp: number | null | undefined) {
+  function formatAge(timestamp: number | null | undefined, nowMs: number) {
     if (!timestamp) return '等待首个报价';
-    const age = Math.max(0, Date.now() + serverClockOffsetMs - timestamp);
+    const age = Math.max(0, nowMs + serverClockOffsetMs - timestamp);
     if (age < 1_000) return '刚刚';
     if (age < 60_000) return `${Math.floor(age / 1_000)} 秒前`;
-    return `${Math.floor(age / 60_000)} 分钟前`;
+    if (age < 3_600_000) return `${Math.floor(age / 60_000)} 分钟前`;
+    if (age < 86_400_000) {
+      const hours = Math.floor(age / 3_600_000);
+      const minutes = Math.floor(age % 3_600_000 / 60_000);
+      return minutes > 0 ? `${hours} 小时 ${minutes} 分钟前` : `${hours} 小时前`;
+    }
+    const days = Math.floor(age / 86_400_000);
+    const hours = Math.floor(age % 86_400_000 / 3_600_000);
+    return hours > 0 ? `${days} 天 ${hours} 小时前` : `${days} 天前`;
+  }
+
+  function formatBookTime(timestamp: number | null | undefined) {
+    if (!timestamp) return '尚未收到有效订单簿';
+    return `最近接收：${new Date(timestamp).toLocaleString()}`;
   }
 
   function resolutionLabel(value: number | undefined) {
@@ -407,7 +451,6 @@
   function liveStateLabel(value: LiveSpread | null) {
     if (!value) return '等待实时流';
     if (value.state === 'valid') return '实时 BBO 有效';
-    if (value.reason?.includes('stale')) return '一条或两条腿已过期';
     if (value.reason?.includes('no valid BBO')) return '等待两腿有效 BBO';
     return '当前价差不可用';
   }
@@ -714,9 +757,13 @@
       <section class="leg-block a">
         <header>
           <span>A</span>
-          <div>
-            <strong>{legA?.venue ?? '未选择'}</strong>
-            <small>{legA?.symbol ?? '—'}</small>
+          <div class="leg-identity">
+            <strong>{displayLegA?.venue ?? '未选择'}</strong>
+            <small>{displayLegA?.symbol ?? '—'}</small>
+          </div>
+          <div class="book-age" title={formatBookTime(displayLegA?.latestRecvMs)}>
+            <span>最新订单簿</span>
+            <strong>{formatAge(displayLegA?.latestRecvMs, clockNowMs)}</strong>
           </div>
         </header>
         <div class="venue-list">
@@ -727,7 +774,7 @@
               on:click={() => chooseLeg('a', instrument)}
             >
               <span>{instrument.venue}</span>
-              <small>{formatAge(instrument.latestRecvMs)}</small>
+              <small>{formatAge(instrument.latestRecvMs, clockNowMs)}</small>
             </button>
           {/each}
         </div>
@@ -736,9 +783,13 @@
       <section class="leg-block b">
         <header>
           <span>B</span>
-          <div>
-            <strong>{legB?.venue ?? '未选择'}</strong>
-            <small>{legB?.symbol ?? '—'}</small>
+          <div class="leg-identity">
+            <strong>{displayLegB?.venue ?? '未选择'}</strong>
+            <small>{displayLegB?.symbol ?? '—'}</small>
+          </div>
+          <div class="book-age" title={formatBookTime(displayLegB?.latestRecvMs)}>
+            <span>最新订单簿</span>
+            <strong>{formatAge(displayLegB?.latestRecvMs, clockNowMs)}</strong>
           </div>
         </header>
         <div class="venue-list">
@@ -749,7 +800,7 @@
               on:click={() => chooseLeg('b', instrument)}
             >
               <span>{instrument.venue}</span>
-              <small>{formatAge(instrument.latestRecvMs)}</small>
+              <small>{formatAge(instrument.latestRecvMs, clockNowMs)}</small>
             </button>
           {/each}
         </div>
@@ -1548,7 +1599,8 @@
   }
 
   .leg-block > header {
-    display: flex;
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr) auto;
     align-items: center;
     gap: 10px;
     margin-bottom: 12px;
@@ -1574,14 +1626,48 @@
     display: block;
   }
 
-  .leg-block header strong {
+  .leg-identity {
+    min-width: 0;
+  }
+
+  .leg-identity strong,
+  .leg-identity small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .leg-identity strong {
     font-size: 14px;
   }
 
-  .leg-block header small {
+  .leg-identity small {
     margin-top: 2px;
     color: #657789;
     font-size: 10px;
+  }
+
+  .book-age {
+    min-width: 78px;
+    padding-left: 9px;
+    border-left: 1px solid #c7d2d9;
+    text-align: right;
+  }
+
+  .book-age span {
+    display: block;
+    color: #718392;
+    font-size: 8px;
+    letter-spacing: 0.03em;
+  }
+
+  .book-age strong {
+    display: block;
+    margin-top: 3px;
+    color: #385d72;
+    font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 9px;
+    white-space: nowrap;
   }
 
   .venue-list {

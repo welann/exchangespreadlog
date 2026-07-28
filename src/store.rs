@@ -10,10 +10,7 @@ use anyhow::{Context, bail};
 use serde::Serialize;
 use tokio::sync::{RwLock, broadcast};
 
-use crate::{
-    domain::{BboTick, InstrumentCatalog, MarketEvent, QuoteRateBook},
-    ingest::time::unix_time_ns,
-};
+use crate::domain::{BboTick, InstrumentCatalog, MarketEvent, QuoteRateBook};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -98,18 +95,16 @@ pub struct LiveBookStore {
     inner: Arc<RwLock<Inner>>,
     updates: broadcast::Sender<LiveNotice>,
     stats: Arc<RuntimeStats>,
-    max_book_age_ms: i64,
     quote_rates: QuoteRateBook,
 }
 
 impl LiveBookStore {
-    pub fn new(max_book_age_ms: i64, quote_rates: QuoteRateBook) -> Self {
+    pub fn new(quote_rates: QuoteRateBook) -> Self {
         let (updates, _) = broadcast::channel(4_096);
         Self {
             inner: Arc::new(RwLock::new(Inner::default())),
             updates,
             stats: Arc::new(RuntimeStats::default()),
-            max_book_age_ms,
             quote_rates,
         }
     }
@@ -227,7 +222,6 @@ impl LiveBookStore {
         if leg_a == leg_b {
             bail!("choose two different instruments");
         }
-        let now_ms = i64::try_from(unix_time_ns() / 1_000_000).context("clock overflow")?;
         let inner = self.inner.read().await;
         let catalog_a = inner
             .catalogs
@@ -257,16 +251,6 @@ impl LiveBookStore {
                 view_b,
             ));
         };
-        let age_a = now_ms - recv_ms(tick_a);
-        let age_b = now_ms - recv_ms(tick_b);
-        if age_a > self.max_book_age_ms || age_b > self.max_book_age_ms {
-            return Ok(unavailable(
-                "one or both books are stale",
-                conversion.target_quote,
-                view_a,
-                view_b,
-            ));
-        }
         let point =
             spread_from_ticks_with_rates(tick_a, tick_b, conversion.a_rate, conversion.b_rate)?;
         Ok(LiveSpread {
@@ -474,8 +458,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keeps_last_valid_bbo_available_without_a_time_expiry() {
+        let store = LiveBookStore::new(QuoteRateBook::default());
+        let venue_a = catalog("venue-a", "USDC");
+        let venue_b = catalog("venue-b", "USDC");
+        for (instrument, bid, ask) in [
+            (&venue_a, Fixed::new(100, 0), Fixed::new(101, 0)),
+            (&venue_b, Fixed::new(102, 0), Fixed::new(103, 0)),
+        ] {
+            store
+                .apply(&MarketEvent::Catalog {
+                    instrument: instrument.clone(),
+                })
+                .await;
+            store
+                .apply(&MarketEvent::Tick {
+                    tick: BboTick::new(
+                        instrument.instrument_ref(),
+                        1,
+                        None,
+                        None,
+                        Some(BestLevel::new(bid, Fixed::new(1, 0), None)),
+                        Some(BestLevel::new(ask, Fixed::new(1, 0), None)),
+                        SourceKind::Bbo,
+                    ),
+                })
+                .await;
+        }
+
+        let spread = store
+            .spread(&venue_a.catalog_id, &venue_b.catalog_id)
+            .await
+            .unwrap();
+
+        assert_eq!(spread.state, "valid");
+        assert!(spread.point.is_some());
+        assert_eq!(spread.leg_a.latest_recv_ms, Some(0));
+        assert_eq!(spread.leg_b.latest_recv_ms, Some(0));
+    }
+
+    #[tokio::test]
     async fn venue_reset_removes_only_that_venues_catalogs_and_ticks() {
-        let store = LiveBookStore::new(30_000, QuoteRateBook::default());
+        let store = LiveBookStore::new(QuoteRateBook::default());
         let lighter = catalog("lighter", "USDC");
         let hyperliquid = catalog("hyperliquid", "USDC");
         for instrument in [&lighter, &hyperliquid] {

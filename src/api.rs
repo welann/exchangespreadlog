@@ -30,7 +30,6 @@ pub struct ApiState {
     pub store: LiveBookStore,
     pub clickhouse: ClickHouse,
     pub wal: DurableEventLog,
-    pub max_book_age_ms: i64,
     pub shutdown: watch::Receiver<bool>,
 }
 
@@ -79,7 +78,7 @@ async fn history(
     State(state): State<ApiState>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<HistoryResponse>, ApiError> {
-    let (_, _, conversion) = state
+    let (leg_a, leg_b, conversion) = state
         .store
         .catalog_pair(&query.leg_a, &query.leg_b)
         .await
@@ -93,7 +92,8 @@ async fn history(
             &query.leg_b,
             from_ms,
             to_ms,
-            state.max_book_age_ms,
+            &leg_a.venue_instance_id,
+            &leg_b.venue_instance_id,
             conversion,
         )
         .await

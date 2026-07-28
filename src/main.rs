@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let wal = DurableEventLog::open(&config.wal_path)?;
-    let store = LiveBookStore::new(config.query_max_book_age_ms, config.quote_rates.clone());
+    let store = LiveBookStore::new(config.quote_rates.clone());
     let (event_tx, event_rx) = mpsc::channel::<MarketEvent>(16_384);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -122,7 +122,6 @@ async fn main() -> anyhow::Result<()> {
             store,
             clickhouse,
             wal,
-            max_book_age_ms: config.query_max_book_age_ms,
             shutdown: shutdown_rx.clone(),
         },
         config.web_dir.clone(),

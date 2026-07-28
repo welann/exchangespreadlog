@@ -20,7 +20,6 @@ pub struct RuntimeConfig {
     pub wal_path: PathBuf,
     pub web_dir: PathBuf,
     pub stale_after_ms: i64,
-    pub query_max_book_age_ms: i64,
     pub quote_rates: QuoteRateBook,
     pub catalog_cache_path: PathBuf,
     pub catalog_refresh_interval: Duration,
@@ -126,7 +125,6 @@ impl RuntimeConfig {
             ),
             web_dir: PathBuf::from(env::var("WEB_DIR").unwrap_or_else(|_| "web/build".to_string())),
             stale_after_ms: parse_env("STALE_AFTER_MS", 5_000)?,
-            query_max_book_age_ms: parse_env("QUERY_MAX_BOOK_AGE_MS", 30_000)?,
             quote_rates: default_quote_rates(),
             catalog_cache_path: PathBuf::from(
                 env::var("CATALOG_CACHE_PATH").unwrap_or_else(|_| "data/catalog.json".to_string()),
@@ -150,7 +148,6 @@ impl RuntimeConfig {
             wal_path: PathBuf::from("data/wal.sqlite3"),
             web_dir: PathBuf::from("web/build"),
             stale_after_ms: 5_000,
-            query_max_book_age_ms: 30_000,
             quote_rates: default_quote_rates(),
             catalog_cache_path: PathBuf::from("data/catalog.json"),
             catalog_refresh_interval: Duration::from_secs(3_600),
