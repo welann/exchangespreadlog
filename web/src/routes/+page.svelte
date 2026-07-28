@@ -29,6 +29,22 @@
     sampleCount: number;
     topSampleCount: number;
   };
+  type OpportunityRank = {
+    key: string;
+    buy: Instrument;
+    sell: Instrument;
+    opportunityMs: number;
+    windowCount: number;
+    typicalBp: number;
+    latestOpportunityMs: number;
+  };
+  type HistoryCacheEntry = {
+    fetchedAtMs: number;
+    response: HistoryResponse;
+  };
+
+  const opportunityQueryConcurrency = 4;
+  const historyCacheTtlMs = 30_000;
 
   let markets: Market[] = [];
   let selectedMarketKey = '';
@@ -51,6 +67,12 @@
   let clockNowMs = Date.now();
   let serverClockOffsetMs = 0;
   let topSharePercent = 30;
+  let opportunityRanking: OpportunityRank[] = [];
+  let loadingOpportunities = false;
+  let opportunityError = '';
+  let opportunityRequestId = 0;
+  let opportunityAbortController: AbortController | null = null;
+  const historyCache = new Map<string, HistoryCacheEntry>();
 
   $: selectedMarket =
     markets.find((market) => marketKey(market) === selectedMarketKey) ?? null;
@@ -94,6 +116,7 @@
     }, 1_000);
     return () => {
       stream?.close();
+      opportunityAbortController?.abort();
       if (healthTimer) clearInterval(healthTimer);
       if (clockTimer) clearInterval(clockTimer);
     };
@@ -131,6 +154,7 @@
   }
 
   function selectMarket(market: Market) {
+    const marketChanged = marketKey(market) !== selectedMarketKey;
     if (filterMode === 'venue') {
       const primaryInstrument = market.instruments.find(
         (instrument) => instrument.venue === primaryVenue
@@ -143,7 +167,12 @@
       selectedMarketKey = marketKey(market);
       legAKey = primaryInstrument.instrumentKey;
       legBKey = counterInstrument.instrumentKey;
-      void refreshPair();
+      if (marketChanged) {
+        prepareOpportunityRanking();
+        void refreshSelectedMarket(market);
+      } else {
+        void refreshPair();
+      }
       return;
     }
 
@@ -153,7 +182,12 @@
     );
     legAKey = liveInstruments[0]?.instrumentKey ?? '';
     legBKey = liveInstruments.find((instrument) => instrument.instrumentKey !== legAKey)?.instrumentKey ?? '';
-    void refreshPair();
+    if (marketChanged) {
+      prepareOpportunityRanking();
+      void refreshSelectedMarket(market);
+    } else {
+      void refreshPair();
+    }
   }
 
   function setFilterMode(mode: FilterMode) {
@@ -201,6 +235,8 @@
     live = null;
     stream?.close();
     stream = null;
+    prepareOpportunityRanking();
+    loadingOpportunities = false;
   }
 
   function chooseLeg(which: 'a' | 'b', instrument: Instrument) {
@@ -233,9 +269,29 @@
     void refreshPair();
   }
 
+  function selectOpportunity(opportunity: OpportunityRank) {
+    if (filterMode === 'venue') {
+      setVenuePair(opportunity.buy.venue, opportunity.sell.venue);
+      return;
+    }
+
+    legAKey = opportunity.buy.instrumentKey;
+    legBKey = opportunity.sell.instrumentKey;
+    void refreshPair();
+  }
+
   async function setRange(value: number) {
     rangeMs = value;
+    prepareOpportunityRanking();
     await loadHistory();
+    await loadOpportunityRanking(selectedMarket);
+  }
+
+  async function refreshSelectedMarket(market: Market) {
+    await refreshPair();
+    if (marketKey(market) === selectedMarketKey) {
+      await loadOpportunityRanking(market);
+    }
   }
 
   async function refreshPair() {
@@ -247,23 +303,259 @@
     await loadHistory();
   }
 
-  async function loadHistory() {
+  async function loadHistory(force = false) {
     if (!legAKey || !legBKey) return;
     loadingHistory = true;
     try {
-      const query = new URLSearchParams({
-        leg_a: legAKey,
-        leg_b: legBKey,
-        range_ms: String(rangeMs)
-      });
-      const response = await fetch(`/v1/spreads?${query}`);
-      if (!response.ok) throw new Error(await publicError(response));
-      history = (await response.json()) as HistoryResponse;
+      history = await fetchHistory(legAKey, legBKey, rangeMs, undefined, force);
     } catch (cause) {
       error = message(cause);
     } finally {
       loadingHistory = false;
     }
+  }
+
+  async function refreshHistoricalData() {
+    historyCache.clear();
+    prepareOpportunityRanking();
+    await loadHistory(true);
+    await loadOpportunityRanking(selectedMarket);
+  }
+
+  function prepareOpportunityRanking() {
+    opportunityRequestId += 1;
+    opportunityAbortController?.abort();
+    opportunityAbortController = null;
+    opportunityRanking = [];
+    opportunityError = '';
+    loadingOpportunities = true;
+  }
+
+  async function loadOpportunityRanking(market: Market | null) {
+    if (!market || market.instruments.length < 2) {
+      loadingOpportunities = false;
+      return;
+    }
+
+    const requestedMarketKey = marketKey(market);
+    const requestedRangeMs = rangeMs;
+    const requestId = ++opportunityRequestId;
+    opportunityAbortController?.abort();
+    const controller = new AbortController();
+    opportunityAbortController = controller;
+    loadingOpportunities = true;
+    opportunityError = '';
+
+    const pairs = buildInstrumentPairs(market.instruments);
+    let failedPairs = 0;
+
+    try {
+      const results = await mapWithConcurrency(
+        pairs,
+        opportunityQueryConcurrency,
+        async ([first, second]) => {
+          try {
+            const response = await fetchHistory(
+              first.instrumentKey,
+              second.instrumentKey,
+              requestedRangeMs,
+              controller.signal
+            );
+            return summarizeOpportunityPair(response, first, second);
+          } catch (cause) {
+            if (isAbortError(cause)) throw cause;
+            failedPairs += 1;
+            return null;
+          }
+        }
+      );
+
+      if (
+        requestId !== opportunityRequestId ||
+        requestedMarketKey !== selectedMarketKey ||
+        requestedRangeMs !== rangeMs
+      ) {
+        return;
+      }
+
+      opportunityRanking = results
+        .filter((result): result is OpportunityRank => result !== null)
+        .sort(
+          (left, right) =>
+            right.typicalBp - left.typicalBp ||
+            right.opportunityMs - left.opportunityMs ||
+            right.latestOpportunityMs - left.latestOpportunityMs
+        );
+      opportunityError =
+        failedPairs > 0
+          ? `${failedPairs} 组交易所暂时无法读取，排行已使用其余数据。`
+          : '';
+    } catch (cause) {
+      if (!isAbortError(cause) && requestId === opportunityRequestId) {
+        opportunityError = '机会排行暂时无法读取。';
+      }
+    } finally {
+      if (requestId === opportunityRequestId) {
+        loadingOpportunities = false;
+        opportunityAbortController = null;
+      }
+    }
+  }
+
+  async function fetchHistory(
+    firstKey: string,
+    secondKey: string,
+    requestedRangeMs: number,
+    signal?: AbortSignal,
+    force = false
+  ) {
+    const cacheKey = `${firstKey}|${secondKey}|${requestedRangeMs}`;
+    const cached = historyCache.get(cacheKey);
+    if (!force && cached && Date.now() - cached.fetchedAtMs < historyCacheTtlMs) {
+      return cached.response;
+    }
+
+    const query = new URLSearchParams({
+      leg_a: firstKey,
+      leg_b: secondKey,
+      range_ms: String(requestedRangeMs)
+    });
+    const response = await fetch(`/v1/spreads?${query}`, { signal });
+    if (!response.ok) throw new Error(await publicError(response));
+    const payload = (await response.json()) as HistoryResponse;
+    historyCache.set(cacheKey, { fetchedAtMs: Date.now(), response: payload });
+    return payload;
+  }
+
+  function buildInstrumentPairs(instruments: Instrument[]) {
+    const byVenue = new Map<string, Instrument>();
+    for (const instrument of [...instruments].sort(
+      (left, right) => (right.latestRecvMs ?? 0) - (left.latestRecvMs ?? 0)
+    )) {
+      if (!byVenue.has(instrument.venue)) byVenue.set(instrument.venue, instrument);
+    }
+
+    const uniqueInstruments = [...byVenue.values()];
+    const pairs: Array<[Instrument, Instrument]> = [];
+    for (let first = 0; first < uniqueInstruments.length; first += 1) {
+      for (let second = first + 1; second < uniqueInstruments.length; second += 1) {
+        pairs.push([uniqueInstruments[first], uniqueInstruments[second]]);
+      }
+    }
+    return pairs;
+  }
+
+  async function mapWithConcurrency<T, R>(
+    items: T[],
+    concurrency: number,
+    task: (item: T) => Promise<R>
+  ) {
+    const results = new Array<R>(items.length);
+    let nextIndex = 0;
+
+    async function worker() {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await task(items[index]);
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, items.length) }, () => worker())
+    );
+    return results;
+  }
+
+  function summarizeOpportunityPair(
+    response: HistoryResponse,
+    first: Instrument,
+    second: Instrument
+  ) {
+    const aToB = summarizeOpportunityDirection(
+      response,
+      (point) => point.aToBBp,
+      first,
+      second,
+      'aToB'
+    );
+    const bToA = summarizeOpportunityDirection(
+      response,
+      (point) => point.bToABp,
+      first,
+      second,
+      'bToA'
+    );
+    if (!aToB) return bToA;
+    if (!bToA) return aToB;
+    return aToB.typicalBp > bToA.typicalBp ||
+      (aToB.typicalBp === bToA.typicalBp && aToB.opportunityMs >= bToA.opportunityMs)
+      ? aToB
+      : bToA;
+  }
+
+  function summarizeOpportunityDirection(
+    response: HistoryResponse,
+    valueForPoint: (point: SpreadPoint) => number,
+    first: Instrument,
+    second: Instrument,
+    direction: 'aToB' | 'bToA'
+  ): OpportunityRank | null {
+    const points = [...response.points].sort((left, right) => left.tsMs - right.tsMs);
+    const resolutionMs = Math.max(1, response.resolutionMs);
+    const positiveValues: number[] = [];
+    let opportunityMs = 0;
+    let windowCount = 0;
+    let windowOpen = false;
+    let previousTsMs: number | null = null;
+    let latestOpportunityMs = 0;
+
+    for (let index = 0; index < points.length; index += 1) {
+      const point = points[index];
+      const value = valueForPoint(point);
+      const positive = Number.isFinite(value) && value > 0;
+      const contiguous =
+        previousTsMs !== null && point.tsMs - previousTsMs <= resolutionMs * 1.5;
+
+      if (positive) {
+        if (!windowOpen || !contiguous) windowCount += 1;
+        const nextTsMs = points[index + 1]?.tsMs ?? response.toMs;
+        opportunityMs += Math.max(
+          0,
+          Math.min(resolutionMs, nextTsMs - point.tsMs, response.toMs - point.tsMs)
+        );
+        positiveValues.push(value);
+        latestOpportunityMs = Math.max(latestOpportunityMs, point.tsMs);
+      }
+
+      windowOpen = positive;
+      previousTsMs = point.tsMs;
+    }
+
+    if (positiveValues.length === 0) return null;
+    const sortedValues = positiveValues.sort((left, right) => left - right);
+    const buy = direction === 'aToB' ? first : second;
+    const sell = direction === 'aToB' ? second : first;
+    return {
+      key: `${buy.instrumentKey}|${sell.instrumentKey}`,
+      buy,
+      sell,
+      opportunityMs,
+      windowCount,
+      typicalBp: median(sortedValues),
+      latestOpportunityMs
+    };
+  }
+
+  function median(sortedValues: number[]) {
+    const middle = Math.floor(sortedValues.length / 2);
+    return sortedValues.length % 2 === 0
+      ? (sortedValues[middle - 1] + sortedValues[middle]) / 2
+      : sortedValues[middle];
+  }
+
+  function isAbortError(cause: unknown) {
+    return cause instanceof Error && cause.name === 'AbortError';
   }
 
   function connectLive() {
@@ -277,7 +569,7 @@
     };
     stream.addEventListener('snapshot', receive as EventListener);
     stream.addEventListener('spread', receive as EventListener);
-    stream.addEventListener('resync', () => void loadHistory());
+    stream.addEventListener('resync', () => void loadHistory(true));
     stream.onerror = () => {
       error = '实时连接正在重试；历史数据仍可查看。';
     };
@@ -446,6 +738,19 @@
     if (value < 60_000) return `${value / 1_000} 秒`;
     if (value < 3_600_000) return `${value / 60_000} 分钟`;
     return `${value / 3_600_000} 小时`;
+  }
+
+  function selectedRangeLabel() {
+    return ranges.find((range) => range.ms === rangeMs)?.label ?? '当前区间';
+  }
+
+  function formatOpportunityDuration(value: number) {
+    if (value < 60_000) return '<1 分钟';
+    if (value < 3_600_000) return `${Math.round(value / 60_000)} 分钟`;
+    if (value < 86_400_000) {
+      return `${formatNumber(value / 3_600_000, value < 10_800_000 ? 1 : 0)} 小时`;
+    }
+    return `${formatNumber(value / 86_400_000, 1)} 天`;
   }
 
   function liveStateLabel(value: LiveSpread | null) {
@@ -638,7 +943,9 @@
           <span>{loadingHistory ? '查询中…' : `${history?.points.length ?? 0} 个数据点`}</span>
           <span>{resolutionLabel(history?.resolutionMs)} 粒度</span>
           <span>服务端时钟锚定</span>
-          <button on:click={loadHistory} disabled={loadingHistory}>刷新历史</button>
+          <button on:click={refreshHistoricalData} disabled={loadingHistory || loadingOpportunities}>
+            刷新历史
+          </button>
         </div>
       </div>
 
@@ -804,6 +1111,55 @@
             </button>
           {/each}
         </div>
+      </section>
+
+      <section class="opportunity-block" aria-label="当前交易对的交易所机会排行">
+        <div class="rail-heading">
+          <span>机会排行</span>
+          <small>{selectedRangeLabel()} · 典型毛价差</small>
+        </div>
+        {#if loadingOpportunities}
+          <div class="opportunity-loading" aria-label="正在计算机会排行">
+            {#each Array(3) as _}
+              <span></span>
+            {/each}
+          </div>
+        {:else if opportunityRanking.length > 0}
+          <div class="opportunity-list">
+            {#each opportunityRanking.slice(0, 3) as opportunity, index}
+              <button
+                class:active={legAKey === opportunity.buy.instrumentKey &&
+                  legBKey === opportunity.sell.instrumentKey}
+                on:click={() => selectOpportunity(opportunity)}
+                aria-label={`选择 ${opportunity.buy.venue} 买入、${opportunity.sell.venue} 卖出`}
+              >
+                <span class="opportunity-rank">{index + 1}</span>
+                <span class="opportunity-route">
+                  <strong>
+                    {opportunity.buy.venue}
+                    <i>→</i>
+                    {opportunity.sell.venue}
+                  </strong>
+                  <small>
+                    {formatOpportunityDuration(opportunity.opportunityMs)}机会 ·
+                    {opportunity.windowCount} 段
+                  </small>
+                </span>
+                <span class="opportunity-value">
+                  <strong>典型 {formatNumber(opportunity.typicalBp)} bp</strong>
+                  <small>{formatAge(opportunity.latestOpportunityMs, clockNowMs)}出现</small>
+                </span>
+              </button>
+            {/each}
+          </div>
+          {#if opportunityError}
+            <p class="opportunity-note">{opportunityError}</p>
+          {/if}
+        {:else}
+          <p class="opportunity-empty">
+            {opportunityError || '当前区间没有出现正价差。'}
+          </p>
+        {/if}
       </section>
 
       <section class="health-block">
@@ -1704,6 +2060,116 @@
     font-size: 10px;
   }
 
+  .opportunity-block {
+    border-bottom: 1px solid #aebdc8;
+  }
+
+  .opportunity-list button {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border: 0;
+    border-bottom: 1px solid #d2dbe1;
+    background: transparent;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .opportunity-list button:last-child {
+    border-bottom: 0;
+  }
+
+  .opportunity-list button:hover,
+  .opportunity-list button.active {
+    background: #f8fafb;
+  }
+
+  .opportunity-list button.active {
+    box-shadow: inset 3px 0 #4c8876;
+  }
+
+  .opportunity-rank {
+    color: #8a9aa7;
+    font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 9px;
+  }
+
+  .opportunity-route,
+  .opportunity-value {
+    min-width: 0;
+  }
+
+  .opportunity-route strong,
+  .opportunity-route small,
+  .opportunity-value strong,
+  .opportunity-value small {
+    display: block;
+    white-space: nowrap;
+  }
+
+  .opportunity-route strong {
+    overflow: hidden;
+    font-size: 10px;
+    text-overflow: ellipsis;
+  }
+
+  .opportunity-route i {
+    color: #8a9aa7;
+    font-style: normal;
+    font-weight: 400;
+  }
+
+  .opportunity-route small,
+  .opportunity-value small {
+    margin-top: 3px;
+    color: #718392;
+    font-size: 8px;
+  }
+
+  .opportunity-value {
+    padding-left: 8px;
+    border-left: 1px solid #ccd6dd;
+    text-align: right;
+  }
+
+  .opportunity-value strong {
+    color: #287760;
+    font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 9px;
+  }
+
+  .opportunity-loading {
+    display: grid;
+    gap: 1px;
+  }
+
+  .opportunity-loading span {
+    height: 48px;
+    background: linear-gradient(90deg, #e2e8ec, #f7f9fa, #e2e8ec);
+    background-size: 240% 100%;
+    animation: shimmer 1.4s linear infinite;
+  }
+
+  .opportunity-empty,
+  .opportunity-note {
+    margin: 0;
+    color: #657789;
+    font-size: 9px;
+    line-height: 1.55;
+  }
+
+  .opportunity-empty {
+    padding: 17px 14px;
+  }
+
+  .opportunity-note {
+    padding: 8px 12px;
+    border-top: 1px dotted #bbc7d0;
+  }
+
   .health-block dl {
     margin: 0;
     padding: 8px 14px 18px;
@@ -1741,7 +2207,7 @@
     .leg-panel {
       grid-column: 1 / -1;
       display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
+      grid-template-columns: 1fr 1fr;
       border-top: 1px solid #aebdc8;
       border-left: 0;
     }
@@ -1751,8 +2217,12 @@
     }
 
     .leg-block {
+      border-bottom: 1px solid #aebdc8;
+    }
+
+    .leg-block.a,
+    .opportunity-block {
       border-right: 1px solid #aebdc8;
-      border-bottom: 0;
     }
   }
 
@@ -1871,11 +2341,16 @@
       border-right: 0;
       border-bottom: 1px solid #aebdc8;
     }
+
+    .opportunity-block {
+      border-right: 0;
+    }
   }
 
   @media (prefers-reduced-motion: reduce) {
     .signal,
-    .market-skeleton {
+    .market-skeleton,
+    .opportunity-loading span {
       animation: none;
       transition: none;
     }
