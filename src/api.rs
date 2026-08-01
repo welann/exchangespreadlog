@@ -3,13 +3,13 @@ use std::{convert::Infallible, path::PathBuf, sync::atomic::Ordering, time::Dura
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::get,
+    routing::{get, post, put},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -20,6 +20,7 @@ use tower_http::{
 };
 
 use crate::{
+    catalog_control::{AssetGroup, CatalogControl, InstrumentKey},
     clickhouse::{ClickHouse, HistoryResponse},
     store::{LiveBookStore, LiveNotice},
     wal::DurableEventLog,
@@ -31,6 +32,8 @@ pub struct ApiState {
     pub clickhouse: ClickHouse,
     pub wal: DurableEventLog,
     pub shutdown: watch::Receiver<bool>,
+    pub catalog_control: CatalogControl,
+    pub catalog_refresh: tokio::sync::mpsc::Sender<()>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +47,13 @@ struct HistoryQuery {
     leg_a: String,
     leg_b: String,
     range_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveAssetGroup {
+    symbol: String,
+    members: Vec<InstrumentKey>,
 }
 
 #[derive(Debug)]
@@ -61,10 +71,109 @@ pub fn router(state: ApiState, web_dir: PathBuf) -> Router {
         .route("/v1/spreads", get(history))
         .route("/v1/live/spread", get(live_spread))
         .route("/v1/health", get(health))
+        .route("/v1/admin/catalog/instruments", get(catalog_instruments))
+        .route(
+            "/v1/admin/catalog/groups",
+            get(asset_groups).post(create_asset_group),
+        )
+        .route(
+            "/v1/admin/catalog/groups/{id}",
+            put(update_asset_group).delete(delete_asset_group),
+        )
+        .route("/v1/admin/catalog/refresh", post(refresh_catalog))
         .route("/metrics", get(metrics))
         .fallback_service(static_files)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn catalog_instruments(
+    State(state): State<ApiState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let instruments = state
+        .catalog_control
+        .instruments()
+        .map_err(catalog_api_error)?;
+    Ok(Json(json!({ "instruments": instruments })))
+}
+
+async fn asset_groups(State(state): State<ApiState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let groups = state.catalog_control.groups().map_err(catalog_api_error)?;
+    Ok(Json(json!({ "groups": groups })))
+}
+
+async fn create_asset_group(
+    State(state): State<ApiState>,
+    Json(input): Json<SaveAssetGroup>,
+) -> Result<Json<AssetGroup>, ApiError> {
+    let group = state
+        .catalog_control
+        .create_group(&input.symbol, &input.members)
+        .map_err(catalog_api_error)?;
+    state
+        .catalog_refresh
+        .send(())
+        .await
+        .map_err(|error| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "CATALOG_REFRESH_UNAVAILABLE",
+            message: error.to_string(),
+        })?;
+    Ok(Json(group))
+}
+
+async fn update_asset_group(
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+    Json(input): Json<SaveAssetGroup>,
+) -> Result<Json<AssetGroup>, ApiError> {
+    let group = state
+        .catalog_control
+        .update_group(id, &input.symbol, &input.members)
+        .map_err(catalog_api_error)?;
+    state
+        .catalog_refresh
+        .send(())
+        .await
+        .map_err(|error| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "CATALOG_REFRESH_UNAVAILABLE",
+            message: error.to_string(),
+        })?;
+    Ok(Json(group))
+}
+
+async fn delete_asset_group(
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .catalog_control
+        .delete_group(id)
+        .map_err(catalog_api_error)?;
+    state
+        .catalog_refresh
+        .send(())
+        .await
+        .map_err(|error| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "CATALOG_REFRESH_UNAVAILABLE",
+            message: error.to_string(),
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn refresh_catalog(State(state): State<ApiState>) -> Result<StatusCode, ApiError> {
+    state
+        .catalog_refresh
+        .send(())
+        .await
+        .map_err(|error| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "CATALOG_REFRESH_UNAVAILABLE",
+            message: error.to_string(),
+        })?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn markets(State(state): State<ApiState>) -> Json<serde_json::Value> {
@@ -281,6 +390,14 @@ fn internal(error: serde_json::Error) -> ApiError {
     ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: "SERIALIZATION_ERROR",
+        message: error.to_string(),
+    }
+}
+
+fn catalog_api_error(error: anyhow::Error) -> ApiError {
+    ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "CATALOG_UPDATE_FAILED",
         message: error.to_string(),
     }
 }

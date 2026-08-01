@@ -18,6 +18,8 @@ USER spread
 ENV HTTP_HOST=0.0.0.0 \
     HTTP_PORT=8080 \
     WAL_PATH=/app/data/wal.sqlite3 \
+    CATALOG_CACHE_PATH=/app/data/catalog.json \
+    CATALOG_DB_PATH=/app/data/catalog-control.sqlite3 \
     WEB_DIR=/app/empty \
     RUST_LOG=info
 EXPOSE 8080
@@ -25,4 +27,3 @@ VOLUME ["/app/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["curl", "--fail", "--silent", "http://127.0.0.1:8080/v1/health"]
 ENTRYPOINT ["exchange-spread-v2"]
-

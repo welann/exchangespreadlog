@@ -56,3 +56,32 @@ export type Health = {
   rejectedTicks: number;
   venueResets: number;
 };
+
+export type InstrumentKey = {
+  venue: string;
+  instrumentId: string;
+};
+
+export type CatalogInstrument = {
+  venue: string;
+  instrumentId: string;
+  symbol: string;
+  normalizedSymbol: string;
+  productType: 'spot' | 'perp' | 'future';
+  quoteAsset: string;
+  status: string;
+  eligible: boolean;
+  eligibilityReason: string | null;
+  present: boolean;
+  firstSeenMs: number;
+  lastSeenMs: number;
+  rawJson: string;
+  assetGroupId: number | null;
+  assetGroupSymbol: string | null;
+};
+
+export type AssetGroup = {
+  id: number;
+  symbol: string;
+  members: InstrumentKey[];
+};

@@ -4,7 +4,8 @@ use anyhow::{Context, anyhow, bail};
 use clap::Parser;
 use exchange_spread_v2::{
     api::{ApiState, router},
-    catalog::{discover_venue_configs_with_fallback, load_catalog_cache, save_catalog_cache},
+    catalog::{discover_catalog_with_fallback, load_catalog_cache, save_catalog_cache},
+    catalog_control::CatalogControl,
     clickhouse::ClickHouse,
     config::{RuntimeConfig, VenueConfig},
     domain::MarketEvent,
@@ -63,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         .connect_timeout(std::time::Duration::from_secs(8))
         .timeout(std::time::Duration::from_secs(20))
         .build()?;
+    let catalog_control = CatalogControl::open(&config.catalog_db_path)?;
     let cached_venues = match load_catalog_cache(&config.catalog_cache_path).await {
         Ok(venues) => {
             info!(
@@ -82,8 +84,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let venues =
-        discover_venue_configs_with_fallback(&http_client, &cached_venues, &config.disabled_venues)
-            .await?;
+        discover_catalog_plan(&http_client, &cached_venues, &config, &catalog_control).await?;
     if let Err(error) = save_catalog_cache(&config.catalog_cache_path, &venues).await {
         warn!(%error, "failed to persist last-known-good catalog");
     }
@@ -96,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
     let store = LiveBookStore::new(config.quote_rates.clone());
     let (event_tx, event_rx) = mpsc::channel::<MarketEvent>(16_384);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (catalog_refresh_tx, mut catalog_refresh_rx) = mpsc::channel(1);
 
     let mut pipeline_handle = tokio::spawn(pipeline::run(
         event_rx,
@@ -123,6 +125,8 @@ async fn main() -> anyhow::Result<()> {
             clickhouse,
             wal,
             shutdown: shutdown_rx.clone(),
+            catalog_control: catalog_control.clone(),
+            catalog_refresh: catalog_refresh_tx,
         },
         config.web_dir.clone(),
     );
@@ -171,23 +175,23 @@ async fn main() -> anyhow::Result<()> {
                 break task_result("pipeline", result);
             }
             _ = catalog_refresh.tick() => {
-                let current = adapter_manager.configs();
-                match discover_venue_configs_with_fallback(
+                if let Err(error) = refresh_catalog_subscriptions(
                     &http_client,
-                    &current,
-                    &config.disabled_venues,
+                    &config,
+                    &catalog_control,
+                    &mut adapter_manager,
                 ).await {
-                    Ok(next) => {
-                        if let Err(error) = adapter_manager.apply(&next).await {
-                            break Err(error.context("apply refreshed catalog"));
-                        }
-                        if let Err(error) = save_catalog_cache(&config.catalog_cache_path, &next).await {
-                            warn!(%error, "failed to persist refreshed catalog");
-                        }
-                    }
-                    Err(error) => {
-                        warn!(%error, "catalog refresh rejected; current subscriptions remain active");
-                    }
+                    warn!(%error, "catalog refresh rejected; current subscriptions remain active");
+                }
+            }
+            Some(()) = catalog_refresh_rx.recv() => {
+                if let Err(error) = refresh_catalog_subscriptions(
+                    &http_client,
+                    &config,
+                    &catalog_control,
+                    &mut adapter_manager,
+                ).await {
+                    warn!(%error, "manual catalog refresh rejected; current subscriptions remain active");
                 }
             }
             _ = adapter_health.tick() => {
@@ -216,6 +220,35 @@ async fn main() -> anyhow::Result<()> {
     }
     report_task("ClickHouse projector", projector_handle).await;
     final_result
+}
+
+async fn discover_catalog_plan(
+    http_client: &reqwest::Client,
+    fallback: &[VenueConfig],
+    config: &RuntimeConfig,
+    catalog_control: &CatalogControl,
+) -> anyhow::Result<Vec<VenueConfig>> {
+    let mappings = catalog_control.mapping_overrides()?;
+    let discovery =
+        discover_catalog_with_fallback(http_client, fallback, &config.disabled_venues, &mappings)
+            .await?;
+    for (venue, instruments) in &discovery.inventories {
+        catalog_control.sync_venue(venue, instruments)?;
+    }
+    Ok(discovery.venues)
+}
+
+async fn refresh_catalog_subscriptions(
+    http_client: &reqwest::Client,
+    config: &RuntimeConfig,
+    catalog_control: &CatalogControl,
+    adapter_manager: &mut AdapterManager,
+) -> anyhow::Result<()> {
+    let current = adapter_manager.configs();
+    let next = discover_catalog_plan(http_client, &current, config, catalog_control).await?;
+    adapter_manager.apply(&next).await?;
+    save_catalog_cache(&config.catalog_cache_path, &next).await?;
+    Ok(())
 }
 
 struct AdapterTask {

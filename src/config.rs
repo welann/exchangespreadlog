@@ -22,6 +22,7 @@ pub struct RuntimeConfig {
     pub stale_after_ms: i64,
     pub quote_rates: QuoteRateBook,
     pub catalog_cache_path: PathBuf,
+    pub catalog_db_path: PathBuf,
     pub catalog_refresh_interval: Duration,
     pub disabled_venues: HashSet<String>,
 }
@@ -153,6 +154,10 @@ impl RuntimeConfig {
             catalog_cache_path: PathBuf::from(
                 env::var("CATALOG_CACHE_PATH").unwrap_or_else(|_| "data/catalog.json".to_string()),
             ),
+            catalog_db_path: PathBuf::from(
+                env::var("CATALOG_DB_PATH")
+                    .unwrap_or_else(|_| "data/catalog-control.sqlite3".to_string()),
+            ),
             catalog_refresh_interval: Duration::from_secs(catalog_refresh_seconds),
             disabled_venues: parse_csv_env("DISABLED_VENUES"),
         })
@@ -177,6 +182,7 @@ impl RuntimeConfig {
             stale_after_ms: 5_000,
             quote_rates: default_quote_rates(),
             catalog_cache_path: PathBuf::from("data/catalog.json"),
+            catalog_db_path: PathBuf::from("data/catalog-control.sqlite3"),
             catalog_refresh_interval: Duration::from_secs(3_600),
             disabled_venues: HashSet::new(),
         }

@@ -1,5 +1,6 @@
 pub mod api;
 pub mod catalog;
+pub mod catalog_control;
 pub mod clickhouse;
 pub mod config;
 pub mod domain;

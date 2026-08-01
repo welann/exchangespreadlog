@@ -791,6 +791,8 @@
       </div>
     </div>
     <div class="system-line">
+      <a class="catalog-link" href="/admin/catalog/">交易对审核</a>
+      <span class="divider"></span>
       <span class:healthy={health?.status === 'ok'} class="status-dot"></span>
       <span>{health?.status === 'ok' ? '采集链路正常' : '链路检查中'}</span>
       <span class="divider"></span>
@@ -1271,6 +1273,16 @@
     color: #526579;
     font-size: 11px;
     letter-spacing: 0.03em;
+  }
+
+  .catalog-link {
+    color: #315d7a;
+    font-weight: 700;
+    text-decoration: none;
+  }
+
+  .catalog-link:hover {
+    color: #c06e37;
   }
 
   .status-dot {

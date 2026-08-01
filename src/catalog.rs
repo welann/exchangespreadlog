@@ -9,6 +9,7 @@ use futures_util::{
     future::{BoxFuture, join_all},
 };
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -27,6 +28,34 @@ const PERPL_CONTEXT_URL: &str = "https://app.perpl.xyz/api/v1/pub/context";
 const ONDO_MARKETS_URL: &str = "https://api.ondoperps.xyz/v1/markets";
 const SUPPORTED_QUOTE_ASSETS: &[&str] = &["USD", "USDC", "USDT", "AUSD"];
 
+pub type CatalogMappings = HashMap<(String, String), String>;
+
+#[derive(Debug, Clone)]
+pub struct CatalogDiscovery {
+    pub venues: Vec<VenueConfig>,
+    pub inventories: Vec<(String, Vec<CatalogInstrument>)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogInstrument {
+    pub venue: String,
+    pub instrument_id: String,
+    pub symbol: String,
+    pub normalized_symbol: String,
+    pub product_type: ProductType,
+    pub quote_asset: String,
+    pub status: String,
+    pub eligible: bool,
+    pub eligibility_reason: Option<String>,
+    pub raw_json: Value,
+}
+
+struct DiscoveredVenue {
+    config: VenueConfig,
+    inventory: Vec<CatalogInstrument>,
+}
+
 pub async fn discover_venue_configs(client: &Client) -> anyhow::Result<Vec<VenueConfig>> {
     discover_venue_configs_with_fallback(client, &[], &HashSet::new()).await
 }
@@ -36,7 +65,20 @@ pub async fn discover_venue_configs_with_fallback(
     fallback: &[VenueConfig],
     disabled_venues: &HashSet<String>,
 ) -> anyhow::Result<Vec<VenueConfig>> {
-    let jobs: Vec<(&str, BoxFuture<'_, anyhow::Result<VenueConfig>>)> = vec![
+    Ok(
+        discover_catalog_with_fallback(client, fallback, disabled_venues, &HashMap::new())
+            .await?
+            .venues,
+    )
+}
+
+pub async fn discover_catalog_with_fallback(
+    client: &Client,
+    fallback: &[VenueConfig],
+    disabled_venues: &HashSet<String>,
+    mappings: &CatalogMappings,
+) -> anyhow::Result<CatalogDiscovery> {
+    let jobs: Vec<(&str, BoxFuture<'_, anyhow::Result<DiscoveredVenue>>)> = vec![
         ("hyperliquid", discover_hyperliquid(client).boxed()),
         ("lighter", discover_lighter(client).boxed()),
         ("risex", discover_risex(client).boxed()),
@@ -57,18 +99,22 @@ pub async fn discover_venue_configs_with_fallback(
     .await;
 
     let mut venues = Vec::new();
+    let mut inventories = Vec::new();
     let fallback = fallback
         .iter()
         .map(|venue| (venue.venue_instance_id.as_str(), venue))
         .collect::<HashMap<_, _>>();
     for (venue, result) in results {
         match result {
-            Ok(config) => {
+            Ok(discovered) => {
+                let mut config = discovered.config;
+                apply_manual_mappings(&mut config, mappings);
                 info!(
                     venue,
                     instruments = config.instruments.len(),
                     "discovered live exchange catalog"
                 );
+                inventories.push((venue.to_string(), discovered.inventory));
                 venues.push(config);
             }
             Err(error) => {
@@ -79,7 +125,9 @@ pub async fn discover_venue_configs_with_fallback(
                         instruments = cached.instruments.len(),
                         "exchange catalog discovery failed; retaining last-known-good catalog"
                     );
-                    venues.push((*cached).clone());
+                    let mut cached = (*cached).clone();
+                    reset_and_apply_manual_mappings(&mut cached, mappings);
+                    venues.push(cached);
                 } else {
                     warn!(
                         venue,
@@ -106,7 +154,33 @@ pub async fn discover_venue_configs_with_fallback(
             .sum::<usize>(),
         "selected cross-venue catalog"
     );
-    Ok(venues)
+    Ok(CatalogDiscovery {
+        venues,
+        inventories,
+    })
+}
+
+fn apply_manual_mappings(venue: &mut VenueConfig, mappings: &CatalogMappings) {
+    for instrument in &mut venue.instruments {
+        if let Some(symbol) = mappings.get(&(
+            venue.venue_instance_id.clone(),
+            instrument.instrument_id.clone(),
+        )) {
+            instrument.base_asset = symbol.clone();
+        }
+    }
+}
+
+fn reset_and_apply_manual_mappings(venue: &mut VenueConfig, mappings: &CatalogMappings) {
+    for instrument in &mut venue.instruments {
+        instrument.base_asset = mappings
+            .get(&(
+                venue.venue_instance_id.clone(),
+                instrument.instrument_id.clone(),
+            ))
+            .cloned()
+            .unwrap_or_else(|| normalize_base(&instrument.raw_symbol));
+    }
 }
 
 pub async fn load_catalog_cache(path: &Path) -> anyhow::Result<Vec<VenueConfig>> {
@@ -189,7 +263,7 @@ fn select_lighter_anchored_catalog(venues: &mut Vec<VenueConfig>) -> anyhow::Res
     Ok(selected_bases.len())
 }
 
-async fn discover_hyperliquid(client: &Client) -> anyhow::Result<VenueConfig> {
+async fn discover_hyperliquid(client: &Client) -> anyhow::Result<DiscoveredVenue> {
     let (all_perp_metas, spot_meta) = tokio::try_join!(
         post_json(
             client,
@@ -198,23 +272,26 @@ async fn discover_hyperliquid(client: &Client) -> anyhow::Result<VenueConfig> {
         ),
         post_json(client, HYPERLIQUID_INFO_URL, json!({"type": "spotMeta"}),),
     )?;
-    let instruments = parse_hyperliquid_instruments(&all_perp_metas, &spot_meta)?;
+    let (instruments, inventory) = parse_hyperliquid_catalog(&all_perp_metas, &spot_meta)?;
 
-    Ok(venue(
-        "hyperliquid",
-        "hyperliquid",
-        "wss://api.hyperliquid.xyz/ws",
-        Some("bbo"),
-        "USDC",
-        Some(HYPERLIQUID_INFO_URL),
-        instruments,
-    ))
+    Ok(DiscoveredVenue {
+        config: venue(
+            "hyperliquid",
+            "hyperliquid",
+            "wss://api.hyperliquid.xyz/ws",
+            Some("bbo"),
+            "USDC",
+            Some(HYPERLIQUID_INFO_URL),
+            instruments,
+        ),
+        inventory,
+    })
 }
 
-fn parse_hyperliquid_instruments(
+fn parse_hyperliquid_catalog(
     all_perp_metas: &Value,
     spot_meta: &Value,
-) -> anyhow::Result<Vec<InstrumentConfig>> {
+) -> anyhow::Result<(Vec<InstrumentConfig>, Vec<CatalogInstrument>)> {
     let tokens = array_at(spot_meta, &["tokens"], "Hyperliquid spotMeta.tokens")?;
     let quote_by_index = tokens
         .iter()
@@ -232,6 +309,7 @@ fn parse_hyperliquid_instruments(
     };
 
     let mut instruments = Vec::new();
+    let mut inventory = Vec::new();
     for meta in metas {
         let collateral_token = meta
             .get("collateralToken")
@@ -240,25 +318,23 @@ fn parse_hyperliquid_instruments(
         let quote_asset = quote_by_index.get(&collateral_token).with_context(|| {
             format!("Hyperliquid collateralToken {collateral_token} is absent from spotMeta")
         })?;
-        if !SUPPORTED_QUOTE_ASSETS.contains(&quote_asset.as_str()) {
+        let quote_supported = SUPPORTED_QUOTE_ASSETS.contains(&quote_asset.as_str());
+        if !quote_supported {
             warn!(
                 collateral_token,
                 quote_asset,
                 "excluding Hyperliquid perp dex because its quote asset has no configured conversion"
             );
-            continue;
         }
         let universe = meta
             .get("universe")
             .and_then(Value::as_array)
             .context("Hyperliquid perp metadata is missing universe")?;
-        instruments.extend(universe.iter().filter_map(|market| {
-            if market.get("isDelisted").and_then(Value::as_bool) == Some(true) {
-                return None;
-            }
-            let symbol = string_at(market, "name")?;
+        for market in universe {
+            let symbol = string_at(market, "name").context("Hyperliquid market is missing name")?;
             let size_decimals = market.get("szDecimals").and_then(Value::as_u64);
-            Some(instrument(
+            let active = market.get("isDelisted").and_then(Value::as_bool) != Some(true);
+            let mut candidate = instrument(
                 symbol,
                 symbol,
                 symbol,
@@ -266,242 +342,358 @@ fn parse_hyperliquid_instruments(
                 quote_asset,
                 None,
                 size_decimals.and_then(decimal_tick),
-            ))
-        }));
+            );
+            candidate.status = if active { "active" } else { "inactive" }.to_string();
+            let eligible = active && quote_supported;
+            inventory.push(catalog_instrument(
+                "hyperliquid",
+                &candidate,
+                eligible,
+                (!eligible).then_some(if active {
+                    "unsupported_quote"
+                } else {
+                    "inactive"
+                }),
+                market,
+            ));
+            if eligible {
+                instruments.push(candidate);
+            }
+        }
     }
     if instruments.is_empty() {
         bail!("Hyperliquid has no active perps with a supported quote asset");
     }
-    Ok(instruments)
+    Ok((instruments, inventory))
 }
 
-async fn discover_lighter(client: &Client) -> anyhow::Result<VenueConfig> {
+#[cfg(test)]
+fn parse_hyperliquid_instruments(
+    all_perp_metas: &Value,
+    spot_meta: &Value,
+) -> anyhow::Result<Vec<InstrumentConfig>> {
+    parse_hyperliquid_catalog(all_perp_metas, spot_meta).map(|(instruments, _)| instruments)
+}
+
+async fn discover_lighter(client: &Client) -> anyhow::Result<DiscoveredVenue> {
     let value = get_json(client, LIGHTER_ORDERBOOKS_URL).await?;
     let books = array_at(&value, &["order_books"], "Lighter order_books")?;
-    let instruments = books
-        .iter()
-        .filter(|book| string_at(book, "market_type") == Some("perp"))
-        .filter(|book| string_at(book, "status") == Some("active"))
-        .filter_map(|book| {
-            let market_id = scalar_string(book.get("market_id")?)?;
-            let symbol = string_at(book, "symbol")?;
-            let price_decimals = book.get("supported_price_decimals").and_then(Value::as_u64);
-            let size_decimals = book.get("supported_size_decimals").and_then(Value::as_u64);
-            let min_size = book
-                .get("min_base_amount")
-                .and_then(Value::as_str)
-                .and_then(|value| value.parse().ok());
-            Some(InstrumentConfig {
-                min_size,
-                ..instrument(
-                    &market_id,
-                    symbol,
-                    &market_id,
-                    &normalize_base(symbol),
-                    "USDC",
-                    price_decimals.and_then(decimal_tick),
-                    size_decimals.and_then(decimal_tick),
-                )
-            })
-        })
-        .collect();
+    let mut instruments = Vec::new();
+    let mut inventory = Vec::new();
+    for book in books {
+        let Some(market_id) = book.get("market_id").and_then(scalar_string) else {
+            continue;
+        };
+        let Some(symbol) = string_at(book, "symbol") else {
+            continue;
+        };
+        let market_type = string_at(book, "market_type").unwrap_or("perp");
+        let status = string_at(book, "status").unwrap_or("unknown");
+        let price_decimals = book.get("supported_price_decimals").and_then(Value::as_u64);
+        let size_decimals = book.get("supported_size_decimals").and_then(Value::as_u64);
+        let min_size = book
+            .get("min_base_amount")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok());
+        let (base_asset, quote_asset) = symbol
+            .split_once('/')
+            .map(|(base, quote)| (normalize_base(base), quote.to_ascii_uppercase()))
+            .unwrap_or_else(|| (normalize_base(symbol), "USDC".to_string()));
+        let product_type = product_type(market_type);
+        let mut candidate = InstrumentConfig {
+            min_size,
+            ..instrument(
+                &market_id,
+                symbol,
+                &market_id,
+                &base_asset,
+                &quote_asset,
+                price_decimals.and_then(decimal_tick),
+                size_decimals.and_then(decimal_tick),
+            )
+        };
+        candidate.product_type = product_type;
+        candidate.status = status.to_string();
+        let eligible = product_type == ProductType::Perp && status == "active";
+        inventory.push(catalog_instrument(
+            "lighter",
+            &candidate,
+            eligible,
+            (!eligible).then_some(if status != "active" {
+                "inactive"
+            } else {
+                "unsupported_product"
+            }),
+            book,
+        ));
+        if eligible {
+            instruments.push(candidate);
+        }
+    }
 
-    Ok(venue(
-        "lighter",
-        "lighter",
-        "wss://mainnet.zklighter.elliot.ai/stream?readonly=true",
-        Some("ticker"),
-        "USDC",
-        Some(LIGHTER_ORDERBOOKS_URL),
-        instruments,
-    ))
+    Ok(DiscoveredVenue {
+        config: venue(
+            "lighter",
+            "lighter",
+            "wss://mainnet.zklighter.elliot.ai/stream?readonly=true",
+            Some("ticker"),
+            "USDC",
+            Some(LIGHTER_ORDERBOOKS_URL),
+            instruments,
+        ),
+        inventory,
+    })
 }
 
-async fn discover_risex(client: &Client) -> anyhow::Result<VenueConfig> {
+async fn discover_risex(client: &Client) -> anyhow::Result<DiscoveredVenue> {
     let value = get_json(client, RISEX_MARKETS_URL).await?;
     let markets = array_at(&value, &["data", "markets"], "RiseX data.markets")?;
-    let instruments = markets
-        .iter()
-        .filter(|market| market.get("active").and_then(Value::as_bool) != Some(false))
-        .filter_map(|market| {
-            let market_id = scalar_string(market.get("market_id")?)?;
-            let config = market.get("config")?.as_object()?;
-            if config.get("unlocked").and_then(Value::as_bool) == Some(false) {
-                return None;
-            }
-            let raw = config
-                .get("name")
+    let mut instruments = Vec::new();
+    let mut inventory = Vec::new();
+    for market in markets {
+        let Some(market_id) = market.get("market_id").and_then(scalar_string) else {
+            continue;
+        };
+        let Some(config) = market.get("config").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(raw) = config
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| market.get("display_name").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        let quote = market
+            .get("quote_asset_symbol")
+            .and_then(Value::as_str)
+            .unwrap_or("USDC");
+        let active = market.get("active").and_then(Value::as_bool) != Some(false)
+            && config.get("unlocked").and_then(Value::as_bool) != Some(false);
+        let mut candidate = instrument(
+            &market_id,
+            raw,
+            &market_id,
+            &normalize_base(raw),
+            quote,
+            config
+                .get("step_price")
                 .and_then(Value::as_str)
-                .or_else(|| market.get("display_name").and_then(Value::as_str))?;
-            let quote = market
-                .get("quote_asset_symbol")
+                .and_then(|value| value.parse().ok()),
+            config
+                .get("step_size")
                 .and_then(Value::as_str)
-                .unwrap_or("USDC");
-            Some(instrument(
-                &market_id,
-                raw,
-                &market_id,
-                &normalize_base(raw),
-                quote,
-                config
-                    .get("step_price")
-                    .and_then(Value::as_str)
-                    .and_then(|value| value.parse().ok()),
-                config
-                    .get("step_size")
-                    .and_then(Value::as_str)
-                    .and_then(|value| value.parse().ok()),
-            ))
-        })
-        .collect();
+                .and_then(|value| value.parse().ok()),
+        );
+        candidate.status = if active { "active" } else { "inactive" }.to_string();
+        inventory.push(catalog_instrument(
+            "risex",
+            &candidate,
+            active,
+            (!active).then_some("inactive"),
+            market,
+        ));
+        if active {
+            instruments.push(candidate);
+        }
+    }
 
-    Ok(venue(
-        "risex",
-        "risex",
-        "wss://ws.rise.trade/ws",
-        Some("orderbook"),
-        "USDC",
-        Some(RISEX_MARKETS_URL),
-        instruments,
-    ))
+    Ok(DiscoveredVenue {
+        config: venue(
+            "risex",
+            "risex",
+            "wss://ws.rise.trade/ws",
+            Some("orderbook"),
+            "USDC",
+            Some(RISEX_MARKETS_URL),
+            instruments,
+        ),
+        inventory,
+    })
 }
 
-async fn discover_zero_one(client: &Client) -> anyhow::Result<VenueConfig> {
+async fn discover_zero_one(client: &Client) -> anyhow::Result<DiscoveredVenue> {
     let value = get_json(client, ZERO_ONE_INFO_URL).await?;
     let markets = array_at(&value, &["markets"], "01 markets")?;
-    let instruments = markets
-        .iter()
-        .filter_map(|market| {
-            let market_id = scalar_string(market.get("marketId")?)?;
-            let symbol = string_at(market, "symbol")?;
-            let base = normalize_base(symbol);
-            if base == symbol {
-                return None;
-            }
-            Some(instrument(
-                &market_id,
-                symbol,
-                symbol,
-                &base,
-                "USD",
-                market
-                    .get("priceDecimals")
-                    .and_then(Value::as_u64)
-                    .and_then(decimal_tick),
-                market
-                    .get("sizeDecimals")
-                    .and_then(Value::as_u64)
-                    .and_then(decimal_tick),
-            ))
-        })
-        .collect();
+    let mut instruments = Vec::new();
+    let mut inventory = Vec::new();
+    for market in markets {
+        let Some(market_id) = market.get("marketId").and_then(scalar_string) else {
+            continue;
+        };
+        let Some(symbol) = string_at(market, "symbol") else {
+            continue;
+        };
+        let base = normalize_base(symbol);
+        let eligible = base != symbol;
+        let candidate = instrument(
+            &market_id,
+            symbol,
+            symbol,
+            &base,
+            "USD",
+            market
+                .get("priceDecimals")
+                .and_then(Value::as_u64)
+                .and_then(decimal_tick),
+            market
+                .get("sizeDecimals")
+                .and_then(Value::as_u64)
+                .and_then(decimal_tick),
+        );
+        inventory.push(catalog_instrument(
+            "01",
+            &candidate,
+            eligible,
+            (!eligible).then_some("unsupported_symbol"),
+            market,
+        ));
+        if eligible {
+            instruments.push(candidate);
+        }
+    }
 
-    Ok(venue(
-        "01",
-        "01",
-        "wss://zo-mainnet.n1.xyz",
-        Some("deltas"),
-        "USD",
-        Some(ZERO_ONE_INFO_URL),
-        instruments,
-    ))
+    Ok(DiscoveredVenue {
+        config: venue(
+            "01",
+            "01",
+            "wss://zo-mainnet.n1.xyz",
+            Some("deltas"),
+            "USD",
+            Some(ZERO_ONE_INFO_URL),
+            instruments,
+        ),
+        inventory,
+    })
 }
 
 // Ethereal catalog discovery is intentionally disabled together with its adapter.
-async fn discover_perpl(client: &Client) -> anyhow::Result<VenueConfig> {
+async fn discover_perpl(client: &Client) -> anyhow::Result<DiscoveredVenue> {
     let value = get_json(client, PERPL_CONTEXT_URL).await?;
     let markets = array_at(&value, &["markets"], "Perpl markets")?;
-    let instruments = markets
-        .iter()
-        .filter(|market| {
-            market
-                .get("config")
-                .and_then(|config| config.get("is_open"))
-                .and_then(Value::as_bool)
-                == Some(true)
-        })
-        .filter_map(|market| {
-            let market_id = scalar_string(market.get("id")?)?;
-            let raw = string_at(market, "size_units").or_else(|| string_at(market, "name"))?;
-            let base = normalize_base(
-                string_at(market, "symbol")
-                    .filter(|value| !value.is_empty())
-                    .or_else(|| string_at(market, "name"))
-                    .unwrap_or(raw),
-            );
-            let config = market.get("config")?;
-            Some(instrument(
-                &market_id,
-                raw,
-                &market_id,
-                &base,
-                "AUSD",
-                config
-                    .get("price_decimals")
-                    .and_then(Value::as_u64)
-                    .and_then(decimal_tick),
-                config
-                    .get("size_decimals")
-                    .and_then(Value::as_u64)
-                    .and_then(decimal_tick),
-            ))
-        })
-        .collect();
+    let mut instruments = Vec::new();
+    let mut inventory = Vec::new();
+    for market in markets {
+        let Some(market_id) = market.get("id").and_then(scalar_string) else {
+            continue;
+        };
+        let Some(raw) = string_at(market, "size_units").or_else(|| string_at(market, "name"))
+        else {
+            continue;
+        };
+        let base = normalize_base(
+            string_at(market, "symbol")
+                .filter(|value| !value.is_empty())
+                .or_else(|| string_at(market, "name"))
+                .unwrap_or(raw),
+        );
+        let Some(config) = market.get("config") else {
+            continue;
+        };
+        let active = config.get("is_open").and_then(Value::as_bool) == Some(true);
+        let mut candidate = instrument(
+            &market_id,
+            raw,
+            &market_id,
+            &base,
+            "AUSD",
+            config
+                .get("price_decimals")
+                .and_then(Value::as_u64)
+                .and_then(decimal_tick),
+            config
+                .get("size_decimals")
+                .and_then(Value::as_u64)
+                .and_then(decimal_tick),
+        );
+        candidate.status = if active { "active" } else { "inactive" }.to_string();
+        inventory.push(catalog_instrument(
+            "perpl",
+            &candidate,
+            active,
+            (!active).then_some("inactive"),
+            market,
+        ));
+        if active {
+            instruments.push(candidate);
+        }
+    }
 
-    Ok(venue(
-        "perpl",
-        "perpl",
-        "wss://app.perpl.xyz/ws/v1/market-data",
-        Some("order-book"),
-        "AUSD",
-        Some(PERPL_CONTEXT_URL),
-        instruments,
-    ))
+    Ok(DiscoveredVenue {
+        config: venue(
+            "perpl",
+            "perpl",
+            "wss://app.perpl.xyz/ws/v1/market-data",
+            Some("order-book"),
+            "AUSD",
+            Some(PERPL_CONTEXT_URL),
+            instruments,
+        ),
+        inventory,
+    })
 }
 
-async fn discover_ondo(client: &Client) -> anyhow::Result<VenueConfig> {
+async fn discover_ondo(client: &Client) -> anyhow::Result<DiscoveredVenue> {
     let value = get_json(client, ONDO_MARKETS_URL).await?;
     let markets = array_at(
         &value,
         &["result", "perps", "tradingPairs"],
         "Ondo result.perps.tradingPairs",
     )?;
-    let instruments = markets
-        .iter()
-        .filter(|market| market.get("disabled").and_then(Value::as_bool) != Some(true))
-        .filter_map(|market| {
-            let market_id = string_at(market, "market")?;
-            let pair = market.get("pair")?;
-            let base = normalize_base(string_at(pair, "base")?);
-            let quote = string_at(pair, "quote")?;
-            let raw = string_at(market, "displayName").unwrap_or(market_id);
-            Some(instrument(
-                market_id,
-                raw,
-                market_id,
-                &base,
-                quote,
-                market
-                    .get("quoteIncrement")
-                    .and_then(Value::as_str)
-                    .and_then(|value| value.parse().ok()),
-                market
-                    .get("baseIncrement")
-                    .and_then(Value::as_str)
-                    .and_then(|value| value.parse().ok()),
-            ))
-        })
-        .collect();
+    let mut instruments = Vec::new();
+    let mut inventory = Vec::new();
+    for market in markets {
+        let Some(market_id) = string_at(market, "market") else {
+            continue;
+        };
+        let Some(pair) = market.get("pair") else {
+            continue;
+        };
+        let (Some(base), Some(quote)) = (string_at(pair, "base"), string_at(pair, "quote")) else {
+            continue;
+        };
+        let raw = string_at(market, "displayName").unwrap_or(market_id);
+        let active = market.get("disabled").and_then(Value::as_bool) != Some(true);
+        let mut candidate = instrument(
+            market_id,
+            raw,
+            market_id,
+            &normalize_base(base),
+            quote,
+            market
+                .get("quoteIncrement")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse().ok()),
+            market
+                .get("baseIncrement")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse().ok()),
+        );
+        candidate.status = if active { "active" } else { "inactive" }.to_string();
+        inventory.push(catalog_instrument(
+            "ondo",
+            &candidate,
+            active,
+            (!active).then_some("inactive"),
+            market,
+        ));
+        if active {
+            instruments.push(candidate);
+        }
+    }
 
-    Ok(venue(
-        "ondo",
-        "ondo",
-        "wss://api.ondoperps.xyz/ws",
-        Some("topOfBooksPerps"),
-        "USD",
-        Some(ONDO_MARKETS_URL),
-        instruments,
-    ))
+    Ok(DiscoveredVenue {
+        config: venue(
+            "ondo",
+            "ondo",
+            "wss://api.ondoperps.xyz/ws",
+            Some("topOfBooksPerps"),
+            "USD",
+            Some(ONDO_MARKETS_URL),
+            instruments,
+        ),
+        inventory,
+    })
 }
 
 fn dedupe_instruments_by_base(instruments: Vec<InstrumentConfig>) -> Vec<InstrumentConfig> {
@@ -510,6 +702,38 @@ fn dedupe_instruments_by_base(instruments: Vec<InstrumentConfig>) -> Vec<Instrum
         .into_iter()
         .filter(|instrument| seen.insert(instrument.base_asset.clone()))
         .collect()
+}
+
+fn catalog_instrument(
+    venue: &str,
+    instrument: &InstrumentConfig,
+    eligible: bool,
+    eligibility_reason: Option<&str>,
+    raw_json: &Value,
+) -> CatalogInstrument {
+    CatalogInstrument {
+        venue: venue.to_string(),
+        instrument_id: instrument.instrument_id.clone(),
+        symbol: instrument.raw_symbol.clone(),
+        normalized_symbol: instrument.base_asset.clone(),
+        product_type: instrument.product_type,
+        quote_asset: instrument
+            .quote_asset
+            .clone()
+            .unwrap_or_else(|| "UNKNOWN".to_string()),
+        status: instrument.status.clone(),
+        eligible,
+        eligibility_reason: eligibility_reason.map(str::to_string),
+        raw_json: raw_json.clone(),
+    }
+}
+
+fn product_type(value: &str) -> ProductType {
+    match value {
+        "spot" => ProductType::Spot,
+        "future" => ProductType::Future,
+        _ => ProductType::Perp,
+    }
 }
 
 fn normalize_base(symbol: &str) -> String {
@@ -660,10 +884,12 @@ fn scalar_string(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dedupe_instruments_by_base, instrument, load_catalog_cache, normalize_base,
-        parse_hyperliquid_instruments, save_catalog_cache, select_lighter_anchored_catalog, venue,
+        apply_manual_mappings, dedupe_instruments_by_base, instrument, load_catalog_cache,
+        normalize_base, parse_hyperliquid_instruments, save_catalog_cache,
+        select_lighter_anchored_catalog, venue,
     };
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn resolves_hyperliquid_collateral_and_excludes_unpriced_quotes() {
@@ -750,6 +976,65 @@ mod tests {
         assert_eq!(venues.len(), 2);
         assert_eq!(venues[0].instruments[0].base_asset, "BTC");
         assert_eq!(venues[1].instruments[0].quote_asset.as_deref(), Some("USD"));
+    }
+
+    #[test]
+    fn manual_mapping_matches_skhynix_without_merging_skhy() {
+        let mut venues = vec![
+            venue(
+                "lighter",
+                "lighter",
+                "wss://example.test",
+                None,
+                "USDC",
+                None,
+                vec![
+                    instrument("161", "SKHYNIXUSD", "161", "SKHYNIX", "USDC", None, None),
+                    instrument("216", "SKHY", "216", "SKHY", "USDC", None, None),
+                ],
+            ),
+            venue(
+                "hyperliquid",
+                "hyperliquid",
+                "wss://example.test",
+                None,
+                "USDC",
+                None,
+                vec![
+                    instrument(
+                        "xyz:SKHX", "xyz:SKHX", "xyz:SKHX", "SKHX", "USDC", None, None,
+                    ),
+                    instrument(
+                        "xyz:SKHY", "xyz:SKHY", "xyz:SKHY", "SKHY", "USDC", None, None,
+                    ),
+                ],
+            ),
+        ];
+        let mappings = HashMap::from([
+            (
+                ("lighter".to_string(), "161".to_string()),
+                "SKHYNIX".to_string(),
+            ),
+            (
+                ("hyperliquid".to_string(), "xyz:SKHX".to_string()),
+                "SKHYNIX".to_string(),
+            ),
+        ]);
+        for venue in &mut venues {
+            apply_manual_mappings(venue, &mappings);
+        }
+
+        assert_eq!(select_lighter_anchored_catalog(&mut venues).unwrap(), 2);
+        for venue in venues {
+            assert_eq!(
+                venue
+                    .instruments
+                    .iter()
+                    .map(|instrument| instrument.base_asset.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["SKHYNIX", "SKHY"]
+            );
+        }
     }
 
     #[tokio::test]

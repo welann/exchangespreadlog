@@ -18,8 +18,9 @@ v2 只保留已经由测试覆盖的交易所消息解析和订单簿算法，�
 
 ```mermaid
 flowchart LR
-    M["真实 REST 元数据"] --> C["严格市场目录"]
-    W["7 个交易所 WebSocket"] --> N["标准化 + 质量校验"]
+    M["真实 REST 元数据"] --> C["完整交易所目录"]
+    U["人工资产组"] --> C
+    W["6 个交易所 WebSocket"] --> N["标准化 + 质量校验"]
     C --> N
     N --> L["内存最新状态"]
     N --> Q["SQLite WAL"]
@@ -33,8 +34,9 @@ flowchart LR
 
 关键约束：
 
-- 市场目录优先从真实 API 发现，成功结果原子写入本地缓存；单个目录暂时不可用时保留该交易所的 last-known-good 计划；
+- 市场目录优先从真实 API 发现，完整交易对和人工资产组写入独立 SQLite 控制库；单个目录暂时不可用时保留该交易所的 last-known-good 计划；
 - 运行中按固定周期刷新目录，只重启订阅计划发生变化的交易所；可显式禁用故障交易所；
+- 页面 `/admin/catalog` 展示所有已发现交易对；人工资产组覆盖自动 symbol 归一化，保存后立即重算订阅计划；
 - 市场集合以 Lighter 为锚，只有同时出现在 Lighter 和至少一个其他交易所的 `base_asset` 才会订阅；
 - USD、USDC、USDT、AUSD 的 1:1 关系作为显式报价规则参与计算，不把换算隐藏在 symbol 归一化里；
 - 事件先落本地 SQLite WAL，再更新内存视图，ClickHouse 故障不会丢失已经接收的数据；
@@ -81,14 +83,17 @@ Ethereal 源码仅作为归档保留，模块入口、目录发现和适配器�
 | Perpl | `GET https://app.perpl.xyz/api/v1/pub/context` | `config.is_open=true` | `id` |
 | Ondo | `GET https://api.ondoperps.xyz/v1/markets` | `disabled != true` | `market` |
 
-候选目录随后按照原版已经验证过的 Lighter 锚定规则生成真正的监控队列：
+完整目录（包括非活跃合约和暂不支持的产品/quote）会写入 `catalog-control.sqlite3`，供 `/admin/catalog` 审核。候选目录随后按照原版已经验证过的 Lighter 锚定规则生成真正的监控队列：
 
 1. 每个原始市场先标准化为 `venue + instrument_id + base_asset + quote_asset`；
-2. Hyperliquid 使用 `allPerpMetas.collateralToken` 与 `spotMeta.tokens` 确定每个 perp DEX 的真实 quote；因此默认永续和 HIP-3 市场都会参与匹配，但 USDH、USDE、USDT0 等没有显式换算规则的市场会被排除；
-3. Lighter 的 active perp 按 base 去重后作为锚点，与其他五个交易所的 base 并集取交集；
-4. 每个交易所只保留交集中的真实 instrument；同一交易所、相同 base 的重复合约只选一个；
-5. `/v1/markets` 也按 base 分组，所以 `BTC/USD`、`BTC/USDC`、`BTC/AUSD` 会出现在同一个 BTC 市场中；
-6. 价差计算前使用显式报价规则把两腿价格换算到共同 quote；当前规则与原版一致：`USDC→USD=1`、`USDT→USD=1`、`AUSD→USD=1`。
+2. 若某个 `venue + instrument_id` 属于人工资产组，使用组名覆盖自动识别的 base；没有人工记录时沿用原逻辑；
+3. Hyperliquid 使用 `allPerpMetas.collateralToken` 与 `spotMeta.tokens` 确定每个 perp DEX 的真实 quote；因此默认永续和 HIP-3 市场都会参与匹配，但 USDH、USDE、USDT0 等没有显式换算规则的市场会被排除；
+4. Lighter 的 active perp 按 base 去重后作为锚点，与其他五个交易所的 base 并集取交集；
+5. 每个交易所只保留交集中的真实 instrument；同一交易所、相同 base 的重复合约只选一个；
+6. `/v1/markets` 也按 base 分组，所以 `BTC/USD`、`BTC/USDC`、`BTC/AUSD` 会出现在同一个 BTC 市场中；
+7. 价差计算前使用显式报价规则把两腿价格换算到共同 quote；当前规则与原版一致：`USDC→USD=1`、`USDT→USD=1`、`AUSD→USD=1`。
+
+例如 `SKHYNIX` 与 `SKHY` 是两个资产。需要把 Hyperliquid 的 `xyz:SKHX` 与 Lighter 对应合约归入 `SKHYNIX` 组，而 `xyz:SKHY` 保持 `SKHY`；人工映射按真实 instrument id 生效，不做模糊字符串合并。
 
 这种设计保证每个订阅市场都有 Lighter 作为共同基准，同时仍保留每家交易所真实的 instrument id、feed symbol 和 quote asset。若未来不再接受固定 1:1 报价规则，应把稳定币现货/预言机价格作为新的数据源接入，而不是修改 symbol。
 
@@ -115,13 +120,13 @@ docker build -f Dockerfile.collector -t exchange-spread-collector .
 docker build -f Dockerfile.frontend -t exchange-spread-frontend .
 ```
 
-Collector 需要 ClickHouse 环境变量和持久化的 `/app/data`：
+Collector 需要 ClickHouse 环境变量和持久化的 `/app/data`。这个卷同时保存行情 WAL、last-known-good 目录和人工审核控制库：
 
 ```bash
 docker run -d \
   --name spread-collector \
   --env-file .env \
-  -v spread-wal:/app/data \
+  -v spread-data:/app/data \
   -p 8081:8080 \
   exchange-spread-collector
 ```
@@ -156,7 +161,15 @@ docker run -d \
   exchange-spread-frontend
 ```
 
-在 Zeabur 中分别创建两个服务并选择对应 Dockerfile。Collector 暴露 `8080`、挂载 `/app/data` 并配置 `.env.example` 中的变量；Frontend 暴露 `8080`，将 `COLLECTOR_UPSTREAM` 设置成 Collector 的内部 HTTP 地址。Nginx 会代理 `/v1/*`、`/metrics` 和长连接 SSE，浏览器无需跨域访问。
+在 Zeabur 中分别创建两个服务并选择对应 Dockerfile。Collector 暴露 `8080`、创建持久卷并挂载到 `/app/data`，再配置 `.env.example` 中的变量；Frontend 暴露 `8080`，将 `COLLECTOR_UPSTREAM` 设置成 Collector 的内部 HTTP 地址（不要带末尾 `/`）。Nginx 会代理 `/v1/*`、`/metrics` 和长连接 SSE，浏览器无需跨域访问。
+
+只设置 `VOLUME` 并不能保证 Zeabur 重部署后保留数据，必须在 Zeabur 服务设置中实际创建并挂载持久卷到 `/app/data`。更新镜像时不要删除这个卷。容器内默认保存位置为：
+
+```text
+/app/data/wal.sqlite3
+/app/data/catalog.json
+/app/data/catalog-control.sqlite3
+```
 
 ## API
 
@@ -166,6 +179,10 @@ docker run -d \
 | `GET /v1/live/spread?leg_a=...&leg_b=...` | 当前价差与持续 SSE 更新 |
 | `GET /v1/spreads?leg_a=...&leg_b=...&range_ms=...` | 由服务端时钟锚定、最长 31 天的对齐历史价差 |
 | `GET /v1/health` | ClickHouse、WAL 与采集计数 |
+| `GET /v1/admin/catalog/instruments` | 全部已发现交易对、状态和人工分组 |
+| `GET/POST /v1/admin/catalog/groups` | 读取或创建人工资产组 |
+| `PUT/DELETE /v1/admin/catalog/groups/{id}` | 修改或删除人工资产组 |
+| `POST /v1/admin/catalog/refresh` | 立即重新抓取目录并应用订阅计划 |
 | `GET /metrics` | Prometheus 文本指标 |
 
 历史查询分辨率：
@@ -184,13 +201,15 @@ docker run -d \
 - `bbo_events`：不可变的标准化 BBO 事件，保留 6 小时；
 - `venue_state_events`：重连/失联边界；
 - `bbo_state_*`：用于页面快速查询的多分辨率最新状态，最长保留 35 天；
-- `data/wal.sqlite3`：尚未确认写入 ClickHouse 的本地事件。
+- `data/wal.sqlite3`：尚未确认写入 ClickHouse 的本地事件；
+- `data/catalog-control.sqlite3`：完整交易所目录与人工资产组，独立于 ClickHouse。
 
 数据库凭据只放在未跟踪的 `.env` 中。`.env.example` 只保留占位符。
 
 目录与运行控制：
 
 - `CATALOG_CACHE_PATH`：last-known-good 订阅计划，默认 `data/catalog.json`；
+- `CATALOG_DB_PATH`：完整目录和人工映射控制库，默认 `data/catalog-control.sqlite3`；
 - `CATALOG_REFRESH_SECONDS`：在线目录刷新周期，默认 `3600`；
 - `DISABLED_VENUES`：逗号分隔的 venue id，例如 `01,ondo`。Lighter 是目录锚点，禁用后服务会拒绝生成不可比较的订阅计划。
 
