@@ -15,9 +15,19 @@
     type Time,
     type UTCTimestamp
   } from 'lightweight-charts';
+  import {
+    directionBp,
+    directionLabel,
+    grossCaptureBp,
+    oppositeDirection,
+    type SpreadDirection
+  } from './spread-direction';
   import type { SpreadPoint } from './types';
 
   export let points: SpreadPoint[] = [];
+  export let openDirection: SpreadDirection = 'bToA';
+  export let legAVenue = '';
+  export let legBVenue = '';
 
   type CaptureStats = {
     bestBp: number | null;
@@ -32,6 +42,7 @@
   let captureSeries: ISeriesApi<'Baseline'> | null = null;
   let entryMarkers: ISeriesMarkersPluginApi<Time> | null = null;
   let rendered: SpreadPoint[] | null = null;
+  let renderedDirection: SpreadDirection | null = null;
   let pointsBySecond = new Map<number, SpreadPoint>();
   let latestPoint: SpreadPoint | null = null;
   let activePoint: SpreadPoint | null = null;
@@ -46,8 +57,16 @@
   let localZone = '浏览器本地时区';
   let locale = 'zh-CN';
 
+  $: closeDirection = oppositeDirection(openDirection);
+  $: openDirectionLabel = directionLabel(openDirection);
+  $: closeDirectionLabel = directionLabel(closeDirection);
+  $: openActionLabel = actionLabel(openDirection);
+  $: closeActionLabel = actionLabel(closeDirection);
+  $: displayedOpenPoint = entryPoint ?? activePoint;
   $: activeCaptureBp =
-    entryPoint && activePoint ? grossCaptureBp(entryPoint, activePoint) : null;
+    entryPoint && activePoint
+      ? grossCaptureBp(entryPoint, activePoint, openDirection)
+      : null;
   $: activeHoldingMs =
     entryPoint && activePoint && activePoint.tsMs >= entryPoint.tsMs
       ? activePoint.tsMs - entryPoint.tsMs
@@ -87,14 +106,14 @@
     openSeries = chart.addSeries(LineSeries, {
       color: '#c97842',
       lineWidth: 2,
-      title: '开仓 B → A',
+      title: `开仓 ${openDirectionLabel}`,
       priceLineVisible: false,
       lastValueVisible: true
     });
     closeSeries = chart.addSeries(LineSeries, {
       color: '#2e6f95',
       lineWidth: 2,
-      title: '平仓 A → B',
+      title: `平仓 ${closeDirectionLabel}`,
       priceLineVisible: false,
       lastValueVisible: true
     });
@@ -140,10 +159,17 @@
     };
   });
 
-  $: if (chart && points !== rendered) render();
+  $: if (chart && (points !== rendered || openDirection !== renderedDirection)) render();
 
   function render() {
+    const directionChanged =
+      renderedDirection !== null && renderedDirection !== openDirection;
     rendered = points;
+    renderedDirection = openDirection;
+    if (directionChanged) clearEntry();
+
+    openSeries?.applyOptions({ title: `开仓 ${openDirectionLabel}` });
+    closeSeries?.applyOptions({ title: `平仓 ${closeDirectionLabel}` });
     const unique = new Map<number, SpreadPoint>();
     for (const point of points) {
       if (
@@ -170,13 +196,13 @@
     openSeries?.setData(
       sorted.map(([time, point]) => ({
         time: time as UTCTimestamp,
-        value: point.bToABp
+        value: directionBp(point, openDirection)
       }))
     );
     closeSeries?.setData(
       sorted.map(([time, point]) => ({
         time: time as UTCTimestamp,
-        value: point.aToBBp
+        value: directionBp(point, closeDirection)
       }))
     );
     renderCaptureSeries(sorted);
@@ -201,7 +227,7 @@
 
     for (const [time, point] of sorted) {
       if (time < entrySecond) continue;
-      const value = grossCaptureBp(entryPoint, point);
+      const value = grossCaptureBp(entryPoint, point, openDirection);
       if (value === null) continue;
 
       captureData.push({ time: time as UTCTimestamp, value });
@@ -258,14 +284,6 @@
         size: 1.1
       }
     ]);
-  }
-
-  function grossCaptureBp(entry: SpreadPoint, close: SpreadPoint): number | null {
-    if (close.tsMs < entry.tsMs || !Number.isFinite(entry.aAsk) || entry.aAsk <= 0) {
-      return null;
-    }
-    const grossQuote = entry.bToA + close.aToB;
-    return Number.isFinite(grossQuote) ? grossQuote / entry.aAsk * 10_000 : null;
   }
 
   function timestampSeconds(time: Time | undefined): number | null {
@@ -334,6 +352,12 @@
     return `UTC${sign}${hours}:${minutes}`;
   }
 
+  function actionLabel(direction: SpreadDirection) {
+    const a = legAVenue ? `A ${legAVenue}` : 'A';
+    const b = legBVenue ? `B ${legBVenue}` : 'B';
+    return direction === 'aToB' ? `卖 ${a} / 买 ${b}` : `卖 ${b} / 买 ${a}`;
+  }
+
   function formatBp(value: number | undefined) {
     if (value === undefined || !Number.isFinite(value)) return '—';
     return `${value > 0 ? '+' : ''}${value.toFixed(2)} bp`;
@@ -396,16 +420,18 @@
   </div>
   <dl>
     <div class="open">
-      <dt><i></i>{entryPoint ? '固定开仓价差' : '候选开仓 · B → A'}</dt>
-      <dd>{formatBp((entryPoint ?? activePoint)?.bToABp)}</dd>
+      <dt><i></i>{entryPoint ? '固定开仓价差' : `候选开仓 · ${openDirectionLabel}`}</dt>
+      <dd>
+        {formatBp(displayedOpenPoint ? directionBp(displayedOpenPoint, openDirection) : undefined)}
+      </dd>
       <small>
-        {entryPoint ? formatLocalDateTime(entryPoint.tsMs) : 'B bid − A ask'}
+        {entryPoint ? formatLocalDateTime(entryPoint.tsMs) : openActionLabel}
       </small>
     </div>
     <div class="close">
-      <dt><i></i>观察点平仓 · A → B</dt>
-      <dd>{formatBp(activePoint?.aToBBp)}</dd>
-      <small>A bid − B ask</small>
+      <dt><i></i>观察点平仓 · {closeDirectionLabel}</dt>
+      <dd>{formatBp(activePoint ? directionBp(activePoint, closeDirection) : undefined)}</dd>
+      <small>{closeActionLabel}</small>
     </div>
     <div
       class:profitable={activeCaptureBp !== null && activeCaptureBp >= 0}
@@ -427,7 +453,7 @@
   class="chart"
   bind:this={container}
   role="img"
-  aria-label="开仓价差、平仓价差与跨时点可平仓毛收益时间序列；点击图表可选择开仓时刻，单位为基点，时间按浏览器本地时区显示"
+  aria-label={`开仓 ${openActionLabel}、平仓 ${closeActionLabel} 与跨时点可平仓毛收益时间序列；点击图表可选择开仓时刻，单位为基点，时间按浏览器本地时区显示`}
 ></div>
 
 <style>

@@ -1,6 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import SpreadChart from '$lib/SpreadChart.svelte';
+  import {
+    directionLabel,
+    opportunityLegs,
+    oppositeDirection,
+    type SpreadDirection
+  } from '$lib/spread-direction';
   import type {
     Health,
     HistoryResponse,
@@ -67,6 +73,7 @@
   let clockNowMs = Date.now();
   let serverClockOffsetMs = 0;
   let topSharePercent = 30;
+  let openDirection: SpreadDirection = 'bToA';
   let opportunityRanking: OpportunityRank[] = [];
   let loadingOpportunities = false;
   let opportunityError = '';
@@ -101,6 +108,13 @@
     aToB: summarizeDirection(points.map((point) => point.aToBBp), topSharePercent),
     bToA: summarizeDirection(points.map((point) => point.bToABp), topSharePercent)
   };
+  $: closeDirection = oppositeDirection(openDirection);
+  $: rangeRoutes = [
+    { name: directionLabel(openDirection), tone: 'copper', stats: rangeStats[openDirection] },
+    { name: directionLabel(closeDirection), tone: 'blue', stats: rangeStats[closeDirection] }
+  ];
+  $: openAction = routeAction(openDirection, displayLegA?.venue, displayLegB?.venue);
+  $: closeAction = routeAction(closeDirection, displayLegA?.venue, displayLegB?.venue);
   $: bestRoute = current
     ? current.aToBBp >= current.bToABp
       ? { name: 'A → B', bp: current.aToBBp, value: current.aToB }
@@ -260,6 +274,7 @@
   }
 
   function swapLegs() {
+    openDirection = oppositeDirection(openDirection);
     if (filterMode === 'venue') {
       setVenuePair(counterVenue, primaryVenue);
       return;
@@ -270,6 +285,7 @@
   }
 
   function selectOpportunity(opportunity: OpportunityRank) {
+    openDirection = 'bToA';
     if (filterMode === 'venue') {
       setVenuePair(opportunity.buy.venue, opportunity.sell.venue);
       return;
@@ -499,7 +515,7 @@
     valueForPoint: (point: SpreadPoint) => number,
     first: Instrument,
     second: Instrument,
-    direction: 'aToB' | 'bToA'
+    direction: SpreadDirection
   ): OpportunityRank | null {
     const points = [...response.points].sort((left, right) => left.tsMs - right.tsMs);
     const resolutionMs = Math.max(1, response.resolutionMs);
@@ -534,8 +550,7 @@
 
     if (positiveValues.length === 0) return null;
     const sortedValues = positiveValues.sort((left, right) => left - right);
-    const buy = direction === 'aToB' ? first : second;
-    const sell = direction === 'aToB' ? second : first;
+    const { buy, sell } = opportunityLegs(direction, first, second);
     return {
       key: `${buy.instrumentKey}|${sell.instrumentKey}`,
       buy,
@@ -552,6 +567,16 @@
     return sortedValues.length % 2 === 0
       ? (sortedValues[middle - 1] + sortedValues[middle]) / 2
       : sortedValues[middle];
+  }
+
+  function routeAction(
+    direction: SpreadDirection,
+    venueA: string | undefined,
+    venueB: string | undefined
+  ) {
+    const a = venueA ? `A ${venueA}` : 'A';
+    const b = venueB ? `B ${venueB}` : 'B';
+    return direction === 'aToB' ? `卖 ${a} / 买 ${b}` : `卖 ${b} / 买 ${a}`;
   }
 
   function isAbortError(cause: unknown) {
@@ -902,7 +927,12 @@
             · USD / USDC / AUSD 按显式 1:1 汇率统一计价
           </p>
         </div>
-        <button class="swap" on:click={swapLegs} disabled={!legA || !legB}>
+        <button
+          class="swap"
+          on:click={swapLegs}
+          disabled={!legA || !legB}
+          title="仅交换 A/B 的显示顺序，保持当前开仓交易不变"
+        >
           交换 A / B
         </button>
       </div>
@@ -967,10 +997,7 @@
           </label>
         </header>
         <div class="stats-comparison">
-          {#each [
-            { name: 'A → B', tone: 'blue', stats: rangeStats.aToB },
-            { name: 'B → A', tone: 'copper', stats: rangeStats.bToA }
-          ] as route}
+          {#each rangeRoutes as route}
             <article class={route.tone}>
               <div class="stat-route">
                 <i></i>
@@ -1012,17 +1039,36 @@
         <header>
           <div class="chart-title">
             <strong>跨时点套利机会 · bp</strong>
-            <span>点击图表锁定橙线开仓时刻，收益线仅使用其后的蓝线平仓报价</span>
+            <span>点击图表锁定橙线开仓时刻；交换 A/B 不会反转这笔交易</span>
             <em>毛收益，尚未扣除手续费、资金费和滑点</em>
           </div>
-          <div class="legend">
-            <span><i class="copper"></i>候选开仓 · B → A</span>
-            <span><i class="blue"></i>候选平仓 · A → B</span>
-            <span><i class="capture"></i>开仓后可平仓毛收益</span>
+          <div class="chart-controls">
+            <div class="direction-picker" aria-label="选择开仓方向">
+              <button
+                class:active={openDirection === 'bToA'}
+                aria-pressed={openDirection === 'bToA'}
+                on:click={() => (openDirection = 'bToA')}
+              >B → A 开仓</button>
+              <button
+                class:active={openDirection === 'aToB'}
+                aria-pressed={openDirection === 'aToB'}
+                on:click={() => (openDirection = 'aToB')}
+              >A → B 开仓</button>
+            </div>
+            <div class="legend">
+              <span title={openAction}><i class="copper"></i>开仓 · {openAction}</span>
+              <span title={closeAction}><i class="blue"></i>平仓 · {closeAction}</span>
+              <span><i class="capture"></i>开仓后可平仓毛收益</span>
+            </div>
           </div>
         </header>
         {#if points.length > 0}
-          <SpreadChart {points} />
+          <SpreadChart
+            {points}
+            {openDirection}
+            legAVenue={displayLegA?.venue ?? ''}
+            legBVenue={displayLegB?.venue ?? ''}
+          />
         {:else}
           <div class="chart-empty">
             <strong>{loadingHistory ? '正在读取聚合数据' : '当前时间范围没有双腿同时有效的报价'}</strong>
@@ -1882,6 +1928,38 @@
     color: #99603f;
     font-size: 9px;
     font-style: normal;
+  }
+
+  .chart-controls {
+    display: grid;
+    justify-items: end;
+    gap: 7px;
+  }
+
+  .direction-picker {
+    display: flex;
+    border: 1px solid #aebdc8;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .direction-picker button {
+    padding: 5px 8px;
+    color: #657789;
+    border: 0;
+    border-right: 1px solid #aebdc8;
+    background: #f3f6f8;
+    cursor: pointer;
+    font-size: 9px;
+  }
+
+  .direction-picker button:last-child {
+    border-right: 0;
+  }
+
+  .direction-picker button.active {
+    color: #f8fafb;
+    background: #9f572c;
   }
 
   .legend {
