@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import SpreadChart from '$lib/SpreadChart.svelte';
+  import TradeDirection from '$lib/TradeDirection.svelte';
   import {
-    directionLabel,
     opportunityLegs,
     oppositeDirection,
     type SpreadDirection
@@ -110,15 +110,15 @@
   };
   $: closeDirection = oppositeDirection(openDirection);
   $: rangeRoutes = [
-    { name: directionLabel(openDirection), tone: 'copper', stats: rangeStats[openDirection] },
-    { name: directionLabel(closeDirection), tone: 'blue', stats: rangeStats[closeDirection] }
+    { direction: openDirection, tone: 'copper', stats: rangeStats[openDirection] },
+    { direction: closeDirection, tone: 'blue', stats: rangeStats[closeDirection] }
   ];
   $: openAction = routeAction(openDirection, displayLegA?.venue, displayLegB?.venue);
   $: closeAction = routeAction(closeDirection, displayLegA?.venue, displayLegB?.venue);
   $: bestRoute = current
     ? current.aToBBp >= current.bToABp
-      ? { name: 'A → B', bp: current.aToBBp, value: current.aToB }
-      : { name: 'B → A', bp: current.bToABp, value: current.bToA }
+      ? { direction: 'aToB' as SpreadDirection, bp: current.aToBBp, value: current.aToB }
+      : { direction: 'bToA' as SpreadDirection, bp: current.bToABp, value: current.bToA }
     : null;
   $: railPosition = bestRoute ? clamp(50 + bestRoute.bp * 2.5, 3, 97) : 50;
 
@@ -574,9 +574,11 @@
     venueA: string | undefined,
     venueB: string | undefined
   ) {
-    const a = venueA ? `A ${venueA}` : 'A';
-    const b = venueB ? `B ${venueB}` : 'B';
-    return direction === 'aToB' ? `卖 ${a} / 买 ${b}` : `卖 ${b} / 买 ${a}`;
+    const a = venueA ? ` ${venueA}` : '';
+    const b = venueB ? ` ${venueB}` : '';
+    return direction === 'aToB'
+      ? `BUY B${b} · SELL A${a}`
+      : `BUY A${a} · SELL B${b}`;
   }
 
   function isAbortError(cause: unknown) {
@@ -941,7 +943,11 @@
         <div class="route-summary">
           <span>可执行方向</span>
           <strong class:positive={(bestRoute?.bp ?? 0) > 0}>
-            {bestRoute?.name ?? '等待双腿'}
+            {#if bestRoute}
+              <TradeDirection direction={bestRoute.direction} />
+            {:else}
+              等待双腿
+            {/if}
           </strong>
           <small>{liveStateLabel(live)}</small>
         </div>
@@ -1001,7 +1007,9 @@
             <article class={route.tone}>
               <div class="stat-route">
                 <i></i>
-                <strong>{route.name}</strong>
+                <strong>
+                  <TradeDirection direction={route.direction} />
+                </strong>
                 <span>取 {route.stats.topSampleCount} / {route.stats.sampleCount} 点</span>
               </div>
               <dl>
@@ -1048,16 +1056,36 @@
                 class:active={openDirection === 'bToA'}
                 aria-pressed={openDirection === 'bToA'}
                 on:click={() => (openDirection = 'bToA')}
-              >B → A 开仓</button>
+              >
+                <TradeDirection direction="bToA" />
+              </button>
               <button
                 class:active={openDirection === 'aToB'}
                 aria-pressed={openDirection === 'aToB'}
                 on:click={() => (openDirection = 'aToB')}
-              >A → B 开仓</button>
+              >
+                <TradeDirection direction="aToB" />
+              </button>
             </div>
             <div class="legend">
-              <span title={openAction}><i class="copper"></i>开仓 · {openAction}</span>
-              <span title={closeAction}><i class="blue"></i>平仓 · {closeAction}</span>
+              <span title={openAction}>
+                <i class="copper"></i>开仓 ·
+                <TradeDirection
+                  direction={openDirection}
+                  venueA={displayLegA?.venue ?? ''}
+                  venueB={displayLegB?.venue ?? ''}
+                  showVenues
+                />
+              </span>
+              <span title={closeAction}>
+                <i class="blue"></i>平仓 ·
+                <TradeDirection
+                  direction={closeDirection}
+                  venueA={displayLegA?.venue ?? ''}
+                  venueB={displayLegB?.venue ?? ''}
+                  showVenues
+                />
+              </span>
               <span><i class="capture"></i>开仓后可平仓毛收益</span>
             </div>
           </div>
@@ -1079,23 +1107,23 @@
 
       <section class="tape">
         <div>
-          <span>A 买 / 卖</span>
+          <span>A 盘口 · BID / ASK</span>
           <strong>{formatNumber(current?.aBid, 4)}</strong>
           <strong>{formatNumber(current?.aAsk, 4)}</strong>
         </div>
         <div>
-          <span>B 买 / 卖</span>
+          <span>B 盘口 · BID / ASK</span>
           <strong>{formatNumber(current?.bBid, 4)}</strong>
           <strong>{formatNumber(current?.bAsk, 4)}</strong>
         </div>
         <div>
-          <span>A → B</span>
+          <span><TradeDirection direction="aToB" /></span>
           <strong class:positive={(current?.aToBBp ?? 0) > 0}>
             {formatNumber(current?.aToBBp)} bp
           </strong>
         </div>
         <div>
-          <span>B → A</span>
+          <span><TradeDirection direction="bToA" /></span>
           <strong class:positive={(current?.bToABp ?? 0) > 0}>
             {formatNumber(current?.bToABp)} bp
           </strong>
@@ -1184,9 +1212,13 @@
                 <span class="opportunity-rank">{index + 1}</span>
                 <span class="opportunity-route">
                   <strong>
-                    {opportunity.buy.venue}
-                    <i>→</i>
-                    {opportunity.sell.venue}
+                    <span class="order-side buy">
+                      <b>BUY</b>{opportunity.buy.venue}
+                    </span>
+                    <i>·</i>
+                    <span class="order-side sell">
+                      <b>SELL</b>{opportunity.sell.venue}
+                    </span>
                   </strong>
                   <small>
                     {formatOpportunityDuration(opportunity.opportunityMs)}机会 ·
@@ -1610,8 +1642,8 @@
     color: #f0f4f6;
   }
 
-  .route-summary span,
-  .route-value span {
+  .route-summary > span,
+  .route-value > span {
     display: block;
     margin-bottom: 7px;
     color: #9fb0bc;
@@ -1622,6 +1654,13 @@
 
   .route-summary strong {
     font-size: 22px;
+  }
+
+  .route-summary {
+    --trade-buy: #8bd0b7;
+    --trade-buy-bg: rgba(92, 171, 143, 0.17);
+    --trade-sell: #e9a18f;
+    --trade-sell-bg: rgba(201, 120, 94, 0.17);
   }
 
   .route-summary small {
@@ -1850,7 +1889,7 @@
     font-size: 12px;
   }
 
-  .stat-route span {
+  .stat-route > span {
     justify-self: end;
     color: #718291;
     font-family: "IBM Plex Mono", monospace;
@@ -1944,6 +1983,8 @@
   }
 
   .direction-picker button {
+    display: flex;
+    align-items: center;
     padding: 5px 8px;
     color: #657789;
     border: 0;
@@ -1958,6 +1999,10 @@
   }
 
   .direction-picker button.active {
+    --trade-buy: #d8f2e8;
+    --trade-buy-bg: rgba(255, 255, 255, 0.12);
+    --trade-sell: #ffe0d9;
+    --trade-sell-bg: rgba(255, 255, 255, 0.12);
     color: #f8fafb;
     background: #9f572c;
   }
@@ -1971,7 +2016,13 @@
     font-size: 10px;
   }
 
-  .legend i {
+  .legend > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .legend > span > i {
     width: 16px;
     height: 2px;
     display: inline-block;
@@ -2028,7 +2079,7 @@
     border-right: 0;
   }
 
-  .tape span {
+  .tape > div > span {
     grid-column: 1 / -1;
     color: #657789;
     font-size: 10px;
@@ -2202,8 +2253,38 @@
 
   .opportunity-route strong {
     overflow: hidden;
+    display: flex;
+    align-items: center;
+    gap: 5px;
     font-size: 10px;
     text-overflow: ellipsis;
+  }
+
+  .order-side {
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .order-side b {
+    flex: 0 0 auto;
+    padding: 1px 3px;
+    border-radius: 2px;
+    font-size: 7px;
+    letter-spacing: 0.04em;
+  }
+
+  .order-side.buy b {
+    color: #287760;
+    background: #dcebe5;
+  }
+
+  .order-side.sell b {
+    color: #9a493f;
+    background: #f1dfdc;
   }
 
   .opportunity-route i {

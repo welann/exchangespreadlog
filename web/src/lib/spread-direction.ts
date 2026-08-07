@@ -1,9 +1,17 @@
 import type { SpreadPoint } from './types';
 
 export type SpreadDirection = 'aToB' | 'bToA';
+export type SpreadLeg = 'A' | 'B';
+
+export function directionLegs(
+  direction: SpreadDirection
+): { buy: SpreadLeg; sell: SpreadLeg } {
+  return direction === 'aToB' ? { buy: 'B', sell: 'A' } : { buy: 'A', sell: 'B' };
+}
 
 export function directionLabel(direction: SpreadDirection): string {
-  return direction === 'aToB' ? 'A → B' : 'B → A';
+  const { buy, sell } = directionLegs(direction);
+  return `BUY ${buy} · SELL ${sell}`;
 }
 
 export function oppositeDirection(direction: SpreadDirection): SpreadDirection {

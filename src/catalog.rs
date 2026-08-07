@@ -525,7 +525,7 @@ async fn discover_zero_one(client: &Client) -> anyhow::Result<DiscoveredVenue> {
             continue;
         };
         let base = normalize_base(symbol);
-        let eligible = base != symbol;
+        let (eligible, eligibility_reason) = zero_one_market_eligibility(market, symbol, &base);
         let candidate = instrument(
             &market_id,
             symbol,
@@ -545,7 +545,7 @@ async fn discover_zero_one(client: &Client) -> anyhow::Result<DiscoveredVenue> {
             "01",
             &candidate,
             eligible,
-            (!eligible).then_some("unsupported_symbol"),
+            eligibility_reason,
             market,
         ));
         if eligible {
@@ -565,6 +565,30 @@ async fn discover_zero_one(client: &Client) -> anyhow::Result<DiscoveredVenue> {
         ),
         inventory,
     })
+}
+
+fn zero_one_market_eligibility(
+    market: &Value,
+    symbol: &str,
+    normalized_base: &str,
+) -> (bool, Option<&'static str>) {
+    if normalized_base == symbol {
+        return (false, Some("unsupported_symbol"));
+    }
+
+    // The 01 metadata feed also advertises RFQ-only markets. They have no
+    // CLOB snapshot endpoint and cannot produce the BBO stream consumed by
+    // this adapter. Keep them visible in catalog inventory, but do not add
+    // them to the subscription plan.
+    if market
+        .get("mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| !mode.eq_ignore_ascii_case("clob"))
+    {
+        return (false, Some("unsupported_market_mode"));
+    }
+
+    (true, None)
 }
 
 // Ethereal catalog discovery is intentionally disabled together with its adapter.
@@ -886,7 +910,7 @@ mod tests {
     use super::{
         apply_manual_mappings, dedupe_instruments_by_base, instrument, load_catalog_cache,
         normalize_base, parse_hyperliquid_instruments, save_catalog_cache,
-        select_lighter_anchored_catalog, venue,
+        select_lighter_anchored_catalog, venue, zero_one_market_eligibility,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -941,6 +965,18 @@ mod tests {
         assert_eq!(normalize_base("BTC/USDC"), "BTC");
         assert_eq!(normalize_base("ETH-USD"), "ETH");
         assert_eq!(normalize_base("SOLUSD"), "SOL");
+    }
+
+    #[test]
+    fn zero_one_catalog_excludes_rfq_markets_without_orderbooks() {
+        assert_eq!(
+            zero_one_market_eligibility(&json!({"mode": "clob"}), "BTCUSD", "BTC"),
+            (true, None)
+        );
+        assert_eq!(
+            zero_one_market_eligibility(&json!({"mode": "rfq"}), "DOGEUSD", "DOGE"),
+            (false, Some("unsupported_market_mode"))
+        );
     }
 
     #[test]

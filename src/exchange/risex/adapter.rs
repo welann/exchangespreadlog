@@ -70,15 +70,11 @@ impl RisexAdapter {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let payload = json!({
-            "method": "subscribe",
-            "params": {
-                "channel": "orderbook",
-                "market_ids": market_ids,
-            }
-        });
         write
-            .send(Message::Text(payload.to_string()))
+            .send(Message::Text(subscription_payload(
+                "subscribe",
+                &market_ids,
+            )))
             .await
             .context("subscribe RiseX orderbook")?;
 
@@ -133,7 +129,33 @@ impl RisexAdapter {
                                         }
                                         Ok(None) => {}
                                         Err(err) => {
-                                            anyhow::bail!("RiseX orderbook state error: {err}");
+                                            let numeric_market_id = market_id.parse::<u64>().with_context(|| {
+                                                format!("RiseX market id must be numeric: {market_id}")
+                                            })?;
+                                            warn!(
+                                                venue = %self.venue_instance_id,
+                                                market = %market_id,
+                                                error = %err,
+                                                "RiseX orderbook state invalid; refreshing market snapshot"
+                                            );
+                                            write
+                                                .send(Message::Text(subscription_payload(
+                                                    "unsubscribe",
+                                                    &[numeric_market_id],
+                                                )))
+                                                .await
+                                                .with_context(|| format!(
+                                                    "unsubscribe RiseX market {market_id} after orderbook state error"
+                                                ))?;
+                                            write
+                                                .send(Message::Text(subscription_payload(
+                                                    "subscribe",
+                                                    &[numeric_market_id],
+                                                )))
+                                                .await
+                                                .with_context(|| format!(
+                                                    "resubscribe RiseX market {market_id} after orderbook state error"
+                                                ))?;
                                         }
                                     }
                                 }
@@ -158,6 +180,17 @@ impl RisexAdapter {
             }
         }
     }
+}
+
+fn subscription_payload(method: &str, market_ids: &[u64]) -> String {
+    json!({
+        "method": method,
+        "params": {
+            "channel": "orderbook",
+            "market_ids": market_ids,
+        }
+    })
+    .to_string()
 }
 
 #[async_trait]

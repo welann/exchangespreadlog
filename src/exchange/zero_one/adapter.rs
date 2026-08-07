@@ -127,19 +127,30 @@ impl ZeroOneAdapter {
         let (mut write, mut read) = stream.split();
         let mut pending_ticks = LatestTickQueue::default();
 
+        let mut initialized_instruments = 0;
         for market in markets {
             let recv_ts_ns = crate::ingest::time::unix_time_ns();
             let tick = self
                 .fetch_snapshot_tick(&client, &mut books, market, recv_ts_ns)
                 .await
                 .with_context(|| format!("fetch initial 01 snapshot {}", market.feed_key()))?;
-            pending_ticks.push(&tx, tick)?;
+            if let Some(tick) = tick {
+                pending_ticks.push(&tx, tick)?;
+                initialized_instruments += 1;
+            } else {
+                warn!(
+                    venue = %self.venue_instance_id,
+                    market = %market.feed_key(),
+                    market_id = %market.instrument_id,
+                    "01 market has no CLOB orderbook snapshot; skipping market"
+                );
+            }
         }
 
         info!(
             venue = %self.venue_instance_id,
             connection_index,
-            instruments = markets.len(),
+            instruments = initialized_instruments,
             url = %ws_url,
             "subscribed"
         );
@@ -185,13 +196,22 @@ impl ZeroOneAdapter {
                                                 "orderbook delta gap; refreshing snapshot"
                                             );
                                             if let Some(market) = markets_by_symbol.get(&market_symbol) {
-                                                let mut tick = self
+                                                let tick = self
                                                     .fetch_snapshot_tick(&client, &mut books, market, recv_ts_ns)
                                                     .await
                                                     .with_context(|| format!("refresh 01 snapshot {market_symbol}"))?;
-                                                tick.quality.gap = true;
-                                                tick.quality.add_note("orderbook delta gap; snapshot refreshed");
-                                                pending_ticks.push(&tx, tick)?;
+                                                if let Some(mut tick) = tick {
+                                                    tick.quality.gap = true;
+                                                    tick.quality.add_note("orderbook delta gap; snapshot refreshed");
+                                                    pending_ticks.push(&tx, tick)?;
+                                                } else {
+                                                    warn!(
+                                                        venue = %self.venue_instance_id,
+                                                        market = %market_symbol,
+                                                        market_id = %market.instrument_id,
+                                                        "01 gap refresh skipped because market has no CLOB snapshot"
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -221,33 +241,39 @@ impl ZeroOneAdapter {
         books: &mut ZeroOneBooks,
         market: &InstrumentCatalog,
         recv_ts_ns: i128,
-    ) -> anyhow::Result<BboTick> {
-        let snapshot = self.fetch_snapshot(client, &market.instrument_id).await?;
-        Ok(books.apply_snapshot(
+    ) -> anyhow::Result<Option<BboTick>> {
+        let Some(snapshot) = self.fetch_snapshot(client, &market.instrument_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(books.apply_snapshot(
             market.feed_key(),
             market.instrument_ref(),
             snapshot,
             recv_ts_ns,
-        ))
+        )))
     }
 
     async fn fetch_snapshot(
         &self,
         client: &reqwest::Client,
         market_id: &str,
-    ) -> anyhow::Result<OrderbookSnapshot> {
+    ) -> anyhow::Result<Option<OrderbookSnapshot>> {
         let url = format!("{}/market/{market_id}/orderbook", self.rest_url);
-        let text = client
+        let response = client
             .get(&url)
             .send()
             .await
-            .with_context(|| format!("request 01 orderbook snapshot {url}"))?
+            .with_context(|| format!("request 01 orderbook snapshot {url}"))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let text = response
             .error_for_status()
             .with_context(|| format!("01 orderbook snapshot returned error status {url}"))?
             .text()
             .await
             .with_context(|| format!("read 01 orderbook snapshot {url}"))?;
-        parser::parse_snapshot(&text)
+        parser::parse_snapshot(&text).map(Some)
     }
 }
 

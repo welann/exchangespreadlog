@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  directionLabel,
   grossCaptureBp,
   opportunityLegs,
   oppositeDirection
@@ -51,6 +52,8 @@ function swapLegs(value: SpreadPoint): SpreadPoint {
 test('maps executable spread directions to their actual buy and sell legs', () => {
   assert.deepEqual(opportunityLegs('aToB', 'A', 'B'), { buy: 'B', sell: 'A' });
   assert.deepEqual(opportunityLegs('bToA', 'A', 'B'), { buy: 'A', sell: 'B' });
+  assert.equal(directionLabel('aToB'), 'BUY B · SELL A');
+  assert.equal(directionLabel('bToA'), 'BUY A · SELL B');
 });
 
 test('calculates both opening directions with the purchase-leg notional', () => {

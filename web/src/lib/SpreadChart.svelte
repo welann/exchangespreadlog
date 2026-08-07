@@ -22,6 +22,7 @@
     oppositeDirection,
     type SpreadDirection
   } from './spread-direction';
+  import TradeDirection from './TradeDirection.svelte';
   import type { SpreadPoint } from './types';
 
   export let points: SpreadPoint[] = [];
@@ -353,9 +354,11 @@
   }
 
   function actionLabel(direction: SpreadDirection) {
-    const a = legAVenue ? `A ${legAVenue}` : 'A';
-    const b = legBVenue ? `B ${legBVenue}` : 'B';
-    return direction === 'aToB' ? `卖 ${a} / 买 ${b}` : `卖 ${b} / 买 ${a}`;
+    const a = legAVenue ? ` ${legAVenue}` : '';
+    const b = legBVenue ? ` ${legBVenue}` : '';
+    return direction === 'aToB'
+      ? `BUY B${b} · SELL A${a}`
+      : `BUY A${a} · SELL B${b}`;
   }
 
   function formatBp(value: number | undefined) {
@@ -420,18 +423,34 @@
   </div>
   <dl>
     <div class="open">
-      <dt><i></i>{entryPoint ? '固定开仓价差' : `候选开仓 · ${openDirectionLabel}`}</dt>
+      <dt>
+        <i></i>{entryPoint ? '固定开仓' : '候选开仓'} ·
+        <TradeDirection
+          direction={openDirection}
+          venueA={legAVenue}
+          venueB={legBVenue}
+          showVenues
+        />
+      </dt>
       <dd>
         {formatBp(displayedOpenPoint ? directionBp(displayedOpenPoint, openDirection) : undefined)}
       </dd>
       <small>
-        {entryPoint ? formatLocalDateTime(entryPoint.tsMs) : openActionLabel}
+        {entryPoint ? formatLocalDateTime(entryPoint.tsMs) : '卖出腿 bid − 买入腿 ask'}
       </small>
     </div>
     <div class="close">
-      <dt><i></i>观察点平仓 · {closeDirectionLabel}</dt>
+      <dt>
+        <i></i>观察点平仓 ·
+        <TradeDirection
+          direction={closeDirection}
+          venueA={legAVenue}
+          venueB={legBVenue}
+          showVenues
+        />
+      </dt>
       <dd>{formatBp(activePoint ? directionBp(activePoint, closeDirection) : undefined)}</dd>
-      <small>{closeActionLabel}</small>
+      <small>原买入腿 bid − 原卖出腿 ask</small>
     </div>
     <div
       class:profitable={activeCaptureBp !== null && activeCaptureBp >= 0}

@@ -79,7 +79,7 @@ Ethereal 源码仅作为归档保留，模块入口、目录发现和适配器�
 | Hyperliquid | `POST https://api.hyperliquid.xyz/info`，`type=allPerpMetas` + `spotMeta` | `isDelisted != true`，且 `collateralToken` 能映射到已配置换算的 quote | `universe[].name` |
 | Lighter | `GET https://mainnet.zklighter.elliot.ai/api/v1/orderBooks` | `market_type=perp` 且 `status=active` | `market_id` |
 | RiseX | `GET https://api.rise.trade/v1/markets` | `active != false` 且 `config.unlocked != false` | `market_id` |
-| 01 | `GET https://zo-mainnet.n1.xyz/info` | 能解析出 `marketId` 和以 `USD` 结尾的 `symbol` | `symbol` |
+| 01 | `GET https://zo-mainnet.n1.xyz/info` | 能解析出 `marketId`、以 `USD` 结尾的 `symbol`，且 `mode=clob` | `symbol` |
 | Perpl | `GET https://app.perpl.xyz/api/v1/pub/context` | `config.is_open=true` | `id` |
 | Ondo | `GET https://api.ondoperps.xyz/v1/markets` | `disabled != true` | `market` |
 

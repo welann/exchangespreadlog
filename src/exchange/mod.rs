@@ -161,6 +161,7 @@ struct ReconnectDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReconnectKind {
     TransientWebsocketDisconnect,
+    TransientUpstreamFailure,
     RateLimited,
     Error,
 }
@@ -198,6 +199,13 @@ fn reconnect_decision(
         };
     }
 
+    if is_transient_upstream_failure(err) {
+        return ReconnectDecision {
+            sleep: backoff.next_delay(),
+            kind: ReconnectKind::TransientUpstreamFailure,
+        };
+    }
+
     ReconnectDecision {
         sleep: backoff.next_delay(),
         kind: ReconnectKind::Error,
@@ -218,6 +226,15 @@ fn log_adapter_restart(
                 sleep = ?decision.sleep,
                 ?uptime,
                 "adapter reconnecting after transient websocket disconnect"
+            );
+        }
+        ReconnectKind::TransientUpstreamFailure => {
+            info!(
+                venue,
+                reason = %err,
+                sleep = ?decision.sleep,
+                ?uptime,
+                "exchange upstream temporarily unavailable; reconnecting"
             );
         }
         ReconnectKind::RateLimited => {
@@ -258,6 +275,29 @@ fn is_transient_websocket_disconnect(err: &anyhow::Error) -> bool {
         || text.contains("broken pipe")
         || text.contains("reason: \"expired\"")
         || text.contains("reason: \"ping timeout\"")
+}
+
+fn is_transient_upstream_failure(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(error) = cause.downcast_ref::<reqwest::Error>()
+            && error
+                .status()
+                .is_some_and(|status| status.is_server_error())
+        {
+            return true;
+        }
+        if let Some(tokio_tungstenite::tungstenite::Error::Http(response)) =
+            cause.downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+            && response.status().is_server_error()
+        {
+            return true;
+        }
+    }
+
+    // Preserve classification if an adapter added string context around the
+    // typed transport error before it reached the reconnect supervisor.
+    let text = error_chain_text(err);
+    (500_u16..=599).any(|status| text.contains(&format!("http error: {status}")))
 }
 
 fn error_chain_text(err: &anyhow::Error) -> String {
@@ -415,7 +455,8 @@ mod tests {
     use super::{
         CatalogIndex, LatestTickQueue, RATE_LIMIT_RECONNECT_DELAY, ReconnectDecision,
         ReconnectKind, TRANSIENT_WS_RECONNECT_DELAY, decimal_tick, is_rate_limited,
-        is_transient_websocket_disconnect, merge_configured_catalog, reconnect_decision,
+        is_transient_upstream_failure, is_transient_websocket_disconnect, merge_configured_catalog,
+        reconnect_decision,
     };
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -545,6 +586,23 @@ mod tests {
 
         let err = anyhow::anyhow!("order-book sequence gap for BTCUSD");
         assert!(!is_transient_websocket_disconnect(&err));
+    }
+
+    #[test]
+    fn classifies_http_521_as_a_transient_upstream_failure() {
+        let err = anyhow::anyhow!("HTTP error: 521 <unknown status code>");
+
+        assert!(is_transient_upstream_failure(&err));
+        assert!(!is_transient_websocket_disconnect(&err));
+
+        let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
+        assert_eq!(
+            reconnect_decision(&mut backoff, &err, Duration::from_millis(250)),
+            ReconnectDecision {
+                sleep: Duration::from_secs(1),
+                kind: ReconnectKind::TransientUpstreamFailure,
+            }
+        );
     }
 
     #[test]
