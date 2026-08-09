@@ -407,79 +407,91 @@
   }
 </script>
 
-<div class:anchored={entryPoint !== null} class="readout">
-  <div class="readout-time">
-    <div>
-      <span>
-        观察时间 · {localZone}
-        {activePoint ? ` · ${describeUtcOffset(activePoint.tsMs)}` : ''}
-      </span>
-      <strong>{activePoint ? formatLocalDateTime(activePoint.tsMs) : '—'}</strong>
-      <small>{observationNote(entryPoint, activePoint, activeHoldingMs)}</small>
+<div class="spread-chart">
+  <div class:anchored={entryPoint !== null} class="readout">
+    <div class="readout-time">
+      <div>
+        <span>
+          观察时间 · {localZone}
+          {activePoint ? ` · ${describeUtcOffset(activePoint.tsMs)}` : ''}
+        </span>
+        <strong>{activePoint ? formatLocalDateTime(activePoint.tsMs) : '—'}</strong>
+        <small>{observationNote(entryPoint, activePoint, activeHoldingMs)}</small>
+      </div>
+      {#if entryPoint}
+        <button on:click={clearEntry}>清除开仓点</button>
+      {/if}
     </div>
-    {#if entryPoint}
-      <button on:click={clearEntry}>清除开仓点</button>
-    {/if}
+    <dl>
+      <div class="open">
+        <dt>
+          <i></i>
+          <span class="metric-label">{entryPoint ? '固定开仓' : '候选开仓'} ·</span>
+          <span class="metric-direction">
+            <TradeDirection
+              direction={openDirection}
+              venueA={legAVenue}
+              venueB={legBVenue}
+              showVenues
+            />
+          </span>
+        </dt>
+        <dd>
+          {formatBp(displayedOpenPoint ? directionBp(displayedOpenPoint, openDirection) : undefined)}
+        </dd>
+        <small>
+          {entryPoint ? formatLocalDateTime(entryPoint.tsMs) : '卖出腿 bid − 买入腿 ask'}
+        </small>
+      </div>
+      <div class="close">
+        <dt>
+          <i></i>
+          <span class="metric-label">观察点平仓 ·</span>
+          <span class="metric-direction">
+            <TradeDirection
+              direction={closeDirection}
+              venueA={legAVenue}
+              venueB={legBVenue}
+              showVenues
+            />
+          </span>
+        </dt>
+        <dd>{formatBp(activePoint ? directionBp(activePoint, closeDirection) : undefined)}</dd>
+        <small>原买入腿 bid − 原卖出腿 ask</small>
+      </div>
+      <div
+        class:profitable={activeCaptureBp !== null && activeCaptureBp >= 0}
+        class="capture"
+      >
+        <dt><i></i><span class="metric-label">可平仓毛收益</span></dt>
+        <dd>{entryPoint ? formatBp(activeCaptureBp ?? undefined) : '等待选择'}</dd>
+        <small>未扣手续费、资金费和滑点</small>
+      </div>
+      <div class="best">
+        <dt><i></i><span class="metric-label">区间最佳毛收益</span></dt>
+        <dd>{formatBp(captureStats.bestBp ?? undefined)}</dd>
+        <small>{captureSummary(entryPoint, captureStats)}</small>
+      </div>
+    </dl>
   </div>
-  <dl>
-    <div class="open">
-      <dt>
-        <i></i>{entryPoint ? '固定开仓' : '候选开仓'} ·
-        <TradeDirection
-          direction={openDirection}
-          venueA={legAVenue}
-          venueB={legBVenue}
-          showVenues
-        />
-      </dt>
-      <dd>
-        {formatBp(displayedOpenPoint ? directionBp(displayedOpenPoint, openDirection) : undefined)}
-      </dd>
-      <small>
-        {entryPoint ? formatLocalDateTime(entryPoint.tsMs) : '卖出腿 bid − 买入腿 ask'}
-      </small>
-    </div>
-    <div class="close">
-      <dt>
-        <i></i>观察点平仓 ·
-        <TradeDirection
-          direction={closeDirection}
-          venueA={legAVenue}
-          venueB={legBVenue}
-          showVenues
-        />
-      </dt>
-      <dd>{formatBp(activePoint ? directionBp(activePoint, closeDirection) : undefined)}</dd>
-      <small>原买入腿 bid − 原卖出腿 ask</small>
-    </div>
-    <div
-      class:profitable={activeCaptureBp !== null && activeCaptureBp >= 0}
-      class="capture"
-    >
-      <dt><i></i>可平仓毛收益</dt>
-      <dd>{entryPoint ? formatBp(activeCaptureBp ?? undefined) : '等待选择'}</dd>
-      <small>未扣手续费、资金费和滑点</small>
-    </div>
-    <div class="best">
-      <dt><i></i>区间最佳毛收益</dt>
-      <dd>{formatBp(captureStats.bestBp ?? undefined)}</dd>
-      <small>{captureSummary(entryPoint, captureStats)}</small>
-    </div>
-  </dl>
+
+  <div
+    class="chart"
+    bind:this={container}
+    role="img"
+    aria-label={`开仓 ${openActionLabel}、平仓 ${closeActionLabel} 与跨时点可平仓毛收益时间序列；点击图表可选择开仓时刻，单位为基点，时间按浏览器本地时区显示`}
+  ></div>
 </div>
 
-<div
-  class="chart"
-  bind:this={container}
-  role="img"
-  aria-label={`开仓 ${openActionLabel}、平仓 ${closeActionLabel} 与跨时点可平仓毛收益时间序列；点击图表可选择开仓时刻，单位为基点，时间按浏览器本地时区显示`}
-></div>
-
 <style>
+  .spread-chart {
+    container-type: inline-size;
+  }
+
   .readout {
     min-height: 76px;
     display: grid;
-    grid-template-columns: minmax(245px, 1.2fr) minmax(0, 2.8fr);
+    grid-template-columns: minmax(245px, 0.9fr) minmax(0, 3.1fr);
     align-items: stretch;
     margin: 0 12px;
     border: 1px solid #d1dbe1;
@@ -572,9 +584,44 @@
   }
 
   dt {
+    min-width: 0;
     display: flex;
     align-items: center;
     gap: 6px;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+
+  .metric-label {
+    flex: 0 0 auto;
+  }
+
+  .metric-direction {
+    min-width: 0;
+    display: flex;
+    flex: 1 1 0;
+    overflow: hidden;
+  }
+
+  .metric-direction :global(.trade-direction) {
+    width: 100%;
+  }
+
+  .open dt,
+  .close dt {
+    display: grid;
+    grid-template-columns: 13px minmax(0, 1fr);
+    row-gap: 3px;
+  }
+
+  .open .metric-label,
+  .close .metric-label {
+    grid-column: 2;
+  }
+
+  .open .metric-direction,
+  .close .metric-direction {
+    grid-column: 1 / -1;
   }
 
   dt i {
@@ -637,17 +684,18 @@
     height: 400px;
   }
 
-  @media (max-width: 760px) {
+  @container (max-width: 860px) {
     .readout {
       grid-template-columns: 1fr;
-      margin: 0 8px;
     }
 
     .readout-time {
       border-right: 0;
       border-bottom: 1px solid #d1dbe1;
     }
+  }
 
+  @container (max-width: 620px) {
     dl {
       grid-template-columns: 1fr 1fr;
     }
@@ -662,6 +710,13 @@
 
     .best {
       border-right: 0;
+    }
+  }
+
+  @media (max-width: 760px) {
+    .readout {
+      grid-template-columns: 1fr;
+      margin: 0 8px;
     }
 
     .chart {

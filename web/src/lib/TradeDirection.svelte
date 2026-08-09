@@ -31,7 +31,7 @@
     <b>BUY</b>
     <span>{legs.buy}</span>
     {#if showVenues && venue(legs.buy)}
-      <em>{venue(legs.buy)}</em>
+      <em title={venue(legs.buy)}>{venue(legs.buy)}</em>
     {/if}
   </span>
   <i>·</i>
@@ -39,7 +39,7 @@
     <b>SELL</b>
     <span>{legs.sell}</span>
     {#if showVenues && venue(legs.sell)}
-      <em>{venue(legs.sell)}</em>
+      <em title={venue(legs.sell)}>{venue(legs.sell)}</em>
     {/if}
   </span>
 </span>
@@ -52,8 +52,10 @@
   }
 
   .trade-direction {
+    max-width: 100%;
     min-width: 0;
     gap: 5px;
+    overflow: hidden;
     font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
     white-space: nowrap;
   }
@@ -86,6 +88,7 @@
   }
 
   em {
+    min-width: 0;
     overflow: hidden;
     max-width: 11em;
     color: inherit;

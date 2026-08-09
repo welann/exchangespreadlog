@@ -2208,7 +2208,7 @@
   .opportunity-list button {
     width: 100%;
     display: grid;
-    grid-template-columns: 18px minmax(0, 1fr) auto;
+    grid-template-columns: 18px minmax(0, 1fr);
     align-items: center;
     gap: 8px;
     padding: 10px 12px;
@@ -2241,6 +2241,7 @@
   .opportunity-route,
   .opportunity-value {
     min-width: 0;
+    grid-column: 2;
   }
 
   .opportunity-route strong,
@@ -2301,9 +2302,12 @@
   }
 
   .opportunity-value {
-    padding-left: 8px;
-    border-left: 1px solid #ccd6dd;
-    text-align: right;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    padding-top: 5px;
+    border-top: 1px dotted #ccd6dd;
   }
 
   .opportunity-value strong {
